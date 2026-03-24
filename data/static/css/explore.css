@@ -272,6 +272,28 @@
     z-index: 2;
 }
 
+.card-badge-vip {
+    background: linear-gradient(135deg, #d4a017, #b8860b);
+    color: #1a1a1a;
+}
+.card-badge-premium {
+    background: var(--accent, #7c3aed);
+    color: #fff;
+}
+.modal-cta-vip {
+    background: linear-gradient(135deg, #d4a017, #b8860b);
+    color: #1a1a1a;
+}
+.modal-price-info {
+    text-align: center;
+    padding: 8px 0;
+    font-size: 0.9rem;
+    color: var(--text-secondary, #999);
+}
+.modal-price-info i {
+    color: #d4a017;
+}
+
 /* Visibility Badges (Private / Unlisted / Draft) */
 .card-visibility-badge {
     position: absolute;

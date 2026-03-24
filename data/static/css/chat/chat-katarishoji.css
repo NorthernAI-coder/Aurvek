@@ -2297,6 +2297,27 @@ body { display: flex; height: 100svh; margin: 0; overflow: hidden; }
 }
 
 /* ==========================================================
+   Thinking Block (Extended Thinking) inside messages
+   ========================================================== */
+
+.message.bot .thinking-block {
+    border-left-color: var(--ks-gold-muted);
+}
+
+.message.bot .message-content .thinking-block summary {
+    color: var(--msg-bot-text-light) !important;
+}
+
+.message.bot .message-content .thinking-block > pre.thinking-content {
+    background-color: rgba(10, 25, 47, 0.06) !important;
+    color: var(--msg-bot-text) !important;
+    border: 1px solid rgba(191, 161, 106, 0.2) !important;
+    border-radius: 8px !important;
+    padding: 12px !important;
+    margin: 8px 0 0 0 !important;
+}
+
+/* ==========================================================
    Thinking Tokens
    ========================================================== */
 

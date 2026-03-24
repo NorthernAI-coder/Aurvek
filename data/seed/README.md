@@ -81,8 +81,8 @@ The seed script creates:
 
 1. **User Roles** (3)
    - admin
-   - manager
    - user
+   - customer
 
 2. **Services** (6)
    - TTS-ELEVENLABS

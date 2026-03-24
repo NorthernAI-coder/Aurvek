@@ -256,10 +256,10 @@ async def purchase_slot(
     if not current_user:
         raise HTTPException(401, "Authentication required")
 
-    # Only managers can purchase slots
-    is_manager = await current_user.is_manager
-    if not is_manager:
-        raise HTTPException(403, "Only managers can purchase domain slots")
+    # Only users (creators) can purchase slots
+    is_user = await current_user.is_user
+    if not is_user:
+        raise HTTPException(403, "Only users can purchase domain slots")
 
     # Atomic: deduct balance + add slot in single transaction
     async with get_db_connection() as conn:
@@ -428,16 +428,16 @@ async def activate_domain(
     """
     Activate a verified domain using a domain slot.
     Requires an available slot (purchased previously or buy one now).
-    Only managers can use this endpoint. Admins should use /admin/domains/{id}/activate-free.
+    Only users can use this endpoint. Admins should use /admin/domains/{id}/activate-free.
     """
     if not current_user:
         raise HTTPException(401, "Authentication required")
 
-    # Only managers can activate. Admins should use activate-free endpoint.
+    # Only users can activate. Admins should use activate-free endpoint.
     is_admin = await current_user.is_admin
-    is_manager = await current_user.is_manager
-    if not is_manager and not is_admin:
-        raise HTTPException(403, "Only managers can activate custom domains")
+    is_user = await current_user.is_user
+    if not is_user and not is_admin:
+        raise HTTPException(403, "Only users can activate custom domains")
 
     # If admin, redirect them to use the free endpoint
     if is_admin:

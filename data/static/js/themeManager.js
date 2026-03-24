@@ -167,7 +167,7 @@ const ThemeManager = {
      * @param {boolean} reload - Whether to reload page after setting theme (default: true)
      */
     setTheme(theme, reload = true) {
-        // Phase 5: Respect forced theme from manager
+        // Phase 5: Respect forced theme from creator
         if (this.forcedTheme && reload) {
             // User is trying to change theme but it's locked
             console.log('ThemeManager: Theme is locked to', this.forcedTheme);
@@ -382,7 +382,7 @@ const ThemeManager = {
         // Determine which theme to use
         let activeTheme;
         if (this.forcedTheme) {
-            // Use forced theme from manager
+            // Use forced theme from creator
             activeTheme = this.forcedTheme;
         } else {
             // Use saved theme from localStorage
@@ -398,7 +398,7 @@ const ThemeManager = {
             // But check if forced theme differs from what was loaded
             if (this.forcedTheme && this.forcedTheme !== themeLoaderTheme) {
                 // Forced theme is different - need to switch
-                // This happens when manager sets a forced theme after page load
+                // This happens when creator sets a forced theme after page load
                 this.loadCSS(this.forcedTheme)
                     .then(() => this.applyThemeEffects(this.forcedTheme))
                     .catch(err => console.error('ThemeManager: Error applying forced theme:', err));

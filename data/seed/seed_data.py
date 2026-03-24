@@ -2,7 +2,7 @@
 Aurvek Database Seed Script
 
 This script initializes a fresh Aurvek installation with:
-- User roles (admin, manager, user)
+- User roles (admin, user, customer)
 - Services (TTS, STT, Images)
 - Voices (ElevenLabs, OpenAI)
 - LLM models
@@ -109,8 +109,8 @@ def get_landing_base_url(public_id: str, slug: str) -> str:
 
 USER_ROLES = [
     {"id": 1, "role_name": "admin"},
-    {"id": 2, "role_name": "manager"},
-    {"id": 3, "role_name": "user"},
+    {"id": 2, "role_name": "user"},
+    {"id": 3, "role_name": "customer"},
 ]
 
 SERVICES = [

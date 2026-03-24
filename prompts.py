@@ -45,7 +45,7 @@ async def list_prompts(request: Request, current_user: User = Depends(get_curren
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
         
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
     
     async with get_db_connection(readonly=True) as conn:
@@ -65,7 +65,7 @@ async def list_prompts(request: Request, current_user: User = Depends(get_curren
         """
         params = [current_user.id, current_user.id]
         
-        if await current_user.is_manager and not await current_user.is_admin:
+        if await current_user.is_user and not await current_user.is_admin:
             query += " WHERE pp_edit.user_id IS NOT NULL OR pp_owner.user_id IS NOT NULL"
         
         async with conn.execute(query, params) as cursor:
@@ -73,10 +73,13 @@ async def list_prompts(request: Request, current_user: User = Depends(get_curren
             prompts = []
             for row in rows:
                 prompt = dict(row)
-                try:
-                    prompt['created_at'] = datetime.strptime(prompt['created_at'], '%Y-%m-%d %H:%M:%S.%f')
-                except ValueError:
-                    prompt['created_at'] = datetime.strptime(prompt['created_at'], '%Y-%m-%d %H:%M:%S')
+                if prompt['created_at']:
+                    try:
+                        prompt['created_at'] = datetime.strptime(prompt['created_at'], '%Y-%m-%d %H:%M:%S.%f')
+                    except ValueError:
+                        prompt['created_at'] = datetime.strptime(prompt['created_at'], '%Y-%m-%d %H:%M:%S')
+                else:
+                    prompt['created_at'] = None
                 prompt['can_edit'] = bool(prompt['can_edit']) or bool(prompt['is_owner']) or await current_user.is_admin
 
                 # Generate image URLs (thumbnail and fullsize)
@@ -235,13 +238,15 @@ async def create_prompt(request: Request, current_user: User = Depends(get_curre
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
         
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
     async with get_db_connection(readonly=True) as conn:
         async with conn.execute("SELECT voice_code, name FROM Voices") as cursor:
             voices = await cursor.fetchall()
         context = await get_template_context(request, current_user)
         context["voices"] = voices
+        context["gransabio_enabled"] = False
+        context["gransabio_config"] = {}
         return templates.TemplateResponse("prompts/create_prompt.html", context)
 
 @router.post("/prompts/new")
@@ -270,11 +275,14 @@ async def create_prompt_post(
     extensions_enabled: bool = Form(False),
     extensions_auto_advance: bool = Form(False),
     extensions_free_selection: bool = Form(True),
+    # GranSabio settings
+    gransabio_enabled: bool = Form(False),
+    gransabio_config: Optional[str] = Form(None),
 ):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Mutual exclusion: disable_web_search takes priority over force_web_search
@@ -304,6 +312,59 @@ async def create_prompt_post(
             raise HTTPException(status_code=400, detail="Invalid JSON in watchdog configuration")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Watchdog config error: {e}")
+
+    # GranSabio config normalization (same pattern as watchdog_config)
+    if gransabio_config is not None and gransabio_config.strip() in ("", "null"):
+        gransabio_config = None
+
+    # Bidirectional incompatibility checks (catches both directions of the conflict)
+    if gransabio_enabled and extensions_auto_advance:
+        return JSONResponse(
+            content={"success": False, "message": "GranSabio is incompatible with extensions auto-advance (requires tool-calling)."},
+            status_code=400,
+        )
+    if gransabio_enabled and force_web_search:
+        return JSONResponse(
+            content={"success": False, "message": "GranSabio is incompatible with force_web_search (bypasses all tool calling)."},
+            status_code=400,
+        )
+
+    # Validate GranSabio config: both JSON structure AND merged effective config
+    if gransabio_enabled:
+        parsed_gs = {}
+        if gransabio_config:
+            try:
+                parsed_gs = orjson.loads(gransabio_config)
+                if not isinstance(parsed_gs, dict):
+                    return JSONResponse(
+                        content={"success": False, "message": "GranSabio config must be a JSON object."},
+                        status_code=400,
+                    )
+            except orjson.JSONDecodeError:
+                return JSONResponse(
+                    content={"success": False, "message": "Invalid GranSabio config JSON."},
+                    status_code=400,
+                )
+        # Always validate merged config (catches broken admin defaults + empty prompt config)
+        try:
+            from gransabio_service import merge_gransabio_config, validate_merged_config
+            from gransabio_config import get_gransabio_config
+            admin_config = await get_gransabio_config()
+            merged = merge_gransabio_config(parsed_gs, admin_config)
+            valid, config_err = validate_merged_config(merged)
+            if not valid:
+                return JSONResponse(
+                    content={"success": False, "message": f"GranSabio config validation: {config_err}. Configure admin defaults or set per-prompt values."},
+                    status_code=400,
+                )
+        except ImportError:
+            logger.warning("GranSabio modules not available, skipping config validation")
+        except Exception as e:
+            # DB errors loading admin config should block the save
+            return JSONResponse(
+                content={"success": False, "message": f"GranSabio config validation error: {e}"},
+                status_code=400,
+            )
 
     # Parse category_ids
     parsed_category_ids = []
@@ -364,12 +425,14 @@ async def create_prompt_post(
                 """INSERT INTO Prompts (name, prompt, description, voice_id, created_by_user_id, created_at, public,
                    is_paid, markup_per_mtokens, forced_llm_id, hide_llm_name, disable_web_search, force_web_search,
                    enable_moderation, watchdog_config, allowed_llms,
-                   extensions_enabled, extensions_auto_advance, extensions_free_selection)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   extensions_enabled, extensions_auto_advance, extensions_free_selection,
+                   gransabio_enabled, gransabio_config)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (name, prompt, description, voice_id, current_user.id, datetime.utcnow(), public,
                  is_paid_bool, actual_markup, actual_forced_llm_id, actual_hide_llm_name, disable_web_search, force_web_search,
                  enable_moderation, watchdog_config_json, actual_allowed_llms,
-                 extensions_enabled, extensions_auto_advance, extensions_free_selection)
+                 extensions_enabled, extensions_auto_advance, extensions_free_selection,
+                 gransabio_enabled, gransabio_config)
             )
             prompt_id = cursor.lastrowid
 
@@ -419,7 +482,8 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
                                           force_web_search, enable_moderation, watchdog_config,
                                           allow_in_packs, pack_notice_period_days,
                                           allowed_llms, extensions_enabled, extensions_auto_advance, extensions_free_selection,
-                                          purchase_price
+                                          purchase_price,
+                                          gransabio_enabled, gransabio_config
                                    FROM Prompts WHERE id = ?""", (prompt_id,)) as cursor:
             prompt = await cursor.fetchone()
         
@@ -432,7 +496,7 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
             role_name = role_result[0] if role_result else None
 
         is_admin = role_name == 'admin'
-        is_manager = role_name == 'manager'
+        is_user = role_name == 'user'
         
         # Get the current owner
         async with conn.execute("SELECT user_id FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND permission_level = 'owner'", (prompt_id,)) as cursor:
@@ -457,12 +521,12 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
         async with conn.execute("SELECT id, name FROM Voices") as cursor:
             voices = await cursor.fetchall()
         
-        # Get users who are admins or managers
+        # Get users who are admins or users (elevated role)
         async with conn.execute("""
             SELECT u.id, u.username 
             FROM USERS u
             JOIN USER_ROLES ur ON u.role_id = ur.id
-            WHERE ur.role_name IN ('admin', 'manager')
+            WHERE ur.role_name IN ('admin', 'user')
             ORDER BY u.id
         """) as cursor:
             users = await cursor.fetchall()
@@ -474,7 +538,7 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
             JOIN PROMPT_PERMISSIONS pp ON u.id = pp.user_id 
             JOIN USER_ROLES ur ON u.role_id = ur.id
             WHERE pp.prompt_id = ? AND pp.permission_level = 'edit'
-            AND ur.role_name IN ('admin', 'manager')
+            AND ur.role_name IN ('admin', 'user')
         """, (prompt_id,)) as cursor:
             editors = await cursor.fetchall()
         
@@ -537,6 +601,9 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
         "extensions_free_selection": bool(prompt[20]) if prompt[20] is not None else True,
         # Purchase price
         "purchase_price": prompt[21],
+        # GranSabio config
+        "gransabio_enabled": bool(prompt[22]) if prompt[22] else False,
+        "gransabio_config": _parse_gransabio_config_for_template(prompt[23]),
         # Welcome message (pre-loaded, no extra HTTP request)
         "welcome_message_content": welcome_message_content,
     })
@@ -577,6 +644,9 @@ async def update_prompt(
     extensions_free_selection: bool = Form(True),
     # Individual purchase
     purchase_price: Optional[str] = Form(None),
+    # GranSabio settings
+    gransabio_enabled: bool = Form(False),
+    gransabio_config: Optional[str] = Form(None),
 ):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
@@ -612,6 +682,59 @@ async def update_prompt(
             raise HTTPException(status_code=400, detail="Invalid JSON in watchdog configuration")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Watchdog config error: {e}")
+
+    # GranSabio config normalization (same pattern as watchdog_config)
+    if gransabio_config is not None and gransabio_config.strip() in ("", "null"):
+        gransabio_config = None
+
+    # Bidirectional incompatibility checks (catches both directions of the conflict)
+    if gransabio_enabled and extensions_auto_advance:
+        return JSONResponse(
+            content={"success": False, "message": "GranSabio is incompatible with extensions auto-advance (requires tool-calling)."},
+            status_code=400,
+        )
+    if gransabio_enabled and force_web_search:
+        return JSONResponse(
+            content={"success": False, "message": "GranSabio is incompatible with force_web_search (bypasses all tool calling)."},
+            status_code=400,
+        )
+
+    # Validate GranSabio config: both JSON structure AND merged effective config
+    if gransabio_enabled:
+        parsed_gs = {}
+        if gransabio_config:
+            try:
+                parsed_gs = orjson.loads(gransabio_config)
+                if not isinstance(parsed_gs, dict):
+                    return JSONResponse(
+                        content={"success": False, "message": "GranSabio config must be a JSON object."},
+                        status_code=400,
+                    )
+            except orjson.JSONDecodeError:
+                return JSONResponse(
+                    content={"success": False, "message": "Invalid GranSabio config JSON."},
+                    status_code=400,
+                )
+        # Always validate merged config (catches broken admin defaults + empty prompt config)
+        try:
+            from gransabio_service import merge_gransabio_config, validate_merged_config
+            from gransabio_config import get_gransabio_config
+            admin_config = await get_gransabio_config()
+            merged = merge_gransabio_config(parsed_gs, admin_config)
+            valid, config_err = validate_merged_config(merged)
+            if not valid:
+                return JSONResponse(
+                    content={"success": False, "message": f"GranSabio config validation: {config_err}. Configure admin defaults or set per-prompt values."},
+                    status_code=400,
+                )
+        except ImportError:
+            logger.warning("GranSabio modules not available, skipping config validation")
+        except Exception as e:
+            # DB errors loading admin config should block the save
+            return JSONResponse(
+                content={"success": False, "message": f"GranSabio config validation error: {e}"},
+                status_code=400,
+            )
 
     # Parse category_ids
     parsed_category_ids = []
@@ -729,9 +852,13 @@ async def update_prompt(
                     actual_purchase_price = float(purchase_price)
                     if actual_purchase_price < 0:
                         raise HTTPException(status_code=400, detail="Purchase price cannot be negative")
+                    if actual_purchase_price > 0 and actual_purchase_price < 0.50:
+                        raise HTTPException(status_code=400, detail="Minimum purchase price is $0.50 (Stripe minimum)")
                 except ValueError:
                     raise HTTPException(status_code=400, detail="Invalid purchase price")
-            # Only set purchase_price if prompt is paid; clear if not
+            # 0 means "no purchase gate" (Premium), convert to NULL
+            if actual_purchase_price is not None and actual_purchase_price == 0:
+                actual_purchase_price = None
             if not is_paid_bool:
                 actual_purchase_price = None
 
@@ -742,14 +869,16 @@ async def update_prompt(
                    force_web_search = ?, enable_moderation = ?, watchdog_config = ?,
                    allow_in_packs = ?, pack_notice_period_days = ?,
                    allowed_llms = ?, extensions_enabled = ?, extensions_auto_advance = ?, extensions_free_selection = ?,
-                   purchase_price = ?
+                   purchase_price = ?,
+                   gransabio_enabled = ?, gransabio_config = ?
                    WHERE id = ?""",
                 (name, prompt, description, voice_id, public,
                  is_paid_bool, actual_markup, actual_forced_llm_id, actual_hide_llm_name, disable_web_search,
                  force_web_search, enable_moderation, watchdog_config_json,
                  allow_in_packs, pack_notice_period_days,
                  actual_allowed_llms, extensions_enabled, extensions_auto_advance, extensions_free_selection,
-                 actual_purchase_price, prompt_id)
+                 actual_purchase_price,
+                 gransabio_enabled, gransabio_config, prompt_id)
             )
 
             # If extensions were just disabled, clean active_extension_id from all conversations
@@ -931,7 +1060,7 @@ async def delete_prompts_batch(request: Request, current_user: User = Depends(ge
     if current_user is None:
         return RedirectResponse(url="/login", status_code=303)
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
 
     form_data = await request.form()
@@ -972,7 +1101,7 @@ async def delete_prompts_batch(request: Request, current_user: User = Depends(ge
                     owner_result = await cursor.fetchone()
                     is_owner = owner_result and owner_result[0] == current_user.id
 
-                # Check edit permission for managers
+                # Check edit permission for users (elevated role)
                 async with conn.execute(
                     "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ? AND permission_level IN ('owner', 'edit')",
                     (prompt_id, current_user.id)
@@ -1102,11 +1231,11 @@ async def delete_prompt_image(prompt_id: int, current_user: User = Depends(get_c
 
     return JSONResponse(content={"success": True, "message": "Prompt image deleted successfully"}, status_code=200)
         
-async def get_manager_accessible_prompts(manager_id: int):
-    """Get all prompts a manager can assign to users (including public prompts).
+async def get_user_accessible_prompts(user_id: int):
+    """Get all prompts a user can assign to customers (including public prompts).
 
-    Used when assigning prompts to users - includes public prompts because
-    users can be assigned to use any public prompt.
+    Used when assigning prompts to customers - includes public prompts because
+    customers can be assigned to use any public prompt.
     """
     async with get_db_connection(readonly=True) as conn:
         async with conn.cursor() as cursor:
@@ -1118,15 +1247,15 @@ async def get_manager_accessible_prompts(manager_id: int):
                OR (pp.user_id = ? AND pp.permission_level IN ('owner', 'edit'))
                OR p.public = TRUE
             """
-            await cursor.execute(query, (manager_id, manager_id))
+            await cursor.execute(query, (user_id, user_id))
             prompts = await cursor.fetchall()
     return [prompt[0] for prompt in prompts]
 
 
-async def get_manager_owned_prompts(manager_id: int):
-    """Get only prompt IDs that a manager can manage.
+async def get_user_owned_prompts(user_id: int):
+    """Get only prompt IDs that a user can manage.
 
-    Used in configuration panels where managers should only see/edit their own
+    Used in configuration panels where users should only see/edit their own
     prompts, NOT public prompts from other users that they cannot modify.
 
     Permission logic (consistent with can_manage_prompt):
@@ -1154,7 +1283,7 @@ async def get_manager_owned_prompts(manager_id: int):
                     )
                 )
             """
-            await cursor.execute(query, (manager_id, manager_id))
+            await cursor.execute(query, (user_id, user_id))
             prompts = await cursor.fetchall()
     return [prompt[0] for prompt in prompts]
 
@@ -1396,8 +1525,8 @@ DEFAULT_LANDING_REGISTRATION_CONFIG = {
     "allow_file_upload": False,
     "allow_image_generation": False,
     "initial_balance": 0.0,
-    "billing_mode": "user_pays",      # "user_pays" | "manager_pays"
-    "billing_limit": None,            # Only used when billing_mode = "manager_pays"
+    "billing_mode": "customer_pays",      # "customer_pays" | "user_pays"
+    "billing_limit": None,            # Only used when billing_mode = "user_pays"
     "billing_limit_action": "block",  # "block" | "notify" | "auto_refill"
     "billing_auto_refill_amount": 10.0,  # Amount to increase limit by when auto_refill triggers
     "billing_max_limit": None,        # Maximum limit cap for auto_refill (null = unlimited)
@@ -1474,7 +1603,7 @@ def sanitize_landing_reg_config(config: dict, max_initial_balance: float = MAX_F
     # billing_mode - must be one of the allowed values
     if "billing_mode" in config:
         val = config["billing_mode"]
-        if val in ("user_pays", "manager_pays"):
+        if val in ("customer_pays", "user_pays"):
             sanitized["billing_mode"] = val
 
     # billing_limit - must be positive float or None
@@ -1592,6 +1721,19 @@ def _parse_watchdog_config_for_template(raw_json: Optional[str]) -> dict:
         except orjson.JSONDecodeError:
             pass
     return config
+
+
+def _parse_gransabio_config_for_template(raw_json: Optional[str]) -> dict:
+    """Parse gransabio_config from DB for template rendering.
+    Returns empty dict if NULL/invalid."""
+    if raw_json:
+        try:
+            parsed = orjson.loads(raw_json)
+            if isinstance(parsed, dict):
+                return parsed
+        except orjson.JSONDecodeError:
+            pass
+    return {}
 
 
 def get_default_watchdog_config() -> dict:
@@ -2012,7 +2154,7 @@ async def watchdog_suggest_config(
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
 
     body = await request.json()

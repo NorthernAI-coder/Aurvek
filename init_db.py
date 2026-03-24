@@ -27,6 +27,40 @@ def init_db():
             conn.execute("INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES ('geo_global_response_html', '')")
             conn.execute("INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES ('geo_global_cf_rule_id', '')")
             conn.execute("INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES ('geo_landing_cf_rule_ids', '[]')")
+
+            # Seed SYSTEM_CONFIG with GranSabio defaults
+            gransabio_defaults = [
+                ("gransabio_enabled", "false"),
+                ("gransabio_url", "http://127.0.0.1:8000"),
+                ("gransabio_default_generator", ""),
+                ("gransabio_default_qa_models", "[]"),
+                ("gransabio_default_min_score", "8.0"),
+                ("gransabio_default_max_iterations", "3"),
+                ("gransabio_default_gran_sabio_model", ""),
+                ("gransabio_default_arbiter_model", ""),
+                ("gransabio_default_smart_edit", "auto"),
+                ("gransabio_default_gran_sabio_fallback", "true"),
+                ("gransabio_default_verbose", "false"),
+                ("gransabio_default_context_max_tokens", "4000"),
+                ("gransabio_cost_safety_multiplier", "3"),
+                ("gransabio_extra_allowed_ips", ""),
+            ]
+            for key, value in gransabio_defaults:
+                conn.execute(
+                    "INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+
+            # Seed synthetic GranSabio LLM row (existence check - no UNIQUE on LLM)
+            existing = conn.execute(
+                "SELECT id FROM LLM WHERE machine = 'GranSabio' AND model = 'gransabio-pipeline'"
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO LLM (machine, model, input_token_cost, output_token_cost) "
+                    "VALUES ('GranSabio', 'gransabio-pipeline', 0, 0)"
+                )
+
             conn.commit()
 
         print(f"Database {db_path} initialized successfully.")

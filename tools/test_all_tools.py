@@ -489,8 +489,12 @@ def test_registered_tools():
         for name in function_handlers.keys():
             print(f"    - {name}")
 
-        # Check for mismatches
-        tool_names = {t.get('function', {}).get('name') for t in tools}
+        # Check for duplicate tool names (set conversion would silently hide them)
+        tool_names_list = [t.get('function', {}).get('name') for t in tools]
+        tool_names = set(tool_names_list)
+        if len(tool_names_list) != len(tool_names):
+            dupes = [n for n in tool_names_list if tool_names_list.count(n) > 1]
+            print(f"\n  [ERROR] Duplicate tool names found: {set(dupes)}")
         handler_names = set(function_handlers.keys())
 
         missing_handlers = tool_names - handler_names

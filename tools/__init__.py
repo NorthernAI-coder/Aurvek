@@ -9,6 +9,14 @@ dramatiq_tasks = {}
 function_handlers: Dict[str, Callable] = {}
 
 def register_tool(tool: Dict[str, Any]):
+    new_name = tool.get('function', {}).get('name', '')
+    if new_name:
+        for existing in tools:
+            if existing.get('function', {}).get('name', '') == new_name:
+                raise ValueError(
+                    f"Duplicate tool name '{new_name}' in register_tool(). "
+                    f"Each tool must have a unique name."
+                )
     tools.append(tool)
 
 def register_dramatiq_task(name: str, task):

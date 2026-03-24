@@ -592,3 +592,114 @@
     color: #fff;
 }
 
+/* ==========================================================
+   GranSabio Pipeline Panel (Chat Messages)
+   ========================================================== */
+
+.gransabio-panel {
+    background: var(--bg-secondary, #2b2d31);
+    border: 1px solid var(--border-color, #3f4147);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    overflow: hidden;
+    font-size: 0.85rem;
+}
+
+.gransabio-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    background: var(--bg-tertiary, #232428);
+}
+
+.gransabio-header i:first-child {
+    color: var(--accent, #5865f2);
+}
+
+.gransabio-title {
+    flex: 1;
+    font-weight: 600;
+    color: var(--text-primary, #dbdee1);
+}
+
+.gransabio-title.gransabio-approved {
+    color: var(--success, #3ba55c);
+}
+
+.gransabio-title.gransabio-failed {
+    color: var(--danger, #ed4245);
+}
+
+.gransabio-toggle {
+    color: var(--text-muted, #949ba4);
+    transition: transform 0.2s;
+}
+
+.gransabio-panel.collapsed .gransabio-body {
+    display: none;
+}
+
+.gransabio-panel.collapsed .gransabio-toggle {
+    transform: rotate(-90deg);
+}
+
+.gransabio-body {
+    padding: 8px 12px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.gransabio-line {
+    padding: 3px 0;
+    color: var(--text-secondary, #b5bac1);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.gransabio-line i {
+    width: 16px;
+    text-align: center;
+    color: var(--text-muted, #949ba4);
+}
+
+.gransabio-phase-generating i { color: var(--accent, #5865f2); }
+.gransabio-phase-qa i { color: var(--info, #5bc0de); }
+.gransabio-phase-scoring i { color: var(--warning, #faa61a); }
+.gransabio-phase-editing i { color: #e67e22; }
+.gransabio-phase-retry i { color: var(--warning, #faa61a); }
+.gransabio-phase-gran_sabio i { color: #9b59b6; }
+
+.gransabio-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.gransabio-iter {
+    font-size: 0.8rem;
+    color: var(--text-muted, #949ba4);
+    background: var(--bg-primary, #1e1f22);
+    padding: 1px 6px;
+    border-radius: 4px;
+}
+
+.gransabio-layer {
+    font-size: 0.8rem;
+    font-style: italic;
+    color: var(--text-muted, #949ba4);
+}
+
+.gransabio-score-pass {
+    color: var(--success, #3ba55c);
+    font-weight: 600;
+}
+
+.gransabio-score-fail {
+    color: var(--danger, #ed4245);
+    font-weight: 600;
+}
+

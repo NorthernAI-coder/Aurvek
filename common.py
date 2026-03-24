@@ -305,7 +305,7 @@ templates.env.globals['get_static_theme_hashes'] = get_static_theme_hashes
 
 async def get_template_context(request, current_user, branding_context=None):
     """Generate base context for templates that include navbar.html"""
-    is_manager = await current_user.is_manager if current_user else False
+    is_user = await current_user.is_user if current_user else False
     is_admin = await current_user.is_admin if current_user else False
 
     navbar_avatar_url = ""
@@ -350,7 +350,7 @@ async def get_template_context(request, current_user, branding_context=None):
     return {
         "request": request,
         "username": current_user.username if current_user else "",
-        "is_manager": is_manager,
+        "is_user": is_user,
         "is_admin": is_admin,
         "navbar_avatar_url": navbar_avatar_url,
         "navbar_initials": navbar_initials,
@@ -1647,6 +1647,38 @@ async def get_user_billing_info(user_id: int, conn=None) -> dict:
     }
 
 
+async def get_effective_billing_info(user_id: int) -> dict:
+    """Resolve who actually pays for this user's API usage.
+
+    Returns {
+        'billing_account_id': int,
+        'effective_balance': float,
+        'monthly_remaining': float | None,
+        'billing_limit_action': str | None,
+    }
+    Mirrors consume_token()'s logic for determining the payer.
+    """
+    billing_info = await get_user_billing_info(user_id)
+
+    billing_account_id = billing_info.get('billing_account_id') or user_id
+    billing_limit = billing_info.get('billing_limit')
+    billing_limit_action = billing_info.get('billing_limit_action')
+    current_month_spent = billing_info.get('billing_current_month_spent', 0.0)
+
+    effective_balance = await get_balance(billing_account_id)
+
+    monthly_remaining = None
+    if billing_limit is not None and billing_limit > 0:
+        monthly_remaining = billing_limit - current_month_spent
+
+    return {
+        'billing_account_id': billing_account_id,
+        'effective_balance': effective_balance,
+        'monthly_remaining': monthly_remaining,
+        'billing_limit_action': billing_limit_action,
+    }
+
+
 async def reset_monthly_billing_if_needed(user_id: int, conn, cursor) -> bool:
     """
     Reset billing_current_month_spent if we're in a new month.
@@ -1745,6 +1777,7 @@ async def consume_token(
     reasoning_tokens=0,
     prompt_id=None,
     byok=False,
+    override_api_cost=None,
 ):
     """
     Consume tokens and apply pricing logic based on prompt configuration.
@@ -1774,6 +1807,10 @@ async def consume_token(
             api_cost = 0
             input_cost_total = 0
             output_cost_total = 0
+
+        # GranSabio: direct cost passthrough from pipeline billing
+        if override_api_cost is not None:
+            api_cost = override_api_cost
 
         # Get pricing configuration
         pricing_config = await get_pricing_config()
@@ -1871,8 +1908,8 @@ async def consume_token(
         billing_account_id = billing_info['billing_account_id']
 
         if billing_account_id:
-            # TEAM BILLING: charge manager's account instead of user's
-            manager_id = billing_account_id
+            # TEAM BILLING: charge billing owner's account instead of user's
+            billing_owner_id = billing_account_id
 
             # Reset monthly billing counter if new month
             await reset_monthly_billing_if_needed(user_id, conn, cursor)
@@ -1919,24 +1956,24 @@ async def consume_token(
                         # 'notify' - log warning but continue
                         logger.warning(f"[consume_token] Team-billed user {user_id} over monthly limit (action=notify). Limit: {billing_limit}, Spent: {current_month_spent + total_cost}")
 
-            # Check manager's balance
-            await cursor.execute('SELECT balance FROM USER_DETAILS WHERE user_id = ?', (manager_id,))
-            manager_result = await cursor.fetchone()
-            if not manager_result:
-                logger.info(f"Manager with ID {manager_id} not found in USER_DETAILS")
+            # Check billing owner's balance
+            await cursor.execute('SELECT balance FROM USER_DETAILS WHERE user_id = ?', (billing_owner_id,))
+            owner_result = await cursor.fetchone()
+            if not owner_result:
+                logger.info(f"Billing owner with ID {billing_owner_id} not found in USER_DETAILS")
                 return False
 
-            manager_balance = manager_result[0]
-            if total_cost > manager_balance:
-                logger.info(f"Insufficient manager balance. Required: {total_cost:.6f}, Available: {manager_balance:.6f}")
+            owner_balance = owner_result[0]
+            if total_cost > owner_balance:
+                logger.info(f"Insufficient billing owner balance. Required: {total_cost:.6f}, Available: {owner_balance:.6f}")
                 return False
 
-            # Deduct from manager's balance
+            # Deduct from billing owner's balance
             await cursor.execute('''
                 UPDATE USER_DETAILS
                 SET balance = balance - ?
                 WHERE user_id = ?
-            ''', (total_cost, manager_id))
+            ''', (total_cost, billing_owner_id))
 
             # Update user's billing spent (for limit tracking) and token stats (no balance deduction)
             await cursor.execute('''
@@ -1951,7 +1988,7 @@ async def consume_token(
                 WHERE user_id = ?
             ''', (total_cost, input_tokens, output_tokens + reasoning_tokens, input_cost_total, output_cost_total, total_cost, total_tokens, user_id))
 
-            # Record daily usage summary (under actual user, not manager)
+            # Record daily usage summary (under actual user, not billing owner)
             await record_daily_usage(
                 user_id=user_id,
                 usage_type='ai_tokens',
@@ -1962,7 +1999,7 @@ async def consume_token(
                 cursor=cursor
             )
 
-            logger.debug(f"[consume_token] Team billing: charged manager {manager_id} ${total_cost:.6f} for user {user_id}")
+            logger.debug(f"[consume_token] Team billing: charged billing owner {billing_owner_id} ${total_cost:.6f} for user {user_id}")
 
         else:
             # STANDARD MODE: charge user's own balance
@@ -2012,25 +2049,25 @@ async def consume_token(
 # Phase 5: White-Label Branding Functions
 # ============================================================================
 
-async def get_manager_branding(manager_id: int, conn=None) -> dict:
+async def get_user_branding(user_id: int, conn=None) -> dict:
     """
-    Get white-label branding configuration for a manager.
+    Get white-label branding configuration for a user (role).
     Returns default values if no custom branding is configured.
     """
     query = '''
         SELECT company_name, logo_url, brand_color_primary, brand_color_secondary,
                footer_text, email_signature, hide_platform_branding, forced_theme,
                disable_theme_selector
-        FROM MANAGER_BRANDING
-        WHERE manager_id = ?
+        FROM USER_BRANDING
+        WHERE user_id = ?
     '''
 
     if conn:
-        cursor = await conn.execute(query, (manager_id,))
+        cursor = await conn.execute(query, (user_id,))
         row = await cursor.fetchone()
     else:
         async with get_db_connection(readonly=True) as new_conn:
-            cursor = await new_conn.execute(query, (manager_id,))
+            cursor = await new_conn.execute(query, (user_id,))
             row = await cursor.fetchone()
 
     if not row:
@@ -2061,8 +2098,8 @@ async def get_manager_branding(manager_id: int, conn=None) -> dict:
 
 async def get_branding_for_user(user_id: int, conn=None) -> dict:
     """
-    Get white-label branding for a user based on their creator/manager.
-    If the user was created by a manager with custom branding, return that.
+    Get white-label branding for a user based on their creator.
+    If the user was created by a creator with custom branding, return that.
     Otherwise return default branding.
     """
     query = '''
@@ -2077,7 +2114,7 @@ async def get_branding_for_user(user_id: int, conn=None) -> dict:
         creator_id = row[0] if row else None
 
         if creator_id:
-            return await get_manager_branding(creator_id, conn)
+            return await get_user_branding(creator_id, conn)
     else:
         async with get_db_connection(readonly=True) as new_conn:
             cursor = await new_conn.execute(query, (user_id,))
@@ -2085,7 +2122,7 @@ async def get_branding_for_user(user_id: int, conn=None) -> dict:
             creator_id = row[0] if row else None
 
             if creator_id:
-                return await get_manager_branding(creator_id, new_conn)
+                return await get_user_branding(creator_id, new_conn)
 
     # Return default branding
     return {
@@ -2180,7 +2217,7 @@ async def get_branding_for_context(context=None, conn=None) -> dict:
     if not creator_id:
         return PLATFORM_DEFAULTS
 
-    branding = await get_manager_branding(creator_id, conn)
+    branding = await get_user_branding(creator_id, conn)
     branding['brand_color_primary'] = _safe_color(branding.get('brand_color_primary'), '#6366f1')
     branding['brand_color_secondary'] = _safe_color(branding.get('brand_color_secondary'), '#10B981')
     branding['context_type'] = context_type

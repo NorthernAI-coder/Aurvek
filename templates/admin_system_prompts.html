@@ -1,0 +1,1041 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}System Prompts - AURVEK{% endblock %}
+
+{% block page_title %}System Prompts{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Global prompt blocks injected into all AI conversations</p>
+{% endblock %}
+
+{% block page_actions %}
+<button class="btn btn-primary" id="newBlockBtn" onclick="showCreateForm()">
+    <i class="fas fa-plus me-1"></i> New Block
+</button>
+{% endblock %}
+
+{% block styles %}
+<style>
+    /* Stats row overrides for this page */
+    .sp-stats .stat-badge {
+        min-width: 110px;
+    }
+
+    /* Section headers for position groups */
+    .position-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 16px;
+        padding-bottom: 8px;
+        border-bottom: 2px solid var(--border-color);
+        color: var(--text-secondary);
+        font-weight: 600;
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .position-header i {
+        color: var(--accent);
+    }
+
+    /* Block cards */
+    .block-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 10px;
+        transition: box-shadow 0.15s, border-color 0.15s;
+    }
+    .block-card:hover {
+        box-shadow: var(--shadow-soft);
+    }
+    .block-card.missing {
+        opacity: 0.55;
+        border-style: dashed;
+    }
+    .block-card.dragging {
+        opacity: 0.5;
+        border-color: var(--accent);
+    }
+    .block-card.drag-over {
+        border-top: 3px solid var(--accent);
+    }
+
+    /* Block card layout */
+    .block-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+    .block-name {
+        font-weight: 700;
+        font-size: 1rem;
+        color: var(--text-primary);
+    }
+    .block-meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        font-size: 0.8rem;
+        color: var(--text-muted);
+    }
+    .block-actions {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    /* Drag handle */
+    .drag-handle {
+        cursor: grab;
+        color: var(--text-muted);
+        font-size: 1rem;
+        padding: 2px 4px;
+        opacity: 0.5;
+    }
+    .drag-handle:hover {
+        opacity: 1;
+        color: var(--accent);
+    }
+
+    /* Badges */
+    .badge-mandatory {
+        background: rgba(237, 66, 69, 0.15);
+        color: var(--danger);
+        border: 1px solid rgba(237, 66, 69, 0.3);
+        font-size: 0.7rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+    }
+    .badge-system {
+        background: var(--bg-tertiary);
+        color: var(--text-muted);
+        border: 1px solid var(--border-color);
+        font-size: 0.7rem;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+    }
+    .badge-condition {
+        background: rgba(99, 102, 241, 0.12);
+        color: var(--accent);
+        border: 1px solid rgba(99, 102, 241, 0.25);
+        font-size: 0.7rem;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 4px;
+    }
+
+    /* Toggle switch */
+    .block-toggle .form-check-input {
+        width: 2.5em;
+        height: 1.25em;
+        cursor: pointer;
+    }
+    .block-toggle .form-check-input:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+    }
+
+    /* Inline edit/create form */
+    .block-form {
+        display: none;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 16px;
+    }
+    .block-form.visible {
+        display: block;
+    }
+    .block-form .form-label {
+        font-weight: 600;
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+    }
+    .block-form textarea {
+        font-family: 'Courier New', Consolas, monospace;
+        font-size: 0.85rem;
+        resize: vertical;
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        border-color: var(--border-color);
+    }
+    .block-form textarea:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 0.2rem rgba(99, 102, 241, 0.15);
+    }
+    .block-form input.form-control,
+    .block-form select.form-select {
+        background: var(--bg-primary);
+        color: var(--text-primary);
+        border-color: var(--border-color);
+    }
+    .block-form input.form-control:focus,
+    .block-form select.form-select:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 0.2rem rgba(99, 102, 241, 0.15);
+    }
+    .block-form .help-text {
+        font-size: 0.78rem;
+        color: var(--text-muted);
+    }
+
+    /* Radio group for position */
+    .position-radio-group {
+        display: flex;
+        gap: 16px;
+    }
+    .position-radio-group .form-check-label {
+        font-size: 0.85rem;
+    }
+
+    /* Frozen field display */
+    .frozen-value {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        padding: 6px 0;
+    }
+    .frozen-value i {
+        font-size: 0.7rem;
+        margin-left: 4px;
+    }
+
+    /* Empty state */
+    .empty-state {
+        text-align: center;
+        padding: 30px 20px;
+        color: var(--text-muted);
+    }
+    .empty-state i {
+        font-size: 2rem;
+        margin-bottom: 10px;
+        display: block;
+        opacity: 0.4;
+    }
+
+    /* Form actions row */
+    .form-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+    }
+    .form-actions-right {
+        margin-left: auto;
+    }
+
+    /* Loading spinner */
+    .loading-container {
+        text-align: center;
+        padding: 40px;
+        color: var(--text-muted);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Stats Row -->
+<div class="stats-row sp-stats" id="statsRow">
+    <span class="stat-badge">
+        <i class="fas fa-check-circle"></i> <strong id="statActive">0</strong> Active
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-pause-circle"></i> <strong id="statDisabled">0</strong> Disabled
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-arrow-up"></i> <strong id="statPre">0</strong> Pre-prompt
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-arrow-down"></i> <strong id="statPost">0</strong> Post-prompt
+    </span>
+</div>
+
+<!-- Create Form (hidden by default) -->
+<div class="block-form" id="createForm">
+    <h5 style="margin-bottom: 16px; color: var(--text-primary); font-weight: 700;">
+        <i class="fas fa-plus-circle me-2" style="color: var(--accent);"></i>Create New Block
+    </h5>
+    <div class="row">
+        <div class="col-md-6 mb-3">
+            <label class="form-label" for="createName">Name</label>
+            <input type="text" class="form-control" id="createName" placeholder="Block name" maxlength="100" required>
+        </div>
+        <div class="col-md-3 mb-3">
+            <label class="form-label">Position</label>
+            <div class="position-radio-group mt-1">
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="createPosition" id="createPosPre" value="pre_prompt">
+                    <label class="form-check-label" for="createPosPre">Pre-prompt</label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="createPosition" id="createPosPost" value="post_prompt" checked>
+                    <label class="form-check-label" for="createPosPost">Post-prompt</label>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 mb-3">
+            <label class="form-label" for="createCondition">Condition</label>
+            <select class="form-select" id="createCondition">
+                <option value="always">Always</option>
+                <option value="watchdog_only">Watchdog only</option>
+            </select>
+        </div>
+    </div>
+    <div class="mb-3">
+        <label class="form-label" for="createDescription">Description</label>
+        <input type="text" class="form-control" id="createDescription" placeholder="Optional description" maxlength="300">
+    </div>
+    <div class="mb-2">
+        <label class="form-label" for="createContent">Content</label>
+        <textarea class="form-control" id="createContent" rows="15" placeholder="Prompt block content..."></textarea>
+        <div class="help-text mt-1">Available variables: <code>{user_level}</code></div>
+    </div>
+    <div class="form-actions">
+        <button class="btn btn-primary" onclick="createBlock()">
+            <i class="fas fa-save me-1"></i> Create Block
+        </button>
+        <button class="btn btn-outline-secondary" onclick="hideCreateForm()">Cancel</button>
+    </div>
+</div>
+
+<!-- Block Lists -->
+<div id="blocksContainer">
+    <div class="loading-container">
+        <span class="spinner-border spinner-border-sm me-2"></span> Loading blocks...
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+(function() {
+    'use strict';
+
+    // -- State --
+    var blocks = [];
+    var editingBlockId = null;
+    var editFormGuard = null;
+
+    // -- API Helpers --
+
+    async function apiGet(url) {
+        var resp = await secureFetch(url);
+        if (!resp) return null;
+        if (!resp.ok) {
+            var err = await resp.json().catch(function() { return {}; });
+            throw new Error(err.detail || err.message || ('HTTP ' + resp.status));
+        }
+        return resp.json();
+    }
+
+    async function apiPost(url, body) {
+        var resp = await secureFetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!resp) return null;
+        if (!resp.ok) {
+            var err = await resp.json().catch(function() { return {}; });
+            throw new Error(err.detail || err.message || ('HTTP ' + resp.status));
+        }
+        return resp.json();
+    }
+
+    async function apiPut(url, body) {
+        var resp = await secureFetch(url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!resp) return null;
+        if (!resp.ok) {
+            var err = await resp.json().catch(function() { return {}; });
+            throw new Error(err.detail || err.message || ('HTTP ' + resp.status));
+        }
+        return resp.json();
+    }
+
+    async function apiDelete(url) {
+        var resp = await secureFetch(url, { method: 'DELETE' });
+        if (!resp) return null;
+        if (!resp.ok) {
+            var err = await resp.json().catch(function() { return {}; });
+            throw new Error(err.detail || err.message || ('HTTP ' + resp.status));
+        }
+        return resp.json();
+    }
+
+    // -- Load Blocks --
+
+    async function loadBlocks() {
+        try {
+            var data = await apiGet('/api/system-prompt-blocks');
+            if (!data) return;
+            blocks = data.blocks || data;
+            if (Array.isArray(data)) blocks = data;
+            renderBlocks();
+            updateStats();
+        } catch (e) {
+            console.error('Failed to load blocks:', e);
+            document.getElementById('blocksContainer').innerHTML =
+                '<div class="empty-state"><i class="fas fa-exclamation-triangle"></i>Failed to load blocks: ' +
+                escapeHtml(e.message) + '</div>';
+        }
+    }
+
+    // -- Stats --
+
+    function updateStats() {
+        var active = 0, disabled = 0, pre = 0, post = 0;
+        for (var i = 0; i < blocks.length; i++) {
+            var b = blocks[i];
+            if (b._missing) continue;
+            if (b.is_enabled) active++; else disabled++;
+            if (b.position === 'pre_prompt') pre++; else post++;
+        }
+        document.getElementById('statActive').textContent = active;
+        document.getElementById('statDisabled').textContent = disabled;
+        document.getElementById('statPre').textContent = pre;
+        document.getElementById('statPost').textContent = post;
+    }
+
+    // -- Render --
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        var div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    function formatCondition(cond) {
+        if (cond === 'watchdog_only') return 'Watchdog only';
+        return 'Always';
+    }
+
+    function formatPosition(pos) {
+        if (pos === 'pre_prompt') return 'Pre-prompt';
+        return 'Post-prompt';
+    }
+
+    function renderBlocks() {
+        var preBlocks = [];
+        var postBlocks = [];
+
+        for (var i = 0; i < blocks.length; i++) {
+            if (blocks[i].position === 'pre_prompt') {
+                preBlocks.push(blocks[i]);
+            } else {
+                postBlocks.push(blocks[i]);
+            }
+        }
+
+        var html = '';
+
+        // Pre-prompt section
+        html += '<div class="position-header"><i class="fas fa-arrow-up"></i> PRE-PROMPT BLOCKS <span style="font-weight:400; font-size:0.75rem;">(before bot personality)</span></div>';
+        html += '<div id="prePromptZone" class="drop-zone" data-position="pre_prompt">';
+        if (preBlocks.length === 0) {
+            html += '<div class="empty-state"><i class="fas fa-inbox"></i>No pre-prompt blocks</div>';
+        } else {
+            for (var j = 0; j < preBlocks.length; j++) {
+                html += renderBlockCard(preBlocks[j]);
+            }
+        }
+        html += '</div>';
+
+        // Post-prompt section
+        html += '<div class="position-header" style="margin-top: 24px;"><i class="fas fa-arrow-down"></i> POST-PROMPT BLOCKS <span style="font-weight:400; font-size:0.75rem;">(after bot personality)</span></div>';
+        html += '<div id="postPromptZone" class="drop-zone" data-position="post_prompt">';
+        if (postBlocks.length === 0) {
+            html += '<div class="empty-state"><i class="fas fa-inbox"></i>No post-prompt blocks</div>';
+        } else {
+            for (var k = 0; k < postBlocks.length; k++) {
+                html += renderBlockCard(postBlocks[k]);
+            }
+        }
+        html += '</div>';
+
+        document.getElementById('blocksContainer').innerHTML = html;
+
+        // Re-attach DnD listeners
+        initDragAndDrop();
+    }
+
+    function renderBlockCard(block) {
+        var isSystem = block.is_system && block.system_key;
+        var isMandatory = block._mandatory;
+        var isMissing = block._missing;
+        var id = block.id;
+
+        var cardClasses = 'block-card';
+        if (isMissing) cardClasses += ' missing';
+
+        var draggable = (!isSystem && !isMissing) ? ' draggable="true"' : '';
+        var dataId = id ? (' data-block-id="' + id + '"') : '';
+        var dataSysKey = block.system_key ? (' data-system-key="' + escapeHtml(block.system_key) + '"') : '';
+
+        var html = '<div class="' + cardClasses + '"' + draggable + dataId + dataSysKey + '>';
+        html += '<div class="block-header">';
+
+        // Drag handle (custom blocks only)
+        if (!isSystem && !isMissing) {
+            html += '<span class="drag-handle" title="Drag to reorder"><i class="fas fa-grip-vertical"></i></span>';
+        }
+
+        // Name
+        html += '<span class="block-name">' + escapeHtml(block.name) + '</span>';
+
+        // Badges
+        if (isMandatory) {
+            html += '<span class="badge-mandatory">MANDATORY</span>';
+        } else if (isSystem) {
+            html += '<span class="badge-system">SYSTEM</span>';
+        }
+        if (block.condition !== 'always') {
+            html += '<span class="badge-condition">' + escapeHtml(formatCondition(block.condition)) + '</span>';
+        }
+
+        // Actions
+        html += '<div class="block-actions">';
+
+        if (isMissing) {
+            // Restore button for missing blocks
+            html += '<button class="btn btn-sm btn-outline-warning" onclick="restoreBlock(\'' +
+                    escapeHtml(block.system_key) + '\')" title="Restore this system block">' +
+                    '<i class="fas fa-undo me-1"></i>Restore</button>';
+        } else {
+            // Toggle switch
+            html += '<div class="block-toggle form-check form-switch mb-0">';
+            var toggleDisabled = isMandatory ? ' disabled' : '';
+            var toggleChecked = block.is_enabled ? ' checked' : '';
+            var toggleOnChange = isMandatory ? '' : ' onchange="toggleBlock(' + id + ', this.checked, \'' + (block.system_key || '') + '\')"';
+            html += '<input class="form-check-input" type="checkbox" role="switch"' +
+                    toggleChecked + toggleDisabled + toggleOnChange +
+                    ' id="toggle_' + id + '" title="' + (isMandatory ? 'Cannot disable mandatory block' : 'Toggle enabled/disabled') + '">';
+            html += '</div>';
+
+            // Edit button
+            html += '<button class="btn btn-sm btn-outline-secondary" onclick="showEditForm(' + id + ')" title="Edit block">' +
+                    '<i class="fas fa-pen"></i></button>';
+        }
+
+        html += '</div>'; // block-actions
+        html += '</div>'; // block-header
+
+        // Meta row
+        html += '<div class="block-meta">';
+        if (isSystem) {
+            html += '<span>' + escapeHtml(formatCondition(block.condition)) + ' (locked)</span>';
+            html += '<span>|</span>';
+            html += '<span>order: fixed</span>';
+        } else if (!isMissing) {
+            html += '<span>' + escapeHtml(formatCondition(block.condition)) + '</span>';
+        }
+        if (block.description) {
+            html += '<span>|</span>';
+            html += '<span>' + escapeHtml(block.description) + '</span>';
+        }
+        html += '</div>';
+
+        // Inline edit form placeholder
+        html += '<div class="block-form" id="editForm_' + id + '"></div>';
+
+        html += '</div>'; // block-card
+        return html;
+    }
+
+    // -- Edit Form --
+
+    function showEditForm(blockId) {
+        // Close any existing edit form
+        closeEditForm();
+
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        editingBlockId = blockId;
+        var isSystem = block.is_system && block.system_key;
+        var isMandatory = block._mandatory;
+
+        var formEl = document.getElementById('editForm_' + blockId);
+        if (!formEl) return;
+
+        var html = '<h6 style="margin-bottom: 14px; color: var(--text-primary); font-weight: 700;">' +
+                   '<i class="fas fa-pen me-2" style="color: var(--accent);"></i>Edit: ' + escapeHtml(block.name) + '</h6>';
+
+        html += '<div class="row">';
+
+        // Name field
+        html += '<div class="col-md-6 mb-3">';
+        html += '<label class="form-label">Name</label>';
+        html += '<input type="text" class="form-control" id="editName_' + blockId + '" value="' + escapeHtml(block.name) + '" maxlength="100">';
+        html += '</div>';
+
+        // Position
+        html += '<div class="col-md-3 mb-3">';
+        html += '<label class="form-label">Position</label>';
+        if (isSystem) {
+            html += '<div class="frozen-value">' + escapeHtml(formatPosition(block.position)) + ' <i class="fas fa-lock" title="Frozen for system blocks"></i></div>';
+        } else {
+            html += '<div class="position-radio-group mt-1">';
+            html += '<div class="form-check">';
+            html += '<input class="form-check-input" type="radio" name="editPosition_' + blockId + '" id="editPosPre_' + blockId + '" value="pre_prompt"' + (block.position === 'pre_prompt' ? ' checked' : '') + '>';
+            html += '<label class="form-check-label" for="editPosPre_' + blockId + '">Pre-prompt</label>';
+            html += '</div>';
+            html += '<div class="form-check">';
+            html += '<input class="form-check-input" type="radio" name="editPosition_' + blockId + '" id="editPosPost_' + blockId + '" value="post_prompt"' + (block.position === 'post_prompt' ? ' checked' : '') + '>';
+            html += '<label class="form-check-label" for="editPosPost_' + blockId + '">Post-prompt</label>';
+            html += '</div>';
+            html += '</div>';
+        }
+        html += '</div>';
+
+        // Condition
+        html += '<div class="col-md-3 mb-3">';
+        html += '<label class="form-label">Condition</label>';
+        if (isSystem) {
+            html += '<div class="frozen-value">' + escapeHtml(formatCondition(block.condition)) + ' <i class="fas fa-lock" title="Frozen for system blocks"></i></div>';
+        } else {
+            html += '<select class="form-select" id="editCondition_' + blockId + '">';
+            html += '<option value="always"' + (block.condition === 'always' ? ' selected' : '') + '>Always</option>';
+            html += '<option value="watchdog_only"' + (block.condition === 'watchdog_only' ? ' selected' : '') + '>Watchdog only</option>';
+            html += '</select>';
+        }
+        html += '</div>';
+
+        html += '</div>'; // row
+
+        // Description
+        html += '<div class="mb-3">';
+        html += '<label class="form-label">Description</label>';
+        html += '<input type="text" class="form-control" id="editDescription_' + blockId + '" value="' + escapeHtml(block.description || '') + '" maxlength="300" placeholder="Optional description">';
+        html += '</div>';
+
+        // Content
+        html += '<div class="mb-2">';
+        html += '<label class="form-label">Content</label>';
+        html += '<textarea class="form-control" id="editContent_' + blockId + '" rows="15">' + escapeHtml(block.content) + '</textarea>';
+        html += '<div class="help-text mt-1">Available variables: <code>{user_level}</code></div>';
+        html += '</div>';
+
+        // Actions
+        html += '<div class="form-actions">';
+        html += '<button class="btn btn-primary" onclick="saveBlock(' + blockId + ')"><i class="fas fa-save me-1"></i> Save</button>';
+        html += '<button class="btn btn-outline-secondary" onclick="closeEditForm()">Cancel</button>';
+
+        if (isSystem) {
+            html += '<button class="btn btn-outline-warning form-actions-right" onclick="resetBlock(' + blockId + ')">' +
+                    '<i class="fas fa-undo me-1"></i> Reset to Default</button>';
+        } else {
+            html += '<button class="btn btn-outline-danger form-actions-right" onclick="deleteBlock(' + blockId + ')">' +
+                    '<i class="fas fa-trash me-1"></i> Delete</button>';
+        }
+
+        html += '</div>';
+
+        formEl.innerHTML = html;
+        formEl.classList.add('visible');
+
+        // Attach FormGuard
+        if (typeof FormGuard !== 'undefined' && FormGuard.watchWithListeners) {
+            editFormGuard = FormGuard.watchWithListeners(formEl);
+        }
+    }
+
+    function closeEditForm() {
+        if (editingBlockId !== null) {
+            var formEl = document.getElementById('editForm_' + editingBlockId);
+            if (formEl) {
+                formEl.classList.remove('visible');
+                formEl.innerHTML = '';
+            }
+            if (editFormGuard && typeof FormGuard !== 'undefined' && FormGuard.unwatch) {
+                FormGuard.unwatch(editFormGuard);
+            }
+            editFormGuard = null;
+            editingBlockId = null;
+        }
+    }
+
+    // -- Create Form --
+
+    function showCreateForm() {
+        var form = document.getElementById('createForm');
+        form.classList.add('visible');
+        document.getElementById('createName').value = '';
+        document.getElementById('createDescription').value = '';
+        document.getElementById('createContent').value = '';
+        document.getElementById('createCondition').value = 'always';
+        document.querySelector('#createPosPost').checked = true;
+        document.getElementById('createName').focus();
+        document.getElementById('newBlockBtn').disabled = true;
+    }
+
+    function hideCreateForm() {
+        var form = document.getElementById('createForm');
+        form.classList.remove('visible');
+        document.getElementById('newBlockBtn').disabled = false;
+    }
+
+    // -- CRUD Operations --
+
+    async function createBlock() {
+        var name = document.getElementById('createName').value.trim();
+        var content = document.getElementById('createContent').value;
+        var description = document.getElementById('createDescription').value.trim();
+        var position = document.querySelector('input[name="createPosition"]:checked').value;
+        var condition = document.getElementById('createCondition').value;
+
+        if (!name) {
+            NotificationModal.warning('Validation', 'Block name is required.');
+            return;
+        }
+        if (!content.trim()) {
+            NotificationModal.warning('Validation', 'Block content cannot be empty.');
+            return;
+        }
+
+        try {
+            await apiPost('/api/system-prompt-blocks', {
+                name: name,
+                content: content,
+                description: description,
+                position: position,
+                condition: condition
+            });
+            hideCreateForm();
+            await loadBlocks();
+            NotificationModal.info('Block Created', 'New prompt block "' + name + '" has been created.');
+        } catch (e) {
+            NotificationModal.error('Create Failed', e.message);
+        }
+    }
+
+    async function saveBlock(blockId) {
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        var isSystem = block.is_system && block.system_key;
+        var name = document.getElementById('editName_' + blockId).value.trim();
+        var content = document.getElementById('editContent_' + blockId).value;
+        var description = document.getElementById('editDescription_' + blockId).value.trim();
+
+        var position, condition;
+        if (isSystem) {
+            position = block.position;
+            condition = block.condition;
+        } else {
+            position = document.querySelector('input[name="editPosition_' + blockId + '"]:checked').value;
+            condition = document.getElementById('editCondition_' + blockId).value;
+        }
+
+        if (!name) {
+            NotificationModal.warning('Validation', 'Block name is required.');
+            return;
+        }
+        if (!content.trim()) {
+            NotificationModal.warning('Validation', 'Block content cannot be empty.');
+            return;
+        }
+
+        try {
+            await apiPut('/api/system-prompt-blocks/' + blockId, {
+                name: name,
+                content: content,
+                description: description,
+                position: position,
+                condition: condition,
+                is_enabled: block.is_enabled
+            });
+            closeEditForm();
+            await loadBlocks();
+            NotificationModal.info('Block Saved', 'Changes to "' + name + '" have been saved.');
+        } catch (e) {
+            NotificationModal.error('Save Failed', e.message);
+        }
+    }
+
+    async function toggleBlock(blockId, enabled, systemKey) {
+        // Warn when disabling watchdog_preamble
+        if (!enabled && systemKey === 'watchdog_preamble') {
+            NotificationModal.confirm(
+                'Disable Watchdog Preamble?',
+                'Disabling this block may reduce watchdog directive effectiveness. The watchdog will still inject hints but without the authority preamble.',
+                function() { doToggle(blockId, enabled); },
+                function() {
+                    // Revert the toggle
+                    var toggle = document.getElementById('toggle_' + blockId);
+                    if (toggle) toggle.checked = true;
+                },
+                { type: 'warning', confirmText: 'Disable' }
+            );
+            return;
+        }
+
+        doToggle(blockId, enabled);
+    }
+
+    async function doToggle(blockId, enabled) {
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        try {
+            await apiPut('/api/system-prompt-blocks/' + blockId, {
+                name: block.name,
+                content: block.content,
+                description: block.description || '',
+                position: block.position,
+                condition: block.condition,
+                is_enabled: enabled
+            });
+            await loadBlocks();
+        } catch (e) {
+            NotificationModal.error('Toggle Failed', e.message);
+            // Revert toggle on error
+            var toggle = document.getElementById('toggle_' + blockId);
+            if (toggle) toggle.checked = !enabled;
+        }
+    }
+
+    async function deleteBlock(blockId) {
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        NotificationModal.confirm(
+            'Delete Block',
+            'Are you sure you want to delete "' + block.name + '"? This cannot be undone.',
+            async function() {
+                try {
+                    await apiDelete('/api/system-prompt-blocks/' + blockId);
+                    closeEditForm();
+                    await loadBlocks();
+                    NotificationModal.info('Block Deleted', '"' + block.name + '" has been deleted.');
+                } catch (e) {
+                    NotificationModal.error('Delete Failed', e.message);
+                }
+            },
+            null,
+            { type: 'error', confirmText: 'Delete' }
+        );
+    }
+
+    async function resetBlock(blockId) {
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        NotificationModal.confirm(
+            'Reset to Default',
+            'This will restore "' + block.name + '" to its default content and re-enable it. Any custom edits will be lost.',
+            async function() {
+                try {
+                    await apiPost('/api/system-prompt-blocks/' + blockId + '/reset', {});
+                    closeEditForm();
+                    await loadBlocks();
+                    NotificationModal.info('Block Reset', '"' + block.name + '" has been reset to default.');
+                } catch (e) {
+                    NotificationModal.error('Reset Failed', e.message);
+                }
+            },
+            null,
+            { type: 'warning', confirmText: 'Reset' }
+        );
+    }
+
+    async function restoreBlock(systemKey) {
+        try {
+            await apiPost('/api/system-prompt-blocks/restore/' + systemKey, {});
+            await loadBlocks();
+            NotificationModal.info('Block Restored', 'System block "' + systemKey + '" has been restored.');
+        } catch (e) {
+            NotificationModal.error('Restore Failed', e.message);
+        }
+    }
+
+    // -- Reorder --
+
+    async function reorderBlocks(orderedIds) {
+        var reorderData = [];
+        for (var i = 0; i < orderedIds.length; i++) {
+            reorderData.push({ id: parseInt(orderedIds[i], 10), display_order: (i + 1) * 10 });
+        }
+        try {
+            await apiPut('/api/system-prompt-blocks/reorder', reorderData);
+            await loadBlocks();
+        } catch (e) {
+            NotificationModal.error('Reorder Failed', e.message);
+            await loadBlocks(); // Reload to reset visual order
+        }
+    }
+
+    // -- Drag and Drop --
+
+    var draggedEl = null;
+
+    function initDragAndDrop() {
+        var draggables = document.querySelectorAll('.block-card[draggable="true"]');
+        var zones = document.querySelectorAll('.drop-zone');
+
+        draggables.forEach(function(el) {
+            el.addEventListener('dragstart', onDragStart);
+            el.addEventListener('dragend', onDragEnd);
+        });
+
+        zones.forEach(function(zone) {
+            zone.addEventListener('dragover', onDragOver);
+            zone.addEventListener('dragleave', onDragLeave);
+            zone.addEventListener('drop', onDrop);
+        });
+    }
+
+    function onDragStart(e) {
+        draggedEl = e.currentTarget;
+        draggedEl.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', draggedEl.dataset.blockId);
+    }
+
+    function onDragEnd() {
+        if (draggedEl) draggedEl.classList.remove('dragging');
+        draggedEl = null;
+        // Remove all drag-over classes
+        document.querySelectorAll('.drag-over').forEach(function(el) {
+            el.classList.remove('drag-over');
+        });
+    }
+
+    function onDragOver(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+
+        // Find the closest block-card to insert before
+        var cards = Array.from(e.currentTarget.querySelectorAll('.block-card:not(.dragging)'));
+        cards.forEach(function(c) { c.classList.remove('drag-over'); });
+
+        var closest = getClosestCard(e.currentTarget, e.clientY);
+        if (closest) {
+            closest.classList.add('drag-over');
+        }
+    }
+
+    function onDragLeave(e) {
+        // Only handle if leaving the zone entirely
+        if (!e.currentTarget.contains(e.relatedTarget)) {
+            e.currentTarget.querySelectorAll('.drag-over').forEach(function(c) {
+                c.classList.remove('drag-over');
+            });
+        }
+    }
+
+    function onDrop(e) {
+        e.preventDefault();
+        if (!draggedEl) return;
+
+        var zone = e.currentTarget;
+        var newPosition = zone.dataset.position;
+        var blockId = parseInt(draggedEl.dataset.blockId, 10);
+        var block = findBlock(blockId);
+        if (!block) return;
+
+        // If position changed, update it via PUT first
+        var positionChanged = block.position !== newPosition;
+
+        // Find insertion point
+        var closest = getClosestCard(zone, e.clientY);
+        if (closest) {
+            zone.insertBefore(draggedEl, closest);
+        } else {
+            zone.appendChild(draggedEl);
+        }
+
+        // Collect new order of custom blocks in this zone
+        var customCards = zone.querySelectorAll('.block-card[draggable="true"]');
+        var orderedIds = [];
+        customCards.forEach(function(card) {
+            if (card.dataset.blockId) orderedIds.push(card.dataset.blockId);
+        });
+
+        // Clean up drag state
+        document.querySelectorAll('.drag-over').forEach(function(c) {
+            c.classList.remove('drag-over');
+        });
+
+        if (positionChanged) {
+            // Update position first, then reorder
+            apiPut('/api/system-prompt-blocks/' + blockId, {
+                name: block.name,
+                content: block.content,
+                description: block.description || '',
+                position: newPosition,
+                condition: block.condition,
+                is_enabled: block.is_enabled
+            }).then(function() {
+                return reorderBlocks(orderedIds);
+            }).catch(function(err) {
+                NotificationModal.error('Move Failed', err.message);
+                loadBlocks();
+            });
+        } else {
+            reorderBlocks(orderedIds);
+        }
+    }
+
+    function getClosestCard(zone, y) {
+        var cards = Array.from(zone.querySelectorAll('.block-card:not(.dragging)'));
+        var closest = null;
+        var closestOffset = Number.NEGATIVE_INFINITY;
+
+        for (var i = 0; i < cards.length; i++) {
+            var box = cards[i].getBoundingClientRect();
+            var offset = y - box.top - box.height / 2;
+            if (offset < 0 && offset > closestOffset) {
+                closestOffset = offset;
+                closest = cards[i];
+            }
+        }
+        return closest;
+    }
+
+    // -- Helpers --
+
+    function findBlock(blockId) {
+        for (var i = 0; i < blocks.length; i++) {
+            if (blocks[i].id === blockId) return blocks[i];
+        }
+        return null;
+    }
+
+    // -- Expose to global scope --
+    window.showCreateForm = showCreateForm;
+    window.hideCreateForm = hideCreateForm;
+    window.createBlock = createBlock;
+    window.saveBlock = saveBlock;
+    window.toggleBlock = toggleBlock;
+    window.deleteBlock = deleteBlock;
+    window.resetBlock = resetBlock;
+    window.restoreBlock = restoreBlock;
+    window.showEditForm = showEditForm;
+    window.closeEditForm = closeEditForm;
+
+    // -- Init --
+    document.addEventListener('DOMContentLoaded', loadBlocks);
+
+})();
+</script>
+{% endblock %}

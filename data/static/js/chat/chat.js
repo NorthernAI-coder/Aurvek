@@ -17,6 +17,7 @@ const limitMessage = 25;
 const processedMessageIds = new Set();
 let currentThinkingBudget = 0;
 let isCurrentConversationLocked = false;
+let userStopped = false;
 
 // Auto-scroll state management
 let isUserScrolledUp = false;
@@ -638,6 +639,7 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
         audioIcon.dataset.baseIcon = 'fa-volume-up';
         audioIcon.style.cursor = 'pointer';
         audioIcon.style.display = 'inline';
+        audioIcon.title = 'Read aloud';
 
         const resolveMessageText = () => {
             if (divMessage.classList.contains('multi-ai-message')) {
@@ -656,14 +658,15 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
         bookmarkIcon.classList.add('fas', 'fa-bookmark', 'bookmark-icon');
         bookmarkIcon.style.cursor = 'pointer';
         bookmarkIcon.style.display = 'none';
-    
+        bookmarkIcon.title = 'Add to bookmarks';
+
         if (messageObj && messageObj.is_bookmarked) {
             bookmarkIcon.classList.add('bookmarked');
             bookmarkIcon.style.display = 'inline';
         }
     
         const conversationId = messageObj && messageObj.conversation_id ? messageObj.conversation_id : currentConversationId;
-        bookmarkIcon.dataset.conversationId = conversationId;
+        bookmarkIcon.dataset.bookmarkConversationId = conversationId;
     
         bookmarkIcon.onclick = function() {
             const messageElement = this.closest('.message');
@@ -679,12 +682,33 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
         copyIcon.classList.add('fas', 'fa-copy', 'copy-icon');
         copyIcon.style.cursor = 'pointer';
         copyIcon.style.display = 'none';
+        copyIcon.title = 'Copy text';
         copyIcon.onclick = function() {
             copyToClipboard(resolveMessageText(), copyIcon);
         };
     
         iconContainer.appendChild(audioIcon);
         iconContainer.appendChild(bookmarkIcon);
+
+        if (author === 'bot') {
+            const rollbackIcon = document.createElement('i');
+            rollbackIcon.classList.add('fas', 'fa-level-up-alt', 'rollback-icon');
+            rollbackIcon.style.cursor = 'pointer';
+            rollbackIcon.style.display = 'none';
+            rollbackIcon.title = 'Start over from here';
+            if (messageId) {
+                rollbackIcon.setAttribute('data-message-id', messageId);
+            }
+            rollbackIcon.onclick = function() {
+                rollbackConversation(this.getAttribute('data-message-id'), currentConversationId);
+            };
+
+            const chatTitle = document.querySelector('.chatbot-info h4').textContent;
+            if (chatTitle !== "My Bookmarks") {
+                iconContainer.appendChild(rollbackIcon);
+            }
+        }
+
         iconContainer.appendChild(copyIcon);
 
         // Branch icon - appears on all messages (user and bot), hidden in Bookmarks view
@@ -702,25 +726,6 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
                 branchConversation(this.getAttribute('data-message-id'), currentConversationId);
             };
             iconContainer.appendChild(branchIcon);
-        }
-
-        if (author === 'bot') {
-            const rollbackIcon = document.createElement('i');
-            rollbackIcon.classList.add('fas', 'fa-undo', 'rollback-icon');
-            rollbackIcon.style.cursor = 'pointer';
-            rollbackIcon.style.display = 'none';
-            rollbackIcon.title = 'Start over from here';
-            if (messageId) {
-                rollbackIcon.setAttribute('data-message-id', messageId);
-            }
-            rollbackIcon.onclick = function() {
-                rollbackConversation(this.getAttribute('data-message-id'), currentConversationId);
-            };
-    
-            const chatTitle = document.querySelector('.chatbot-info h4').textContent;
-            if (chatTitle !== "My Bookmarks") {
-                iconContainer.appendChild(rollbackIcon);
-            }
         }
 
         // Add arrow icon if we are in "My Bookmarks"
@@ -813,7 +818,7 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
 
     divMessage.addEventListener('mouseover', function() {
         const messageId = this.dataset.messageId;
-        this.querySelectorAll('.fa-bookmark, .fa-copy, .fa-code-branch, .fa-undo, .fa-arrow-right').forEach(icon => {
+        this.querySelectorAll('.fa-bookmark, .fa-copy, .fa-code-branch, .fa-level-up-alt, .fa-arrow-right').forEach(icon => {
             if (!icon.classList.contains('bookmarked')) {
                 if (icon.classList.contains('fa-bookmark') && !messageId) {
                     icon.style.display = 'none';
@@ -825,7 +830,7 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
     });
 
     divMessage.addEventListener('mouseout', function() {
-        this.querySelectorAll('.fa-bookmark, .fa-copy, .fa-code-branch, .fa-undo, .fa-arrow-right').forEach(icon => {
+        this.querySelectorAll('.fa-bookmark, .fa-copy, .fa-code-branch, .fa-level-up-alt, .fa-arrow-right').forEach(icon => {
             if (!icon.classList.contains('bookmarked')) {
                 icon.style.display = 'none';
             }
@@ -1068,6 +1073,44 @@ function sendMessage(messageText) {
     processFiles(attachedFiles, formData, imagePreviews);
     attachedFiles = [];
 
+    // Hoisted for error cleanup access across the entire promise chain
+    let botMessageElement = null;
+    let botMessageParagraph = null;
+    let streamContentReceived = false;
+    let streamErrorOccurred = false;
+    let streamSucceeded = false;
+    userStopped = false;
+
+    function cleanupFailedStream(userMsgEl, botMsgEl, restoreText) {
+        const hadAttachments = formData.getAll('file').length > 0;
+
+        // Remove empty/partial bot bubble
+        if (botMsgEl && botMsgEl.parentNode) {
+            botMsgEl.remove();
+        }
+
+        // Handle user message cleanup
+        if (hadAttachments) {
+            // Files were sent -- keep user message in DOM for visual context
+        } else if (userMsgEl && userMsgEl.parentNode) {
+            if (restoreText) {
+                const originalText = userMsgEl.querySelector('p')?.textContent;
+                if (originalText) {
+                    document.getElementById('message-text').value = originalText;
+                }
+            }
+            userMsgEl.remove();
+        }
+
+        removeLoadingIndicator();
+        toggleSendButton('Send');
+        document.getElementById('message-text').disabled = false;
+        const submitBtn = document.querySelector('#form-message button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = false;
+        document.getElementById('message-text').focus();
+        document.getElementById('message-text').style.height = 'auto';
+    }
+
     controller = new AbortController();
     const signal = controller.signal;
 
@@ -1079,15 +1122,6 @@ function sendMessage(messageText) {
         signal: signal,
     })
     .then(response => {
-        const restoreInputAfterFailure = () => {
-            if (userMessageElement) userMessageElement.remove();
-            removeLoadingIndicator();
-            toggleSendButton('Send');
-            document.getElementById('message-text').disabled = false;
-            const submitBtn = document.querySelector('#form-message button[type="submit"]');
-            if (submitBtn) submitBtn.disabled = false;
-            document.getElementById('message-text').focus();
-        };
 
         const extractServerError = (resp) => {
             if (!resp) return Promise.resolve('Request failed');
@@ -1119,7 +1153,7 @@ function sendMessage(messageText) {
             });
         }
         if (response.status === 403) {
-            restoreInputAfterFailure();
+            cleanupFailedStream(userMessageElement, botMessageElement, true);
             document.getElementById('loading-indicator').style.display = 'none';
 
             // Try to parse response to distinguish app-level lock from external block (e.g. Cloudflare WAF)
@@ -1151,7 +1185,7 @@ function sendMessage(messageText) {
         }
 
         if (!response.ok) {
-            restoreInputAfterFailure();
+            cleanupFailedStream(userMessageElement, botMessageElement, true);
             return extractServerError(response).then((msg) => {
                 NotificationModal.error('Send failed', String(msg));
                 return null;
@@ -1159,7 +1193,7 @@ function sendMessage(messageText) {
         }
 
         if (!response.body) {
-            restoreInputAfterFailure();
+            cleanupFailedStream(userMessageElement, botMessageElement, true);
             NotificationModal.error('Send failed', 'No response stream received from server.');
             return null;
         }
@@ -1179,7 +1213,7 @@ function sendMessage(messageText) {
         let streamCitations = null;
 
         // Create the bot message element before starting to read the stream
-        const botMessageElement = document.createElement('div');
+        botMessageElement = document.createElement('div');
         botMessageElement.classList.add('message', 'text-white', 'bot');
 
         // Create the container for the avatar and the message
@@ -1196,7 +1230,7 @@ function sendMessage(messageText) {
         const messageContent = document.createElement('div');
         messageContent.classList.add('message-content');
 
-        let botMessageParagraph = null;
+        botMessageParagraph = null;
         let multiAiCarousel = null;
         if (isMultiAiRequest) {
             botMessageElement.classList.add('multi-ai-message');
@@ -1232,6 +1266,7 @@ function sendMessage(messageText) {
 
         const audioIcon = createIcon('fa-volume-up', 'inline', () => textToSpeech(getCurrentBotText(), user_id, currentConversationId, audioIcon, 'bot'));
         audioIcon.dataset.baseIcon = 'fa-volume-up';
+        audioIcon.title = 'Read aloud';
         const bookmarkIcon = createIcon('fa-bookmark', 'none', function() {
             const messageElement = this.closest('.message');
             const messageId = messageElement ? messageElement.dataset.messageId : null;
@@ -1241,15 +1276,19 @@ function sendMessage(messageText) {
                 console.error('Could not find message ID to mark as favorite');
             }
         });
+        bookmarkIcon.title = 'Add to bookmarks';
         const copyIcon = createIcon('fa-copy', 'none', () => copyToClipboard(getCurrentBotText(), copyIcon));
+        copyIcon.title = 'Copy text';
         const branchIcon = createIcon('fa-code-branch', 'none', () => branchConversation(newMessageId, currentConversationId));
-        const rollbackIcon = createIcon('fa-undo', 'none', () => rollbackConversation(newMessageId, currentConversationId));
+        branchIcon.title = 'Branch from here';
+        const rollbackIcon = createIcon('fa-level-up-alt', 'none', () => rollbackConversation(newMessageId, currentConversationId));
+        rollbackIcon.title = 'Start over from here';
 
         iconContainer.appendChild(audioIcon);
         iconContainer.appendChild(bookmarkIcon);
+        iconContainer.appendChild(rollbackIcon);
         iconContainer.appendChild(copyIcon);
         iconContainer.appendChild(branchIcon);
-        iconContainer.appendChild(rollbackIcon);
 
         const timeSpan = document.createElement('span');
         infoContainer.appendChild(iconContainer);
@@ -1261,9 +1300,9 @@ function sendMessage(messageText) {
             icon.classList.add('fas', iconClass);
             icon.style.cursor = 'pointer';
             icon.style.display = styleDisplay;
-            if (messageId && (iconClass === 'fa-undo' || iconClass === 'fa-code-branch')) {
+            if (messageId && (iconClass === 'fa-level-up-alt' || iconClass === 'fa-code-branch')) {
                 icon.setAttribute('data-message-id', messageId);
-                if (iconClass === 'fa-undo') {
+                if (iconClass === 'fa-level-up-alt') {
                     icon.onclick = function() {
                         rollbackConversation(this.getAttribute('data-message-id'), currentConversationId);
                     };
@@ -1287,13 +1326,35 @@ function sendMessage(messageText) {
         function readStream() {
             return reader.read().then(({ done, value }) => {
 				if (done) {
+					if (userStopped && !streamContentReceived) {
+						if (botMessageElement?.parentNode) botMessageElement.remove();
+						toggleSendButton('Send');
+						return;
+					}
+					if (!streamContentReceived && !streamErrorOccurred) {
+						cleanupFailedStream(userMessageElement, botMessageElement, true);
+						const hadAttachments = formData.getAll('file').length > 0;
+						if (hadAttachments) {
+							NotificationModal.error('Empty response',
+								'The AI returned an empty response. Files were uploaded but the response failed. Please re-attach your files and try again.');
+						} else {
+							NotificationModal.error('Empty response',
+								'The AI returned an empty response. Your message has been restored. Please try again.');
+						}
+						return;
+					}
+					if (streamErrorOccurred && !streamContentReceived) {
+						cleanupFailedStream(userMessageElement, botMessageElement, true);
+						return;
+					}
+					streamSucceeded = true;
 					toggleSendButton('Send');
 					initializeNewImages(botMessageElement);
 					if (updatedChatName) {
 						updateActiveChatName(updatedChatName);
 					}
 					return;
-				}				
+				}
                 sseBuffer += sseDecoder.decode(value, { stream: true });
                 const lines = sseBuffer.split('\n');
                 // Keep the last (potentially incomplete) line in the buffer
@@ -1304,6 +1365,28 @@ function sendMessage(messageText) {
                         const data = line.slice(6).trim();
 						
                         if (data === '[DONE]') {
+                            if (userStopped && !streamContentReceived) {
+                                if (botMessageElement?.parentNode) botMessageElement.remove();
+                                toggleSendButton('Send');
+                                return;
+                            }
+                            if (!streamContentReceived && !streamErrorOccurred) {
+                                cleanupFailedStream(userMessageElement, botMessageElement, true);
+                                const hadAttachments = formData.getAll('file').length > 0;
+                                if (hadAttachments) {
+                                    NotificationModal.error('Empty response',
+                                        'The AI returned an empty response. Files were uploaded but the response failed. Please re-attach your files and try again.');
+                                } else {
+                                    NotificationModal.error('Empty response',
+                                        'The AI returned an empty response. Your message has been restored. Please try again.');
+                                }
+                                return;
+                            }
+                            if (streamErrorOccurred && !streamContentReceived) {
+                                cleanupFailedStream(userMessageElement, botMessageElement, true);
+                                return;
+                            }
+                            streamSucceeded = true;
                             toggleSendButton('Send');
                             initializeNewImages(botMessageElement);
                             return;
@@ -1337,16 +1420,26 @@ function sendMessage(messageText) {
                             // Handle thinking tokens streaming
                             if (parsedData.type === 'thinking_start') {
                                 if (messageContent && botMessageParagraph) {
-                                    const details = document.createElement('details');
-                                    details.className = 'thinking-block';
-                                    details.open = true;
-                                    const summary = document.createElement('summary');
-                                    summary.textContent = 'Thinking...';
-                                    const content = document.createElement('pre');
-                                    content.className = 'thinking-content';
-                                    details.appendChild(summary);
-                                    details.appendChild(content);
-                                    messageContent.insertBefore(details, botMessageParagraph);
+                                    const existing = messageContent.querySelector('.thinking-block');
+                                    if (existing) {
+                                        // Reuse existing block: reopen and add separator
+                                        existing.open = true;
+                                        const summary = existing.querySelector('summary');
+                                        if (summary) summary.textContent = 'Thinking...';
+                                        const content = existing.querySelector('.thinking-content');
+                                        if (content) content.textContent += '\n\n---\n\n';
+                                    } else {
+                                        const details = document.createElement('details');
+                                        details.className = 'thinking-block';
+                                        details.open = true;
+                                        const summary = document.createElement('summary');
+                                        summary.textContent = 'Thinking...';
+                                        const content = document.createElement('pre');
+                                        content.className = 'thinking-content';
+                                        details.appendChild(summary);
+                                        details.appendChild(content);
+                                        messageContent.insertBefore(details, botMessageParagraph);
+                                    }
                                 }
                             } else if (parsedData.type === 'thinking') {
                                 const thinkingContent = messageContent?.querySelector('.thinking-content');
@@ -1365,6 +1458,7 @@ function sendMessage(messageText) {
                             } else if (parsedData.updated_chat_name) {
                                 updateActiveChatName(parsedData.updated_chat_name);
                             } else if (parsedData.multi_ai && multiAiCarousel?._multiAiApi) {
+                                streamContentReceived = true;
                                 multiAiCarousel._multiAiApi.appendChunk(parsedData.llm_id, parsedData.content || '');
                                 botMessageText = getActiveMultiAiSlideText(botMessageElement);
                                 scrollToBottomIfNeeded();
@@ -1375,6 +1469,8 @@ function sendMessage(messageText) {
                                 scrollToBottomIfNeeded();
                             } else if (parsedData.error && !parsedData.multi_ai_error) {
                                 console.error('SSE error:', parsedData.error);
+                                streamErrorOccurred = true;
+                                NotificationModal.error('AI Error', parsedData.error);
                                 if (multiAiCarousel?._multiAiApi) {
                                     multiAiCarousel._multiAiApi.setGlobalError(parsedData.error);
                                 } else if (botMessageParagraph) {
@@ -1385,6 +1481,7 @@ function sendMessage(messageText) {
                                     botMessageParagraph.appendChild(errorEl);
                                 }
                             } else if (parsedData.video_content && botMessageParagraph) {
+                                streamContentReceived = true;
                                 // Handle video content - render as video element
                                 try {
                                     const videoData = JSON.parse(parsedData.video_content);
@@ -1423,7 +1520,16 @@ function sendMessage(messageText) {
                                 const indicator = botMessageParagraph.querySelector('.searching-indicator');
                                 if (indicator) indicator.remove();
                                 botMessageText = '';
+                            } else if (parsedData.gransabio_verbose && botMessageParagraph) {
+                                // GranSabio pipeline progress
+                                renderGranSabioStatus(botMessageParagraph, parsedData.gransabio_verbose);
+                                scrollToBottomIfNeeded();
+                            } else if (parsedData.gransabio_complete && botMessageParagraph) {
+                                // GranSabio pipeline complete summary
+                                finalizeGranSabioStatus(botMessageParagraph, parsedData.gransabio_complete);
+                                scrollToBottomIfNeeded();
                             } else if (parsedData.content && !parsedData.multi_ai && botMessageParagraph) {
+                                streamContentReceived = true;
                                 // Handle replace_last for progress updates
                                 if (parsedData.replace_last) {
                                     botMessageText = parsedData.content;
@@ -1481,82 +1587,109 @@ function sendMessage(messageText) {
         return readStream().then(() => {
             removeLoadingIndicator();
             document.getElementById('message-text').disabled = false;
-            document.querySelector('#form-message button[type="submit"]').disabled = false;
+            const submitBtnEl = document.querySelector('#form-message button[type="submit"]');
+            if (submitBtnEl) submitBtnEl.disabled = false;
             document.getElementById('message-text').focus();
             scrollToBottomIfNeeded();
 
-            isCurrentConversationEmpty = false;
-            attachedFiles = [];
-            if (endConversation) {
-                document.getElementById('message-text').disabled = true;
-                document.getElementById('send-button').disabled = true;
-                toggleSendButton('Send');
-                document.getElementById('send-button').onclick = null;
-            } else {
-                toggleSendButton('Send');
-            }
-
-            // Update the bot message ID
-            if (newMessageId) {
-                updateMessageId(newMessageId, botMessageElement);
-            }
-            if (newUserMessageId && userMessageElement) {
-                updateMessageId(newUserMessageId, userMessageElement);
-            }
-
-            applyCollapsibleCodeBlocks(botMessageElement);
-
-            // Render web search citations if any were collected
-            if (streamCitations && streamCitations.length > 0) {
-                const sourcesBlock = buildSourcesBlock(streamCitations);
-                if (sourcesBlock) {
-                    const msgContent = botMessageElement.querySelector('.message-content');
-                    const msgInfo = msgContent.querySelector('.message-info');
-                    msgContent.insertBefore(sourcesBlock, msgInfo);
+            if (streamSucceeded) {
+                isCurrentConversationEmpty = false;
+                attachedFiles = [];
+                if (endConversation) {
+                    document.getElementById('message-text').disabled = true;
+                    document.getElementById('send-button').disabled = true;
+                    toggleSendButton('Send');
+                    document.getElementById('send-button').onclick = null;
+                } else {
+                    toggleSendButton('Send');
                 }
-            }
 
-            // Multi-AI: reset state after message completes
-            if (window.multiAiManager) {
-                window.multiAiManager.afterMessageSent();
-            }
+                // Update the bot message ID
+                if (newMessageId) {
+                    updateMessageId(newMessageId, botMessageElement);
+                }
+                if (newUserMessageId && userMessageElement) {
+                    updateMessageId(newUserMessageId, userMessageElement);
+                }
 
-            // Move this conversation to the top of the sidebar
-            moveConversationToTop(currentConversationId);
+                applyCollapsibleCodeBlocks(botMessageElement);
 
-            // Add event listeners to show/hide icons
-            botMessageElement.addEventListener('mouseover', function() {
-                const messageId = this.dataset.messageId;
-                this.querySelectorAll('.fa-volume-up, .fa-bookmark, .fa-copy, .fa-code-branch, .fa-undo').forEach(icon => {
-                    if (!icon.classList.contains('bookmarked')) {
-                        if (icon.classList.contains('fa-bookmark') && !messageId) {
-                            icon.style.display = 'none';
-                            return;
+                // Render web search citations if any were collected
+                if (streamCitations && streamCitations.length > 0) {
+                    const sourcesBlock = buildSourcesBlock(streamCitations);
+                    if (sourcesBlock) {
+                        const msgContent = botMessageElement.querySelector('.message-content');
+                        const msgInfo = msgContent.querySelector('.message-info');
+                        msgContent.insertBefore(sourcesBlock, msgInfo);
+                    }
+                }
+
+                // Multi-AI: reset state after message completes
+                if (window.multiAiManager) {
+                    window.multiAiManager.afterMessageSent();
+                }
+
+                // Move this conversation to the top of the sidebar
+                moveConversationToTop(currentConversationId);
+
+                // Add event listeners to show/hide icons
+                botMessageElement.addEventListener('mouseover', function() {
+                    const messageId = this.dataset.messageId;
+                    this.querySelectorAll('.fa-volume-up, .fa-bookmark, .fa-copy, .fa-code-branch, .fa-level-up-alt').forEach(icon => {
+                        if (!icon.classList.contains('bookmarked')) {
+                            if (icon.classList.contains('fa-bookmark') && !messageId) {
+                                icon.style.display = 'none';
+                                return;
+                            }
+                            icon.style.display = 'inline';
                         }
-                        icon.style.display = 'inline';
-                    }
+                    });
                 });
-            });
 
-            botMessageElement.addEventListener('mouseout', function() {
-                this.querySelectorAll('.fa-volume-up, .fa-bookmark, .fa-copy, .fa-code-branch, .fa-undo').forEach(icon => {
-                    if (!icon.classList.contains('bookmarked')) {
-                        icon.style.display = 'none';
-                    }
+                botMessageElement.addEventListener('mouseout', function() {
+                    this.querySelectorAll('.fa-volume-up, .fa-bookmark, .fa-copy, .fa-code-branch, .fa-level-up-alt').forEach(icon => {
+                        if (!icon.classList.contains('bookmarked')) {
+                            icon.style.display = 'none';
+                        }
+                    });
                 });
-            });
+            }
         });
     })
     .catch(error => {
-        console.error('Error:', error);
-        removeLoadingIndicator();
-        toggleSendButton('Send');
-        document.getElementById('message-text').disabled = false;
-        document.querySelector('#form-message button[type="submit"]').disabled = false;
-        document.getElementById('message-text').focus();
+        if (error.name === 'AbortError') {
+            removeLoadingIndicator();
+            toggleSendButton('Send');
+            document.getElementById('message-text').disabled = false;
+            const submitBtn = document.querySelector('#form-message button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = false;
+            document.getElementById('message-text').focus();
+            return;
+        }
+        console.error('Stream error:', error);
 
-        // Reset text field to original size in case of error
-        document.getElementById('message-text').style.height = 'auto';
+        if (streamContentReceived) {
+            // Partial content received -- backend likely saved. Keep messages.
+            removeLoadingIndicator();
+            toggleSendButton('Send');
+            document.getElementById('message-text').disabled = false;
+            const submitBtn = document.querySelector('#form-message button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = false;
+            document.getElementById('message-text').focus();
+            document.getElementById('message-text').style.height = 'auto';
+            NotificationModal.warning('Stream interrupted',
+                'The response was interrupted. Partial content may have been saved. Reload to verify.');
+        } else {
+            cleanupFailedStream(userMessageElement, botMessageElement, true);
+            const hadAttachments = formData.getAll('file').length > 0;
+            if (hadAttachments) {
+                NotificationModal.error('Message failed',
+                    'The AI could not process your message. Files were uploaded but the response failed. Please re-attach your files and send again.');
+            } else {
+                NotificationModal.error('Message failed',
+                    'The message could not be sent. Your text has been restored. Please try again.');
+            }
+        }
     });
 }
 
@@ -1564,7 +1697,7 @@ function updateMessageId(messageId, element) {
     if (element) {
         const isBotMessage = element.classList.contains('bot');
         element.dataset.messageId = messageId;
-        const rollbackIcon = element.querySelector('.fa-undo');
+        const rollbackIcon = element.querySelector('.fa-level-up-alt');
         if (rollbackIcon) {
             rollbackIcon.setAttribute('data-message-id', messageId);
             rollbackIcon.style.display = 'inline';
@@ -3137,7 +3270,8 @@ function stopReceivingStream(event) {
     if (event) {
         event.preventDefault();
     }
-    
+    userStopped = true;
+
     fetch(`/api/conversations/${currentConversationId}/stop`, {
         method: 'POST'
     }).then(response => {
@@ -3158,7 +3292,7 @@ function toggleBookmark(messageId, conversationId, bookmarkIcon) {
     const action = isCurrentlyBookmarked ? 'remove' : 'add';
 
     // Get the correct conversationId from the data-conversationId attribute of the icon
-    const correctConversationId = bookmarkIcon.dataset.conversationId || conversationId;
+    const correctConversationId = bookmarkIcon.dataset.bookmarkConversationId || conversationId;
 
     fetch(`/api/conversations/${correctConversationId}/bookmark`, {
         method: 'POST',
@@ -4631,3 +4765,97 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Make loadMessages globally accessible for voice-call.js
 window.loadMessages = loadMessages;
+
+
+// ---------------------------------------------------------------------------
+// GranSabio Pipeline UI
+// ---------------------------------------------------------------------------
+
+/**
+ * Render or update the GranSabio verbose status panel inside a bot message.
+ * Creates a collapsible panel on first call, updates content on subsequent calls.
+ */
+function renderGranSabioStatus(messageEl, statusData) {
+    let panel = messageEl.querySelector('.gransabio-panel');
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'gransabio-panel';
+        panel.innerHTML = `
+            <div class="gransabio-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                <i class="fas fa-brain"></i>
+                <span class="gransabio-title">GranSabio Pipeline</span>
+                <span class="gransabio-toggle"><i class="fas fa-chevron-down"></i></span>
+            </div>
+            <div class="gransabio-body"></div>
+        `;
+        // Insert before any existing content
+        messageEl.insertBefore(panel, messageEl.firstChild);
+    }
+
+    const body = panel.querySelector('.gransabio-body');
+    const phase = statusData.phase || 'unknown';
+    const text = statusData.text || '';
+
+    // Build status line
+    const line = document.createElement('div');
+    line.className = `gransabio-line gransabio-phase-${phase}`;
+
+    let icon = 'fa-cog fa-spin';
+    if (phase === 'generating') icon = 'fa-pen-nib';
+    else if (phase === 'qa') icon = 'fa-check-double';
+    else if (phase === 'scoring') icon = 'fa-calculator';
+    else if (phase === 'editing') icon = 'fa-edit';
+    else if (phase === 'retry') icon = 'fa-redo';
+    else if (phase === 'gran_sabio') icon = 'fa-brain';
+    else if (phase === 'arbiter') icon = 'fa-balance-scale';
+    else if (phase === 'preflight') icon = 'fa-plane-departure';
+    else if (phase === 'status') icon = 'fa-info-circle';
+
+    let extra = '';
+    if (statusData.iteration && statusData.max_iterations) {
+        extra += ` <span class="gransabio-iter">iter ${statusData.iteration}/${statusData.max_iterations}</span>`;
+    }
+    if (statusData.layer_name) {
+        extra += ` <span class="gransabio-layer">${DOMPurify.sanitize(statusData.layer_name)}</span>`;
+    }
+    if (statusData.score !== undefined && statusData.min_score !== undefined) {
+        const passed = statusData.passed !== false;
+        const scoreClass = passed ? 'gransabio-score-pass' : 'gransabio-score-fail';
+        extra += ` <span class="${scoreClass}">${statusData.score.toFixed(1)}/${statusData.min_score.toFixed(1)}</span>`;
+    }
+
+    line.innerHTML = `<i class="fas ${icon}"></i> <span class="gransabio-text">${DOMPurify.sanitize(text)}</span>${extra}`;
+    body.appendChild(line);
+
+    // Keep only last 50 lines to prevent DOM bloat
+    while (body.children.length > 50) {
+        body.removeChild(body.firstChild);
+    }
+}
+
+/**
+ * Finalize the GranSabio panel: collapse, show summary line.
+ */
+function finalizeGranSabioStatus(messageEl, summaryData) {
+    const panel = messageEl.querySelector('.gransabio-panel');
+    if (!panel) return;
+
+    // Collapse the panel
+    panel.classList.add('collapsed');
+
+    // Update header with summary
+    const title = panel.querySelector('.gransabio-title');
+    if (title && summaryData) {
+        const approved = summaryData.approved === true;
+        const score = summaryData.final_score != null ? summaryData.final_score.toFixed(1) : '?';
+        const iters = summaryData.iterations_used || summaryData.iterations || '?';
+        const cost = summaryData.total_cost != null ? `$${summaryData.total_cost.toFixed(4)}` :
+                     (summaryData.api_cost != null ? `$${summaryData.api_cost.toFixed(4)}` : '');
+        const status = approved ? 'Approved' : 'Failed';
+        title.textContent = `GranSabio: ${status} (${score}, ${iters} iter${cost ? ', ' + cost : ''})`;
+        title.classList.add(approved ? 'gransabio-approved' : 'gransabio-failed');
+    }
+
+    // Stop any spinning icons
+    panel.querySelectorAll('.fa-spin').forEach(el => el.classList.remove('fa-spin'));
+}

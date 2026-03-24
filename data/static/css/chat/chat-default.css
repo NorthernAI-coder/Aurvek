@@ -2234,6 +2234,27 @@ body {
     gap: 2px;
 }
 
+/* ==========================================================
+   Thinking Block (Extended Thinking) inside messages
+   ========================================================== */
+
+.message.bot .thinking-block {
+    border-left-color: rgba(255, 255, 255, 0.35);
+}
+
+.message.bot .thinking-block summary {
+    color: rgba(255, 255, 255, 0.7) !important;
+}
+
+.message.bot .thinking-block > pre.thinking-content {
+    background-color: rgba(0, 0, 0, 0.15) !important;
+    color: rgba(255, 255, 255, 0.85) !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    border-radius: 8px !important;
+    padding: 12px !important;
+    margin: 8px 0 0 0 !important;
+}
+
 /* Thinking Tokens Control Styles */
 #thinking-tokens-control {
     position: relative;

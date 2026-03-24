@@ -124,7 +124,7 @@
 {% block scripts %}
 <script>
     window._homeConfig = {
-        canManage: {{ 'true' if is_admin|default(false) or is_manager|default(false) else 'false' }}
+        canManage: {{ 'true' if is_admin|default(false) or is_user|default(false) else 'false' }}
     };
 </script>
 <script src="{{ get_static_url('/static/js/home.js') }}"></script>

@@ -77,6 +77,8 @@ CREATE TABLE PROMPTS (
     ranking_score REAL DEFAULT 0,
     has_landing_page BOOLEAN DEFAULT 0,
     geo_policy TEXT DEFAULT NULL,
+    gransabio_enabled INTEGER DEFAULT 0,
+    gransabio_config TEXT DEFAULT NULL,
     FOREIGN KEY (voice_id) REFERENCES VOICES (id),
     FOREIGN KEY (created_by_user_id) REFERENCES USERS (id)
 );
@@ -522,11 +524,11 @@ CREATE TABLE SYSTEM_CONFIG (
 );
 
 -- =============================================================================
--- MANAGER_BRANDING (white-label customization)
+-- USER_BRANDING (white-label customization)
 -- =============================================================================
-CREATE TABLE MANAGER_BRANDING (
+CREATE TABLE USER_BRANDING (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    manager_id INTEGER NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL UNIQUE,
     company_name TEXT,
     logo_url TEXT,
     brand_color_primary TEXT DEFAULT '#6366f1',
@@ -538,10 +540,10 @@ CREATE TABLE MANAGER_BRANDING (
     disable_theme_selector BOOLEAN DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (manager_id) REFERENCES USERS(id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_manager_branding_manager ON MANAGER_BRANDING(manager_id);
+CREATE INDEX idx_user_branding_user ON USER_BRANDING(user_id);
 
 -- =============================================================================
 -- ELEVENLABS_AGENTS (voice call agents)
@@ -783,7 +785,7 @@ CREATE TABLE CREATOR_PROFILES (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
-    FOREIGN KEY (branding_id) REFERENCES MANAGER_BRANDING(id) ON DELETE SET NULL
+    FOREIGN KEY (branding_id) REFERENCES USER_BRANDING(id) ON DELETE SET NULL
 );
 
 CREATE UNIQUE INDEX idx_creator_profiles_slug ON CREATOR_PROFILES(slug);

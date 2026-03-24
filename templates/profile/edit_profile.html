@@ -205,7 +205,7 @@
     <div class="d-flex justify-content-between align-items-center">
         <div>
             <button type="submit" class="btn btn-primary">Save Changes</button>
-            {% if is_manager|default(false) or is_admin|default(false) %}
+            {% if is_user|default(false) or is_admin|default(false) %}
             <a href="/curation-settings" class="btn btn-outline-secondary ms-2">
                 <i class="fas fa-layer-group"></i> Curation Settings
             </a>

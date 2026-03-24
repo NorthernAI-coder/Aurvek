@@ -200,7 +200,7 @@
 
     async function loadDashboardData() {
         try {
-            const response = await fetch('/api/manager/team-billing');
+            const response = await fetch('/api/user/team-billing');
             const data = await response.json();
 
             if (!response.ok) {
@@ -348,7 +348,7 @@
     }
 
     function exportCSV() {
-        window.location.href = '/api/manager/team-billing?format=csv';
+        window.location.href = '/api/user/team-billing?format=csv';
     }
 </script>
 {% endblock %}

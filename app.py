@@ -95,7 +95,7 @@ from database import get_db_connection, DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, is_
 from models import User, ConnectionManager
 from whatsapp import is_whatsapp_conversation
 from telegram import is_telegram_conversation
-from tasks import generate_pdf_task, generate_mp3_task, download_elevenlabs_audio_task
+from tasks import generate_pdf_task, generate_mp3_task, download_elevenlabs_audio_task, gransabio_external_task
 from rediscfg import broker, redis_client, add_revoked_user, RedisManager, get_metrics, get_active_users_count
 from save_images import save_image_locally, generate_img_token, resize_image, get_or_generate_img_token
 from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id, get_user_from_phone_number
@@ -127,6 +127,9 @@ from welcome_service import build_world, user_has_pack_access, user_has_prompt_a
 from tools.tts import process_plain_text, insert_tts_break, process_text_for_tts, get_voice_code_from_prompt, get_voice_code_from_conversation, get_tts_generator, send_cached_audio, get_file_path, handle_tts_request
 from tools.tts_config import get_tts_config, invalidate_tts_config_cache, VALID_MODELS, VALID_FORMATS, WS_INCOMPATIBLE_MODELS
 from tools.tts_load_balancer import get_elevenlabs_key
+from system_prompt_defaults import (
+    MANDATORY_SYSTEM_KEYS, SYSTEM_BLOCK_METADATA, DEFAULT_SYSTEM_BLOCKS, MAX_BLOCK_CONTENT_SIZE
+)
 
 from ai_calls import router as ai_router
 from ai_calls import save_message, process_save_message, get_ai_response, handle_function_call, call_o1_api, call_gpt_api, call_claude_api, call_gemini_api, stop_signals, get_last_message_id, conversation_write_lock
@@ -134,7 +137,7 @@ from ai_calls import save_message, process_save_message, get_ai_response, handle
 from prompts import router as prompts_router
 from packs_router import router as packs_router
 from packs_router import warmup_pack_landing_cache, _pack_landing_cache_stats, _pack_landing_cache, PACK_LANDING_CACHE_SIZE
-from prompts import get_manager_accessible_prompts, get_manager_owned_prompts, create_prompt_directory, get_prompt_info, get_prompt_path, get_pack_path, get_prompt_templates_dir, get_prompt_components_dir, can_manage_prompt, get_manageable_prompts
+from prompts import get_user_accessible_prompts as get_user_role_accessible_prompts, get_user_owned_prompts, create_prompt_directory, get_prompt_info, get_prompt_path, get_pack_path, get_prompt_templates_dir, get_prompt_components_dir, can_manage_prompt, get_manageable_prompts
 from prompts import get_user_directory, get_user_prompts_directory, list_prompts, process_prompt_image_upload, create_prompt, create_prompt_post, edit_prompt, update_prompt, delete_prompt, delete_prompt_image
 from prompts import get_landing_registration_config, set_landing_registration_config, get_prompt_owner_id, DEFAULT_LANDING_REGISTRATION_CONFIG
 from landing_wizard import is_claude_available, list_prompt_files, delete_all_landing_files, list_welcome_files, delete_all_welcome_files
@@ -282,6 +285,10 @@ async def lifespan(app: FastAPI):
         # Initial recalculation at startup
         asyncio.create_task(recalculate_ranking_scores())
 
+    # GranSabio worker config validation
+    from gransabio_service import check_gransabio_worker_config
+    await check_gransabio_worker_config(dual_mode_active=_dual_mode_active)
+
     yield
 
     # Shutdown IP Reputation system
@@ -299,6 +306,13 @@ async def lifespan(app: FastAPI):
         except OSError:
             pass
 
+    # GranSabio HTTP client cleanup
+    try:
+        from gransabio_service import shutdown_http_client
+        await shutdown_http_client()
+    except Exception:
+        pass
+
     # Cleanup on shutdown
     if use_redis:
         logger.info("Closing Redis connections...")
@@ -306,7 +320,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Closing in-memory SQLite connection...")
         from save_images import close_memory_db
-        await close_memory_db()    
+        await close_memory_db()
 
 # Disable Swagger/ReDoc/OpenAPI schema in production (set ENABLE_API_DOCS=1 in .env to enable)
 # All three must be disabled: leaving openapi_url exposed leaks the full API schema,
@@ -666,7 +680,7 @@ async def add_user(username, prompt_id, all_prompts_access, public_prompts_acces
 
                 # Check if the current user has permission to create this type of user
                 if current_user:
-                    if not (await current_user.is_admin or (await current_user.is_manager and role_name.lower() == 'user')):
+                    if not (await current_user.is_admin or (await current_user.is_user and role_name.lower() == 'customer')):
                         logger.info("User does not have permission to create this type of user")
                         return None
 
@@ -770,7 +784,7 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
             LEFT JOIN PROMPT_PERMISSIONS opp ON opp.prompt_id = p.id AND opp.user_id = ? AND opp.permission_level = 'owner'
             ORDER BY p.name COLLATE NOCASE
         ''', (user.id, user.id, user.id))
-    elif await user.is_manager:
+    elif await user.is_user:
         query = '''
             SELECT DISTINCT p.id, p.name, u.username as created_by_username, p.public_id,
                    CASE WHEN pcd.is_active = 1 AND pcd.verification_status = 1
@@ -802,11 +816,9 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
 
         if public_prompts_access:
             if category_access is None:
-                # No category restriction - access to all public prompts
-                query += " OR p.public = 1"
+                query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
             else:
-                # Filter public prompts by allowed categories
-                query += """ OR (p.public = 1 AND EXISTS (
+                query += """ OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0) AND EXISTS (
                     SELECT 1 FROM PROMPT_CATEGORIES pc
                     WHERE pc.prompt_id = p.id
                     AND pc.category_id IN (SELECT value FROM json_each(?))
@@ -847,11 +859,9 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
 
         if public_prompts_access:
             if category_access is None:
-                # No category restriction - access to all public prompts
-                query += " OR p.public = 1"
+                query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
             else:
-                # Filter public prompts by allowed categories
-                query += """ OR (p.public = 1 AND EXISTS (
+                query += """ OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0) AND EXISTS (
                     SELECT 1 FROM PROMPT_CATEGORIES pc
                     WHERE pc.prompt_id = p.id
                     AND pc.category_id IN (SELECT value FROM json_each(?))
@@ -898,12 +908,13 @@ async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
         return True
 
     # Check if prompt is public and user has public access with matching category
-    await cursor.execute("SELECT public FROM PROMPTS WHERE id = ?", (prompt_id,))
+    await cursor.execute("SELECT public, purchase_price FROM PROMPTS WHERE id = ?", (prompt_id,))
     prompt_row = await cursor.fetchone()
     if not prompt_row:
         return False
 
     is_public = prompt_row[0]
+    purchase_price = prompt_row[1]
     if not is_public:
         return False
 
@@ -922,6 +933,10 @@ async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
         return True
 
     if not public_prompts_access:
+        return False
+
+    # VIP gate: paid prompts require explicit access (purchase or permission)
+    if purchase_price is not None and purchase_price > 0:
         return False
 
     # public_prompts_access is True - check category restrictions
@@ -956,6 +971,103 @@ async def can_user_access_pack(user: User, pack_id: int, cursor) -> bool:
         (pack_id, user.id)
     )
     return await cursor.fetchone() is not None
+
+
+async def _apply_landing_config_to_user(conn, config: dict, user_id: int,
+                                         creator_user_id: int = None,
+                                         discount_pct: float = 0,
+                                         creator_share: float = None):
+    """Apply a prompt/pack landing_registration_config to an existing user.
+    Expand-only: never restricts existing permissions or overwrites billing.
+    Does NOT commit -- caller manages the transaction.
+
+    Args:
+        config: Parsed landing_registration_config dict
+        creator_user_id: For billing_mode=user_pays
+        discount_pct: 0-100, scales initial_balance
+        creator_share: If set, clamps initial_balance to this amount (for paid purchases)
+    Returns:
+        initial_balance_cost: The actual balance credited (for creator earnings deduction)
+    """
+    ud_cursor = await conn.execute(
+        """SELECT public_prompts_access, billing_account_id,
+                  allow_file_upload, allow_image_generation
+           FROM USER_DETAILS WHERE user_id = ?""", (user_id,))
+    ud_row = await ud_cursor.fetchone()
+    if not ud_row:
+        return 0
+
+    cur_public, cur_billing, cur_file, cur_imggen = ud_row
+    updates = []
+    params = []
+    initial_balance_cost = 0
+
+    # Initial balance (scaled by discount, optionally clamped to creator_share)
+    ib = float(config.get("initial_balance", 0))
+    if ib > 0:
+        scaled_ib = ib * (1 - discount_pct / 100) if discount_pct > 0 else ib
+        if creator_share is not None and scaled_ib > creator_share:
+            logger.warning(
+                "Landing config: initial_balance %.2f exceeds creator_share %.2f, clamping",
+                scaled_ib, creator_share)
+            scaled_ib = creator_share
+        if scaled_ib > 0:
+            initial_balance_cost = scaled_ib
+            updates.append("balance = balance + ?")
+            params.append(scaled_ib)
+
+    # Billing mode: user_pays (full setup including limits)
+    if config.get("billing_mode") == "user_pays" and creator_user_id:
+        creator_balance = await get_balance(creator_user_id)
+        if creator_balance <= 0:
+            logger.warning(
+                "Landing config: creator %s has zero balance, skipping billing setup for user %s",
+                creator_user_id, user_id)
+        elif cur_billing is not None:
+            logger.warning(
+                "Landing config: billing_account_id not overwritten for user %s (already %s)",
+                user_id, cur_billing)
+        else:
+            updates.append("billing_account_id = ?")
+            params.append(creator_user_id)
+            bl = config.get("billing_limit")
+            if bl is not None:
+                updates.append("billing_limit = ?")
+                params.append(float(bl))
+            bla = config.get("billing_limit_action", "block")
+            updates.append("billing_limit_action = ?")
+            params.append(bla)
+            bara = config.get("billing_auto_refill_amount", 10.0)
+            updates.append("billing_auto_refill_amount = ?")
+            params.append(float(bara))
+            bml = config.get("billing_max_limit")
+            if bml is not None:
+                updates.append("billing_max_limit = ?")
+                params.append(float(bml))
+
+    # Expand-only boolean permissions (never restrict, log downgrade attempts)
+    if "public_prompts_access" in config:
+        if config["public_prompts_access"] and not cur_public:
+            updates.append("public_prompts_access = 1")
+        elif not config["public_prompts_access"] and cur_public:
+            logger.warning("Landing config: skipping public_prompts_access downgrade for user %s", user_id)
+    if "allow_file_upload" in config:
+        if config["allow_file_upload"] and not cur_file:
+            updates.append("allow_file_upload = 1")
+        elif not config["allow_file_upload"] and cur_file:
+            logger.warning("Landing config: skipping allow_file_upload downgrade for user %s", user_id)
+    if "allow_image_generation" in config:
+        if config["allow_image_generation"] and not cur_imggen:
+            updates.append("allow_image_generation = 1")
+        elif not config["allow_image_generation"] and cur_imggen:
+            logger.warning("Landing config: skipping allow_image_generation downgrade for user %s", user_id)
+
+    if updates:
+        params.append(user_id)
+        sql = f"UPDATE USER_DETAILS SET {', '.join(updates)} WHERE user_id = ?"
+        await conn.execute(sql, params)
+
+    return initial_balance_cost
 
 
 @app.get("/health")
@@ -1698,13 +1810,13 @@ async def delete_all_user_credentials(request: Request, current_user: User = Dep
 
 @app.get("/api/user/curation-settings")
 async def get_curation_settings(request: Request, current_user: User = Depends(get_current_user)):
-    """Get curation markup settings for the current manager."""
+    """Get curation markup settings for the current user."""
     if current_user is None:
         return unauthenticated_response()
 
-    # Only managers can have curation settings
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Only managers can access curation settings"})
+    # Only users can have curation settings
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Only users can access curation settings"})
 
     try:
         async with get_db_connection(readonly=True) as conn:
@@ -1738,13 +1850,13 @@ async def update_curation_settings(
     request: Request,
     current_user: User = Depends(get_current_user)
 ):
-    """Update curation markup settings for the current manager."""
+    """Update curation markup settings for the current user."""
     if current_user is None:
         return unauthenticated_response()
 
-    # Only managers can have curation settings
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Only managers can update curation settings"})
+    # Only users can have curation settings
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Only users can update curation settings"})
 
     try:
         data = await request.json()
@@ -1777,13 +1889,13 @@ async def update_curation_settings(
 
 @app.get("/curation-settings", response_class=HTMLResponse)
 async def curation_settings_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Page for managers to configure their curation markup settings."""
+    """Page for users to configure their curation markup settings."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    # Only managers and admins can access
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can access curation settings")
+    # Only users and admins can access
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can access curation settings")
 
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
@@ -1804,30 +1916,30 @@ async def curation_settings_page(request: Request, current_user: User = Depends(
 
 
 # ============================================================================
-# Manager Team Billing Endpoints
+# User Team Billing Endpoints
 # ============================================================================
 
-@app.get("/manager/team-billing")
-async def manager_team_billing_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the team billing dashboard page for managers."""
+@app.get("/user/team-billing")
+async def user_team_billing_page(request: Request, current_user: User = Depends(get_current_user)):
+    """Render the team billing dashboard page for users."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can access the team billing dashboard")
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can access the team billing dashboard")
 
     context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("manager_team_consumption.html", context)
+    return templates.TemplateResponse("user_team_consumption.html", context)
 
 
-@app.get("/api/manager/team-billing")
-async def get_manager_team_billing(request: Request, current_user: User = Depends(get_current_user)):
-    """Get team consumption data for the manager dashboard."""
+@app.get("/api/user/team-billing")
+async def get_user_team_billing(request: Request, current_user: User = Depends(get_current_user)):
+    """Get team consumption data for the user dashboard."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only managers can access this endpoint"}, status_code=403)
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(content={"error": "Only users can access this endpoint"}, status_code=403)
 
     try:
         from datetime import datetime
@@ -1847,12 +1959,12 @@ async def get_manager_team_billing(request: Request, current_user: User = Depend
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
 
-            # Get manager's balance
+            # Get user's balance
             await cursor.execute('SELECT balance FROM USER_DETAILS WHERE user_id = ?', (current_user.id,))
             balance_row = await cursor.fetchone()
             my_balance = float(balance_row[0]) if balance_row else 0.0
 
-            # Get users under this manager's billing
+            # Get customers under this user's billing
             await cursor.execute('''
                 SELECT u.id, u.username, u.email,
                        ud.billing_limit, ud.billing_limit_action, ud.billing_current_month_spent
@@ -1989,40 +2101,40 @@ async def get_manager_team_billing(request: Request, current_user: User = Depend
 
 @app.get("/my-branding")
 async def my_branding_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the manager branding configuration page."""
+    """Render the user branding configuration page."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can access branding settings")
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can access branding settings")
 
     context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("manager_branding.html", context)
+    return templates.TemplateResponse("user_branding.html", context)
 
 
 @app.get("/api/my-branding")
 async def get_my_branding_api(request: Request, current_user: User = Depends(get_current_user)):
-    """Get manager's white-label branding configuration."""
+    """Get user's white-label branding configuration."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only managers can access branding settings"}, status_code=403)
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(content={"error": "Only users can access branding settings"}, status_code=403)
 
-    from common import get_manager_branding
-    branding = await get_manager_branding(current_user.id)
+    from common import get_user_branding
+    branding = await get_user_branding(current_user.id)
 
     return JSONResponse(content={"branding": branding})
 
 
 @app.put("/api/my-branding")
 async def update_my_branding(request: Request, current_user: User = Depends(get_current_user)):
-    """Update manager's white-label branding configuration."""
+    """Update user's white-label branding configuration."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only managers can update branding settings"}, status_code=403)
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(content={"error": "Only users can update branding settings"}, status_code=403)
 
     try:
         data = await request.json()
@@ -2058,13 +2170,13 @@ async def update_my_branding(request: Request, current_user: User = Depends(get_
         cursor = await conn.cursor()
 
         # Check if branding record exists
-        await cursor.execute('SELECT id FROM MANAGER_BRANDING WHERE manager_id = ?', (current_user.id,))
+        await cursor.execute('SELECT id FROM USER_BRANDING WHERE user_id = ?', (current_user.id,))
         existing = await cursor.fetchone()
 
         if existing:
             # Update existing record
             await cursor.execute('''
-                UPDATE MANAGER_BRANDING
+                UPDATE USER_BRANDING
                 SET company_name = ?,
                     logo_url = ?,
                     brand_color_primary = ?,
@@ -2075,7 +2187,7 @@ async def update_my_branding(request: Request, current_user: User = Depends(get_
                     forced_theme = ?,
                     disable_theme_selector = ?,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE manager_id = ?
+                WHERE user_id = ?
             ''', (
                 data.get('company_name'),
                 data.get('logo_url'),
@@ -2091,8 +2203,8 @@ async def update_my_branding(request: Request, current_user: User = Depends(get_
         else:
             # Insert new record
             await cursor.execute('''
-                INSERT INTO MANAGER_BRANDING
-                (manager_id, company_name, logo_url, brand_color_primary, brand_color_secondary,
+                INSERT INTO USER_BRANDING
+                (user_id, company_name, logo_url, brand_color_primary, brand_color_secondary,
                  footer_text, email_signature, hide_platform_branding, forced_theme, disable_theme_selector)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
@@ -2122,8 +2234,8 @@ async def my_storefront_page(request: Request, current_user: User = Depends(get_
     """Render the creator storefront management page."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can manage storefronts")
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can manage storefronts")
 
     context = await get_template_context(request, current_user)
     return templates.TemplateResponse("my_storefront.html", context)
@@ -2134,8 +2246,8 @@ async def get_creator_profile_api(request: Request, current_user: User = Depends
     """Get current user's creator profile data."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only managers can access creator profiles"}, status_code=403)
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(content={"error": "Only users can access creator profiles"}, status_code=403)
 
     from storefront_service import get_own_creator_profile
     profile = await get_own_creator_profile(current_user.id)
@@ -2148,8 +2260,8 @@ async def update_creator_profile(request: Request, current_user: User = Depends(
     """Update current user's creator profile. UPSERT pattern."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_manager and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only managers can update creator profiles"}, status_code=403)
+    if not await current_user.is_user and not await current_user.is_admin:
+        return JSONResponse(content={"error": "Only users can update creator profiles"}, status_code=403)
 
     data = await request.json()
 
@@ -2231,8 +2343,8 @@ async def upload_creator_avatar(
     """Upload creator profile avatar. Saves 4 sizes like profile pictures."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can upload creator avatars")
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can upload creator avatars")
 
     hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
     profile_dir = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "profile")
@@ -2446,11 +2558,11 @@ async def get_user_init(request: Request, current_user: User = Depends(get_curre
     }
 
     # Theme configuration logic
-    is_manager = await current_user.is_manager
+    is_user_role = await current_user.is_user
     is_admin = await current_user.is_admin
 
-    if is_manager or is_admin:
-        # Managers/admins are never subject to theme enforcement
+    if is_user_role or is_admin:
+        # Users/admins are never subject to theme enforcement
         theme_data = {
             "forced_theme": None,
             "disable_theme_selector": False,
@@ -2458,7 +2570,7 @@ async def get_user_init(request: Request, current_user: User = Depends(get_curre
             "brand_color_secondary": '#10B981'
         }
     else:
-        # Regular users - check context-specific or user-level branding
+        # Regular customers - check context-specific or user-level branding
         from common import get_branding_for_user, get_branding_for_context
         if context_type == "storefront" and context_id:
             branding = await get_branding_for_context({"storefront_slug": context_id})
@@ -2479,7 +2591,7 @@ async def get_user_init(request: Request, current_user: User = Depends(get_curre
 
 @app.get("/api/user/theme-config")
 async def get_user_theme_config(request: Request, current_user: User = Depends(get_current_user), context_type: str = None, context_id: str = None):
-    """Get theme configuration for a user, respecting manager's forced theme if applicable."""
+    """Get theme configuration for a user, respecting the creator's forced theme if applicable."""
     if current_user is None:
         # Return defaults for unauthenticated users (login/register pages)
         # Personal theme still comes from localStorage, this just says "no forced theme"
@@ -2490,12 +2602,12 @@ async def get_user_theme_config(request: Request, current_user: User = Depends(g
             "brand_color_secondary": '#10B981'
         })
 
-    # Managers and admins are never subject to theme enforcement - they control their own theme
-    is_manager = await current_user.is_manager
+    # Users and admins are never subject to theme enforcement - they control their own theme
+    is_user_role = await current_user.is_user
     is_admin = await current_user.is_admin
 
-    if is_manager or is_admin:
-        # Return no forced theme for managers/admins
+    if is_user_role or is_admin:
+        # Return no forced theme for users/admins
         return JSONResponse(content={
             "forced_theme": None,
             "disable_theme_selector": False,
@@ -2503,7 +2615,7 @@ async def get_user_theme_config(request: Request, current_user: User = Depends(g
             "brand_color_secondary": '#10B981'
         })
 
-    # For regular users, check context-specific or user-level branding
+    # For regular customers, check context-specific or user-level branding
     from common import get_branding_for_user, get_branding_for_context
     if context_type == "storefront" and context_id:
         branding = await get_branding_for_context({"storefront_slug": context_id})
@@ -2522,17 +2634,17 @@ async def get_user_theme_config(request: Request, current_user: User = Depends(g
 # Phase 5: Landing Page Analytics Endpoints
 # ============================================================================
 
-@app.get("/manager/landing-analytics")
-async def manager_landing_analytics_page(request: Request, current_user: User = Depends(get_current_user)):
+@app.get("/user/landing-analytics")
+async def user_landing_analytics_page(request: Request, current_user: User = Depends(get_current_user)):
     """Render the landing page analytics dashboard."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_manager and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only managers can access analytics")
+    if not await current_user.is_user and not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only users can access analytics")
 
     context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("manager_landing_analytics.html", context)
+    return templates.TemplateResponse("user_landing_analytics.html", context)
 
 
 @app.post("/api/analytics/track-visit")
@@ -2680,13 +2792,13 @@ async def mark_analytics_conversion(request: Request):
     return JSONResponse(content={"status": "marked"})
 
 
-@app.get("/api/manager/landing-analytics")
+@app.get("/api/user/landing-analytics")
 async def get_landing_analytics(request: Request, current_user: User = Depends(get_current_user)):
-    """Get landing page analytics summary for all prompts owned by the manager."""
+    """Get landing page analytics summary for all prompts owned by the user."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
 
     from datetime import datetime, timedelta
@@ -2699,7 +2811,7 @@ async def get_landing_analytics(request: Request, current_user: User = Depends(g
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
 
-        # Get all prompts owned by this manager with analytics
+        # Get all prompts owned by this user with analytics
         # Use direct timestamp comparisons instead of date() to leverage indexes
         await cursor.execute('''
             SELECT
@@ -2798,13 +2910,13 @@ async def get_landing_analytics(request: Request, current_user: User = Depends(g
     })
 
 
-@app.get("/api/manager/landing-analytics/{prompt_id}")
+@app.get("/api/user/landing-analytics/{prompt_id}")
 async def get_prompt_analytics(prompt_id: int, request: Request, current_user: User = Depends(get_current_user)):
     """Get detailed analytics for a specific prompt."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
 
     from datetime import datetime, timedelta
@@ -2812,7 +2924,7 @@ async def get_prompt_analytics(prompt_id: int, request: Request, current_user: U
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
 
-        # Verify prompt belongs to this manager
+        # Verify prompt belongs to this user
         await cursor.execute('SELECT name FROM PROMPTS WHERE id = ? AND created_by_user_id = ?', (prompt_id, current_user.id))
         prompt = await cursor.fetchone()
         if not prompt:
@@ -2886,18 +2998,18 @@ async def get_prompt_analytics(prompt_id: int, request: Request, current_user: U
     })
 
 
-@app.get("/api/manager/pack-landing-analytics")
+@app.get("/api/user/pack-landing-analytics")
 async def get_pack_landing_analytics(current_user: User = Depends(get_current_user)):
     """Get landing page analytics for packs owned by the current user."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     async with get_db_connection(readonly=True) as conn:
         # Get pack analytics grouped by pack
-        # Admin sees all packs, manager sees only their own
+        # Admin sees all packs, user sees only their own
         if await current_user.is_admin:
             packs_query = """
                 SELECT p.id, p.name,
@@ -2946,13 +3058,13 @@ async def get_pack_landing_analytics(current_user: User = Depends(get_current_us
         return {"packs": packs}
 
 
-@app.get("/api/manager/pack-landing-analytics/{pack_id}")
+@app.get("/api/user/pack-landing-analytics/{pack_id}")
 async def get_pack_analytics_detail(pack_id: int, current_user: User = Depends(get_current_user)):
     """Get detailed analytics for a specific pack landing page."""
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     async with get_db_connection(readonly=True) as conn:
@@ -3037,8 +3149,8 @@ async def my_earnings_page(request: Request, current_user: User = Depends(get_cu
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    # Only managers and admins can access (they are the ones who can create prompts)
-    if not await current_user.is_manager and not await current_user.is_admin:
+    # Only users and admins can access (they are the ones who can create prompts)
+    if not await current_user.is_user and not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Only creators can access earnings dashboard")
 
     context = await get_template_context(request, current_user)
@@ -3051,7 +3163,7 @@ async def get_my_earnings(request: Request, current_user: User = Depends(get_cur
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
 
     async with get_db_connection(readonly=True) as conn:
@@ -3088,7 +3200,8 @@ async def get_my_earnings(request: Request, current_user: User = Depends(get_cur
                 p.is_paid,
                 COUNT(DISTINCT ce.consumer_id) as unique_users,
                 SUM(ce.tokens_consumed) as total_tokens,
-                SUM(ce.net_earnings) as total_earned
+                SUM(ce.net_earnings) as total_earned,
+                p.purchase_price
                FROM CREATOR_EARNINGS ce
                JOIN PROMPTS p ON ce.prompt_id = p.id
                WHERE ce.creator_id = ?
@@ -3105,7 +3218,8 @@ async def get_my_earnings(request: Request, current_user: User = Depends(get_cur
                 "is_paid": bool(row[2]),
                 "unique_users": row[3],
                 "total_tokens": row[4],
-                "total_earned": float(row[5] or 0)
+                "total_earned": float(row[5] or 0),
+                "purchase_price": float(row[6]) if row[6] is not None else None
             }
             for row in rows
         ]
@@ -3500,7 +3614,7 @@ async def request_creator_payout(request: Request, current_user: User = Depends(
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"success": False, "message": "Access denied"}, status_code=403)
 
     if not STRIPE_SECRET_KEY:
@@ -3607,7 +3721,7 @@ async def stripe_connect_onboard(request: Request, current_user: User = Depends(
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"success": False, "message": "Access denied"}, status_code=403)
 
     if not STRIPE_SECRET_KEY:
@@ -3753,7 +3867,7 @@ async def stripe_connect_status(request: Request, current_user: User = Depends(g
     if current_user is None:
         return unauthenticated_response()
 
-    if not await current_user.is_manager and not await current_user.is_admin:
+    if not await current_user.is_user and not await current_user.is_admin:
         return JSONResponse(content={"success": False, "message": "Access denied"}, status_code=403)
 
     try:
@@ -4941,7 +5055,7 @@ async def dashboard(request: Request, current_user: User = Depends(get_current_u
 
     base_ctx = await get_template_context(request, current_user)
 
-    if not base_ctx["is_admin"] and not base_ctx["is_manager"]:
+    if not base_ctx["is_admin"] and not base_ctx["is_user"]:
         raise HTTPException(status_code=403, detail="Access denied")
 
     async with get_db_connection(readonly=True) as conn:
@@ -4950,7 +5064,7 @@ async def dashboard(request: Request, current_user: User = Depends(get_current_u
         prompts = await get_user_accessible_prompts(current_user, cursor)
         user_balance = await get_balance(current_user.id)
 
-        manageable_prompts = await get_manageable_prompts(current_user.id, base_ctx["is_admin"]) if base_ctx["is_manager"] or base_ctx["is_admin"] else []
+        manageable_prompts = await get_manageable_prompts(current_user.id, base_ctx["is_admin"]) if base_ctx["is_user"] or base_ctx["is_admin"] else []
 
         base_ctx.update({
             "uses_magic_link": current_user.uses_magic_link,
@@ -5196,7 +5310,7 @@ async def magic_link_recovery(request: Request):
         try:
             magic_link = await generate_magic_link(user_id, 'login', request)
 
-            # Get branding for this user (from their creator/manager)
+            # Get branding for this user (from their creator)
             from common import get_branding_for_user
             branding = await get_branding_for_user(user_id)
 
@@ -5248,7 +5362,7 @@ async def create_user(request: Request, current_user: User = Depends(get_current
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         return handle_error(request, 403, "You do not have permission to access this page.")
 
     async with get_db_connection(readonly=True) as conn:
@@ -5257,7 +5371,7 @@ async def create_user(request: Request, current_user: User = Depends(get_current
         # Use the function get_user_accessible_prompts
         prompts = await get_user_accessible_prompts(current_user, cursor)
 
-        await cursor.execute("SELECT id, machine, model, vision FROM LLM ORDER BY machine DESC")
+        await cursor.execute("SELECT id, machine, model, vision FROM LLM WHERE machine != 'GranSabio' ORDER BY machine DESC")
         llm_models = await cursor.fetchall()
 
         # Get categories for category access selection
@@ -5306,7 +5420,7 @@ async def create_user_post(
     email: str = Form(default=None),
     api_key_mode: str = Form(default="both_prefer_own"),
     category_ids: List[int] = Form(default=None),
-    billing_mode: str = Form(default="user_pays"),
+    billing_mode: str = Form(default="customer_pays"),
     billing_limit: Optional[str] = Form(default=None),
     billing_limit_action: str = Form(default="block"),
     billing_auto_refill_amount: Optional[str] = Form(default=None),
@@ -5315,20 +5429,20 @@ async def create_user_post(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
 
-    # Validate that managers can only create regular users
-    if await current_user.is_manager and user_type != "user":
-        raise HTTPException(status_code=403, detail="Managers can only create regular user accounts.")
+    # Validate that users can only create regular customers
+    if await current_user.is_user and user_type != "customer":
+        raise HTTPException(status_code=403, detail="Users can only create regular customer accounts.")
 
-    # Managers cannot give access to all prompts
-    if await current_user.is_manager and all_prompts_access:
-        raise HTTPException(status_code=403, detail="Managers cannot give access to all prompts.")
+    # Users cannot give access to all prompts
+    if await current_user.is_user and all_prompts_access:
+        raise HTTPException(status_code=403, detail="Users cannot give access to all prompts.")
 
-    # Validate that the prompt is accessible to the manager
-    if await current_user.is_manager:
-        accessible_prompts = await get_manager_accessible_prompts(current_user.id)
+    # Validate that the prompt is accessible to the user
+    if await current_user.is_user:
+        accessible_prompts = await get_user_role_accessible_prompts(current_user.id)
         if prompt_id not in accessible_prompts:
             raise HTTPException(status_code=403, detail="You can only create users with prompts that you have access to.")
 
@@ -5399,14 +5513,14 @@ async def create_user_post(
     billing_max_limit = parse_optional_float(billing_max_limit)
 
     # Process enterprise billing mode
-    # billing_mode: "user_pays" (default) or "manager_pays"
+    # billing_mode: "customer_pays" (default) or "user_pays"
     billing_account_id = None
     processed_billing_limit = None
     processed_auto_refill_amount = 10.0
     processed_max_limit = None
-    if billing_mode == "manager_pays":
-        # Only managers can set themselves as billing account
-        if await current_user.is_manager or await current_user.is_admin:
+    if billing_mode == "user_pays":
+        # Only users can set themselves as billing account
+        if await current_user.is_user or await current_user.is_admin:
             billing_account_id = current_user.id
             processed_billing_limit = billing_limit if billing_limit and billing_limit > 0 else None
             processed_auto_refill_amount = billing_auto_refill_amount if billing_auto_refill_amount and billing_auto_refill_amount > 0 else 10.0
@@ -5505,7 +5619,7 @@ async def edit_user_form(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
 
     async with get_db_connection(readonly=True) as conn:
@@ -5515,7 +5629,7 @@ async def edit_user_form(
         prompts = await get_user_accessible_prompts(current_user, cursor)
         
         # Get all LLM models
-        await cursor.execute("SELECT id, machine, model, vision FROM LLM ORDER BY machine DESC")
+        await cursor.execute("SELECT id, machine, model, vision FROM LLM WHERE machine != 'GranSabio' ORDER BY machine DESC")
         llm_models = await cursor.fetchall()
 
         # Get all categories for curation mode
@@ -5611,7 +5725,7 @@ async def update_user(
     api_key_mode: Optional[str] = Form(None),
     category_ids: Optional[List[str]] = Form(None),
     allow_all_categories: bool = Form(False),
-    billing_mode: str = Form(default="user_pays"),
+    billing_mode: str = Form(default="customer_pays"),
     billing_limit: Optional[str] = Form(default=None),
     billing_limit_action: str = Form(default="block"),
     billing_auto_refill_amount: Optional[str] = Form(default=None),
@@ -5622,18 +5736,18 @@ async def update_user(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_manager:
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
-    
+
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
-        
+
         # Verify if the user exists
         await cursor.execute("SELECT id, role_id FROM USERS WHERE username = ?", (username,))
         user = await cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
-        
+
         user_id, role_id = user
 
         # Get current balance for audit trail
@@ -5642,8 +5756,8 @@ async def update_user(
         previous_balance = balance_row[0] if balance_row else 0.0
 
         # Verify permissions
-        if await current_user.is_manager and role_id == 1:  # Assuming role_id 1 is for admin
-            raise HTTPException(status_code=403, detail="Managers cannot edit admin accounts.")
+        if await current_user.is_user and role_id == 1:  # Assuming role_id 1 is for admin
+            raise HTTPException(status_code=403, detail="Users cannot edit admin accounts.")
 
         # Parse optional numeric fields (HTML forms send empty string instead of null)
         billing_limit = parse_optional_float(billing_limit)
@@ -5776,7 +5890,7 @@ async def update_user(
         update_details_params.append(category_access_value)
 
         # Process enterprise billing mode
-        if billing_mode == "manager_pays" and (await current_user.is_manager or await current_user.is_admin):
+        if billing_mode == "user_pays" and (await current_user.is_user or await current_user.is_admin):
             billing_account_id_value = current_user.id
             billing_limit_value = billing_limit if billing_limit and billing_limit > 0 else None
             billing_action_value = billing_limit_action if billing_limit_action in ['block', 'notify', 'auto_refill'] else 'block'
@@ -5828,7 +5942,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
         
-    if not (await current_user.is_admin or await current_user.is_manager):
+    if not (await current_user.is_admin or await current_user.is_user):
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
     
     async with get_db_connection(readonly=True) as conn:
@@ -5907,7 +6021,10 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             total_cost = row[3]  
             if row[4] and row[5]:
                 magic_link = f'{scheme}://{host}/{url_path}{row[4]}'
-                expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S.%f')
+                try:
+                    expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S.%f')
+                except ValueError:
+                    expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S')
                 is_expired = 'Expired' if expires_at < datetime.now() else 'Active'
             else:
                 magic_link = None
@@ -5959,7 +6076,7 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
         
-    if not (await current_user.is_admin or await current_user.is_manager):
+    if not (await current_user.is_admin or await current_user.is_user):
         return JSONResponse(content={"error": "You do not have permission to access this action."}, status_code=403)
     
     async with get_db_connection() as conn:
@@ -6172,7 +6289,7 @@ async def delete_user(username, current_user, request_ip=None):
                     ("USER_CREATOR_RELATIONSHIPS", "creator_id"),
                     ("USER_CAPTIVE_DOMAINS", "user_id"),
                     ("PROMPT_CUSTOM_DOMAINS", "activated_by_user_id"),
-                    ("MANAGER_BRANDING", "manager_id"),
+                    ("USER_BRANDING", "user_id"),
                     ("USER_ALTER_EGOS", "user_id"),
                     ("WHATSAPP_LOG", "user_id"),
                     ("PENDING_ENTITLEMENTS", "user_id"),
@@ -6348,7 +6465,7 @@ async def delete_users(request: Request, current_user: User = Depends(get_curren
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
         
-    if not (await current_user.is_admin or await current_user.is_manager):
+    if not (await current_user.is_admin or await current_user.is_user):
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
     
     form_data = await request.form()
@@ -6617,7 +6734,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 c.role_id,
                 COALESCE(p.image, p2.image) AS bot_picture,
                 COALESCE(p.description, p2.description) AS prompt_description,
-                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model)) FROM (SELECT id, machine, model FROM LLM ORDER BY machine, model)) AS llm_models_json,
+                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model)) FROM (SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model)) AS llm_models_json,
                 (SELECT json_group_array(json_object('id', id, 'name', name)) FROM Voices) AS voices_json,
                 ud.current_alter_ego_id,
                 ae.name AS alter_ego_name,
@@ -6816,7 +6933,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             "admin_view": admin_view,
             "have_vision": full_data['allow_image_generation'],
             "is_admin": await current_user.is_admin,
-            "is_manager": await current_user.is_manager,
+            "is_user": await current_user.is_user,
             "llm_models": llm_models,
             "current_model_type": full_data['current_model_type'],
             "user_balance": full_data['balance'],
@@ -6904,17 +7021,15 @@ async def admin_elevenlabs_agents(request: Request, current_user: User = Depends
         cursor = await conn.execute("SELECT id, name FROM PROMPTS ORDER BY name ASC")
         prompts = [dict(row) for row in await cursor.fetchall()]
 
-    return templates.TemplateResponse(
-        "admin_elevenlabs.html",
-        {
-            "request": request,
-            "agents": agents,
-            "mappings": mappings,
-            "prompts": prompts,
-            "message": message,
-            "error": error,
-        },
-    )
+    context = await get_template_context(request, current_user)
+    context.update({
+        "agents": agents,
+        "mappings": mappings,
+        "prompts": prompts,
+        "message": message,
+        "error": error,
+    })
+    return templates.TemplateResponse("admin_elevenlabs.html", context)
 
 
 @app.post("/admin/elevenlabs-agents")
@@ -7272,7 +7387,7 @@ async def _reassign_and_delete_llm(
     source_llm = dict(source_row)
 
     async with conn.execute(
-        "SELECT id, machine, model, input_token_cost, output_token_cost, vision FROM LLM"
+        "SELECT id, machine, model, input_token_cost, output_token_cost, vision FROM LLM WHERE machine != 'GranSabio'"
     ) as cursor:
         llm_catalog = [dict(row) for row in await cursor.fetchall()]
 
@@ -7376,7 +7491,7 @@ async def api_llms_list(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     async with get_db_connection(readonly=True) as conn:
-        async with conn.execute("SELECT id, machine, model FROM LLM ORDER BY machine, model ASC") as cursor:
+        async with conn.execute("SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model ASC") as cursor:
             rows = await cursor.fetchall()
 
     return [{"id": row[0], "machine": row[1], "model": row[2]} for row in rows]
@@ -7407,14 +7522,17 @@ async def create_llm_post(
         
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
+    if machine == 'GranSabio' and model == 'gransabio-pipeline':
+        raise HTTPException(status_code=403, detail="This machine/model combination is reserved for the system.")
+
     async with get_db_connection() as conn:
         await conn.execute(
             "INSERT INTO LLM (machine, model, input_token_cost, output_token_cost, vision) VALUES (?, ?, ?, ?, ?)",
             (machine, model, input_token_cost, output_token_cost, vision)
         )
         await conn.commit()
-    
+
     return RedirectResponse(url="/admin/llms", status_code=303)
 
 @app.get("/admin/llm/edit/{llm_id}", response_class=HTMLResponse)
@@ -7432,6 +7550,10 @@ async def edit_llm(request: Request, llm_id: int, current_user: User = Depends(g
 
         if not llm:
             raise HTTPException(status_code=404, detail="LLM not found")
+
+        # Block editing the synthetic GranSabio LLM
+        if llm[0] == 'GranSabio' and llm[1] == 'gransabio-pipeline':
+            raise HTTPException(status_code=403, detail="System LLM cannot be edited.")
 
         context = await get_template_context(request, current_user)
         context.update({
@@ -7451,6 +7573,17 @@ async def update_llm(request: Request, llm_id: int, current_user: User = Depends
         
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    # Prevent modification of synthetic GranSabio LLM row
+    async with get_db_connection(readonly=True) as conn:
+        async with conn.execute("SELECT machine, model FROM LLM WHERE id = ?", (llm_id,)) as cur:
+            row = await cur.fetchone()
+        if row and row[0] == 'GranSabio' and row[1] == 'gransabio-pipeline':
+            raise HTTPException(status_code=403, detail="System LLM cannot be modified.")
+    # Prevent renaming another LLM into the reserved pair
+    if machine == 'GranSabio' and model == 'gransabio-pipeline':
+        raise HTTPException(status_code=403, detail="This machine/model combination is reserved for the system.")
+
     async with get_db_connection() as conn:
         await conn.execute("UPDATE LLM SET machine = ?, model = ?, input_token_cost = ?, output_token_cost = ?, vision = ? WHERE id = ?",
                              (machine, model, input_token_cost, output_token_cost, vision, llm_id))
@@ -7464,7 +7597,14 @@ async def delete_llm(llm_id: int, current_user: User = Depends(get_current_user)
         
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
+    # Prevent deletion of synthetic GranSabio LLM row
+    async with get_db_connection(readonly=True) as conn:
+        async with conn.execute("SELECT machine, model FROM LLM WHERE id = ?", (llm_id,)) as cur:
+            row = await cur.fetchone()
+        if row and row[0] == 'GranSabio' and row[1] == 'gransabio-pipeline':
+            raise HTTPException(status_code=403, detail="System LLM cannot be deleted.")
+
     async with get_db_connection() as conn:
         try:
             await conn.execute("BEGIN IMMEDIATE")
@@ -7510,7 +7650,7 @@ async def bulk_delete_llms(request: Request, current_user: User = Depends(get_cu
         try:
             await conn.execute("BEGIN IMMEDIATE")
             async with conn.execute(
-                f"SELECT id FROM LLM WHERE id IN ({placeholders}) AND machine != 'OpenRouter'",
+                f"SELECT id FROM LLM WHERE id IN ({placeholders}) AND machine NOT IN ('OpenRouter', 'GranSabio')",
                 sanitized_ids
             ) as cursor:
                 target_rows = await cursor.fetchall()
@@ -7557,6 +7697,175 @@ async def bulk_delete_llms(request: Request, current_user: User = Depends(get_cu
             raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# GranSabio Admin
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/gransabio")
+async def admin_gransabio_get(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return RedirectResponse(url="/")
+    from gransabio_config import get_gransabio_config
+    raw = await get_gransabio_config()
+    # Transform SYSTEM_CONFIG keys to template-friendly short names
+    tpl_config = {
+        "url": raw.get("gransabio_url", ""),
+        "enabled": raw.get("gransabio_enabled", "false") == "true",
+        "generator_model": raw.get("gransabio_default_generator", ""),
+        "qa_models": orjson.loads(raw.get("gransabio_default_qa_models", "[]")) if raw.get("gransabio_default_qa_models") else [],
+        "gran_sabio_model": raw.get("gransabio_default_gran_sabio_model", ""),
+        "arbiter_model": raw.get("gransabio_default_arbiter_model", ""),
+        "min_global_score": raw.get("gransabio_default_min_score", "8.0"),
+        "max_iterations": raw.get("gransabio_default_max_iterations", "3"),
+        "smart_editing_mode": raw.get("gransabio_default_smart_edit", "auto"),
+        "gran_sabio_fallback": raw.get("gransabio_default_gran_sabio_fallback", "true") == "true",
+        "verbose": raw.get("gransabio_default_verbose", "false") == "true",
+        "context_max_tokens": raw.get("gransabio_default_context_max_tokens", "4000"),
+        "cost_safety_multiplier": raw.get("gransabio_cost_safety_multiplier", "3"),
+        "extra_allowed_ips": raw.get("gransabio_extra_allowed_ips", ""),
+    }
+    context = await get_template_context(request, current_user)
+    context["config"] = tpl_config
+    return templates.TemplateResponse("admin_gransabio.html", context)
+
+
+@app.post("/admin/gransabio")
+async def admin_gransabio_post(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from gransabio_config import validate_gransabio_url, invalidate_gransabio_config_cache, validate_extra_allowed_ips, get_gransabio_config
+
+    data = await request.json()
+    # Map short JS keys -> full SYSTEM_CONFIG keys
+    _key_map = {
+        "enabled": "gransabio_enabled",
+        "url": "gransabio_url",
+        "generator_model": "gransabio_default_generator",
+        "qa_models": "gransabio_default_qa_models",
+        "min_global_score": "gransabio_default_min_score",
+        "max_iterations": "gransabio_default_max_iterations",
+        "gran_sabio_model": "gransabio_default_gran_sabio_model",
+        "arbiter_model": "gransabio_default_arbiter_model",
+        "smart_editing_mode": "gransabio_default_smart_edit",
+        "gran_sabio_fallback": "gransabio_default_gran_sabio_fallback",
+        "verbose": "gransabio_default_verbose",
+        "context_max_tokens": "gransabio_default_context_max_tokens",
+        "cost_safety_multiplier": "gransabio_cost_safety_multiplier",
+        "extra_allowed_ips": "gransabio_extra_allowed_ips",
+    }
+    updates = {}
+    for short_key, db_key in _key_map.items():
+        val = data.get(short_key)
+        if val is None:
+            val = data.get(db_key)  # Also accept full key names
+        if val is not None:
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            elif isinstance(val, (list, dict)):
+                val = orjson.dumps(val).decode()
+            else:
+                val = str(val)
+            updates[db_key] = val
+
+    # Validate URL (SSRF protection)
+    url = updates.get("gransabio_url", "")
+    extra_ips = updates.get("gransabio_extra_allowed_ips", "")
+    if url:
+        ok, err = validate_gransabio_url(url, extra_ips)
+        if not ok:
+            return JSONResponse(content={"success": False, "message": f"URL validation failed: {err}"}, status_code=400)
+
+    # Validate extra IPs if provided
+    if extra_ips:
+        try:
+            validate_extra_allowed_ips(extra_ips)
+        except ValueError as e:
+            return JSONResponse(content={"success": False, "message": str(e)}, status_code=400)
+
+    # Validate BEFORE persisting if GranSabio is being enabled
+    if updates.get("gransabio_enabled") == "true":
+        try:
+            from gransabio_service import merge_gransabio_config, validate_merged_config
+            # Build a preview config by overlaying updates onto current defaults
+            preview = dict(GRANSABIO_DEFAULTS) if 'GRANSABIO_DEFAULTS' in dir() else {}
+            try:
+                current = await get_gransabio_config()
+                preview.update(current)
+            except Exception:
+                pass
+            preview.update(updates)
+            merged = merge_gransabio_config({}, preview)
+            valid, err = validate_merged_config(merged)
+            if not valid:
+                return JSONResponse(content={
+                    "success": False,
+                    "message": f"Configuration invalid: {err}. Fix before enabling GranSabio.",
+                }, status_code=400)
+        except ImportError:
+            logger.warning("GranSabio modules not available, skipping pre-validation")
+        except Exception as e:
+            # Fail-closed: if validation can't complete, don't allow enabling
+            return JSONResponse(content={
+                "success": False,
+                "message": f"Cannot validate configuration: {e}. Fix before enabling GranSabio.",
+            }, status_code=400)
+
+    async with get_db_connection() as conn:
+        for key, value in updates.items():
+            # UPDATE existing keys (preserves description column), INSERT only if new
+            await conn.execute(
+                "UPDATE SYSTEM_CONFIG SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+                (value, key),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (key, value),
+            )
+        await conn.commit()
+
+    invalidate_gransabio_config_cache()
+    from gransabio_config import invalidate_pricing_cache
+    invalidate_pricing_cache()
+
+    # Post-save validation warning (non-blocking, config already saved)
+    if updates.get("gransabio_enabled") == "true":
+        try:
+            from gransabio_service import merge_gransabio_config, validate_merged_config
+            fresh_config = await get_gransabio_config()
+            merged = merge_gransabio_config({}, fresh_config)
+            valid, err = validate_merged_config(merged)
+            if not valid:
+                return JSONResponse(content={
+                    "success": True,
+                    "message": f"Configuration saved, but validation warning: {err}. Prompts using admin defaults may fail at runtime.",
+                })
+        except Exception:
+            pass
+
+    return JSONResponse(content={"success": True, "message": "GranSabio configuration saved."})
+
+
+@app.post("/admin/gransabio/test-connection")
+async def admin_gransabio_test(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from gransabio_config import validate_gransabio_url, get_gransabio_config
+    from gransabio_service import test_gransabio_connection
+
+    data = await request.json()
+    url = data.get("url", "")
+    extra_ips = data.get("extra_allowed_ips", "")
+    if not extra_ips:
+        config = await get_gransabio_config()
+        extra_ips = config.get("gransabio_extra_allowed_ips", "")
+    ok, err = validate_gransabio_url(url, extra_ips)
+    if not ok:
+        return JSONResponse(content={"success": False, "error": err})
+
+    result = await test_gransabio_connection(url)
+    return JSONResponse(content=result)
+
+
 # ============================================================
 # Security Guard LLM Configuration
 # ============================================================
@@ -7587,9 +7896,9 @@ async def admin_security_guard(request: Request, current_user: User = Depends(ge
             if row and row[0]:
                 current_llm_id = int(row[0])
 
-        # Get list of available LLMs
+        # Get list of available LLMs (exclude synthetic GranSabio row)
         cursor = await conn.execute(
-            "SELECT id, machine, model FROM LLM ORDER BY machine, model"
+            "SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model"
         )
         llms = await cursor.fetchall()
 
@@ -8030,6 +8339,457 @@ async def admin_elevenlabs_tts_save(request: Request, current_user: User = Depen
             url="/admin/elevenlabs-tts?error=" + quote(f"Error saving: {type(e).__name__}"),
             status_code=303,
         )
+
+
+# =============================================================================
+# Admin System Prompt Blocks
+# =============================================================================
+
+VALID_POSITIONS = {"pre_prompt", "post_prompt"}
+VALID_CONDITIONS = {"always", "watchdog_only"}
+
+
+@app.get("/admin/system-prompts", response_class=HTMLResponse)
+async def admin_system_prompts(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Access denied")
+    context = await get_template_context(request, current_user)
+    return templates.TemplateResponse("admin_system_prompts.html", {**context, "request": request})
+
+
+@app.get("/api/system-prompt-blocks")
+async def api_list_system_prompt_blocks(request: Request, current_user: User = Depends(get_current_user)):
+    """List all system prompt blocks for admin UI, including virtual entries for missing system blocks."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.execute(
+                """SELECT id, system_key, name, content, description, position, condition,
+                          is_enabled, is_system, display_order, updated_at
+                   FROM SYSTEM_PROMPT_BLOCKS
+                   ORDER BY CASE WHEN position = 'pre_prompt' THEN 0 ELSE 1 END,
+                            display_order ASC, id ASC"""
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+    except Exception:
+        logger.warning("Failed to read SYSTEM_PROMPT_BLOCKS for admin, using defaults")
+        rows = []
+
+    # Normalize system block metadata for display
+    seen_keys = set()
+    for row in rows:
+        sk = row.get("system_key")
+        if sk and sk in SYSTEM_BLOCK_METADATA:
+            seen_keys.add(sk)
+            meta = SYSTEM_BLOCK_METADATA[sk]
+            row["position"] = meta["position"]
+            row["condition"] = meta["condition"]
+            row["_mandatory"] = sk in MANDATORY_SYSTEM_KEYS
+
+    # Virtual entries for missing system blocks
+    for key, default in DEFAULT_SYSTEM_BLOCKS.items():
+        if key not in seen_keys:
+            meta = SYSTEM_BLOCK_METADATA[key]
+            rows.append({
+                "id": None,
+                "system_key": key,
+                "name": key.replace("_", " ").title(),
+                "content": default["content"],
+                "description": "",
+                "position": meta["position"],
+                "condition": meta["condition"],
+                "is_enabled": 1,
+                "is_system": 1,
+                "display_order": meta["display_order"],
+                "updated_at": None,
+                "_missing": True,
+                "_mandatory": key in MANDATORY_SYSTEM_KEYS,
+            })
+
+    rows.sort(key=lambda r: (0 if r["position"] == "pre_prompt" else 1,
+                              r["display_order"], r.get("id") or 999999))
+    return JSONResponse(content=rows)
+
+
+@app.post("/api/system-prompt-blocks")
+async def api_create_system_prompt_block(request: Request, current_user: User = Depends(get_current_user)):
+    """Create a custom system prompt block."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    data = await request.json()
+
+    # Force custom identity
+    data["system_key"] = None
+    data["is_system"] = 0
+
+    # Reject reserved system_key in body
+    if data.get("system_key") in SYSTEM_BLOCK_METADATA:
+        return JSONResponse(status_code=422, content={"error": "Cannot use a reserved system key"})
+
+    name = (data.get("name") or "").strip()
+    if not name:
+        return JSONResponse(status_code=422, content={"error": "Name is required"})
+
+    content = data.get("content", "")
+    if len(content) > MAX_BLOCK_CONTENT_SIZE:
+        return JSONResponse(status_code=422, content={"error": f"Content exceeds {MAX_BLOCK_CONTENT_SIZE} byte limit"})
+
+    position = data.get("position", "post_prompt")
+    if position not in VALID_POSITIONS:
+        return JSONResponse(status_code=422, content={"error": f"Invalid position. Must be one of: {', '.join(VALID_POSITIONS)}"})
+
+    condition = data.get("condition", "always")
+    if condition not in VALID_CONDITIONS:
+        return JSONResponse(status_code=422, content={"error": f"Invalid condition. Must be one of: {', '.join(VALID_CONDITIONS)}"})
+
+    description = data.get("description", "")
+    display_order = int(data.get("display_order", 0))
+    is_enabled = 1 if data.get("is_enabled", True) else 0
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            """INSERT INTO SYSTEM_PROMPT_BLOCKS
+               (system_key, name, content, description, position, condition, is_enabled, is_system, display_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (None, name, content, description, position, condition, is_enabled, 0, display_order)
+        )
+        await conn.commit()
+        new_id = cursor.lastrowid
+
+        cursor = await conn.execute(
+            "SELECT id, system_key, name, content, description, position, condition, is_enabled, is_system, display_order, updated_at FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (new_id,)
+        )
+        created = dict(await cursor.fetchone())
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="create_system_prompt_block",
+            request=request,
+            target_resource_type="system_prompt_block",
+            target_resource_id=new_id,
+            details=f"Created custom block: {name}"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content=created, status_code=201)
+
+
+@app.put("/api/system-prompt-blocks/{block_id}")
+async def api_update_system_prompt_block(block_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    """Update an existing system prompt block."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    data = await request.json()
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, system_key, name, content, description, position, condition, is_enabled, is_system, display_order FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (block_id,)
+        )
+        block = await cursor.fetchone()
+        if not block:
+            return JSONResponse(status_code=404, content={"error": "Block not found"})
+
+        block = dict(block)
+        sk = block["system_key"]
+
+        new_content = data.get("content", block["content"])
+        if len(new_content) > MAX_BLOCK_CONTENT_SIZE:
+            return JSONResponse(status_code=422, content={"error": f"Content exceeds {MAX_BLOCK_CONTENT_SIZE} byte limit"})
+
+        if sk and sk in SYSTEM_BLOCK_METADATA:
+            # System block: restricted updates
+            if not new_content.strip():
+                return JSONResponse(status_code=422, content={"error": "System blocks cannot have empty content"})
+
+            new_is_enabled = data.get("is_enabled", block["is_enabled"])
+            if isinstance(new_is_enabled, bool):
+                new_is_enabled = 1 if new_is_enabled else 0
+            new_is_enabled = int(new_is_enabled)
+
+            if sk in MANDATORY_SYSTEM_KEYS and not new_is_enabled:
+                return JSONResponse(status_code=422, content={"error": "This block cannot be disabled"})
+
+            canonical = SYSTEM_BLOCK_METADATA[sk]
+            new_condition = data.get("condition", canonical["condition"])
+            if new_condition != canonical["condition"]:
+                return JSONResponse(status_code=422, content={"error": f"Condition is frozen to '{canonical['condition']}'"})
+
+            new_position = data.get("position", canonical["position"])
+            if new_position != canonical["position"]:
+                return JSONResponse(status_code=422, content={"error": f"Position is frozen to '{canonical['position']}'"})
+
+            new_name = data.get("name", block["name"])
+            new_description = data.get("description", block["description"])
+            new_display_order = block["display_order"]  # Frozen for system blocks
+
+            await conn.execute(
+                """UPDATE SYSTEM_PROMPT_BLOCKS
+                   SET name = ?, content = ?, description = ?, is_enabled = ?, display_order = ?
+                   WHERE id = ?""",
+                (new_name, new_content, new_description, new_is_enabled, new_display_order, block_id)
+            )
+        else:
+            # Custom block: all fields editable
+            new_name = (data.get("name") or block["name"]).strip()
+            if not new_name:
+                return JSONResponse(status_code=422, content={"error": "Name is required"})
+
+            new_position = data.get("position", block["position"])
+            if new_position not in VALID_POSITIONS:
+                return JSONResponse(status_code=422, content={"error": f"Invalid position. Must be one of: {', '.join(VALID_POSITIONS)}"})
+
+            new_condition = data.get("condition", block["condition"])
+            if new_condition not in VALID_CONDITIONS:
+                return JSONResponse(status_code=422, content={"error": f"Invalid condition. Must be one of: {', '.join(VALID_CONDITIONS)}"})
+
+            new_description = data.get("description", block["description"])
+            new_display_order = int(data.get("display_order", block["display_order"]))
+            new_is_enabled = data.get("is_enabled", block["is_enabled"])
+            if isinstance(new_is_enabled, bool):
+                new_is_enabled = 1 if new_is_enabled else 0
+            new_is_enabled = int(new_is_enabled)
+
+            await conn.execute(
+                """UPDATE SYSTEM_PROMPT_BLOCKS
+                   SET name = ?, content = ?, description = ?, position = ?, condition = ?,
+                       is_enabled = ?, display_order = ?
+                   WHERE id = ?""",
+                (new_name, new_content, new_description, new_position, new_condition,
+                 new_is_enabled, new_display_order, block_id)
+            )
+
+        await conn.commit()
+
+        cursor = await conn.execute(
+            "SELECT id, system_key, name, content, description, position, condition, is_enabled, is_system, display_order, updated_at FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (block_id,)
+        )
+        updated = dict(await cursor.fetchone())
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="update_system_prompt_block",
+            request=request,
+            target_resource_type="system_prompt_block",
+            target_resource_id=block_id,
+            details=f"Updated block: {updated['name']}"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content=updated)
+
+
+@app.post("/api/system-prompt-blocks/{block_id}/reset")
+async def api_reset_system_prompt_block(block_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    """Reset a system block to its default content."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, system_key, is_system FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (block_id,)
+        )
+        block = await cursor.fetchone()
+        if not block:
+            return JSONResponse(status_code=404, content={"error": "Block not found"})
+
+        block = dict(block)
+        if not block["is_system"]:
+            return JSONResponse(status_code=403, content={"error": "Only system blocks can be reset"})
+
+        sk = block["system_key"]
+        if sk not in DEFAULT_SYSTEM_BLOCKS:
+            return JSONResponse(status_code=404, content={"error": "No default found for this system block"})
+
+        default_content = DEFAULT_SYSTEM_BLOCKS[sk]["content"]
+
+        await conn.execute(
+            "UPDATE SYSTEM_PROMPT_BLOCKS SET content = ?, is_enabled = 1 WHERE id = ?",
+            (default_content, block_id)
+        )
+        await conn.commit()
+
+        cursor = await conn.execute(
+            "SELECT id, system_key, name, content, description, position, condition, is_enabled, is_system, display_order, updated_at FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (block_id,)
+        )
+        updated = dict(await cursor.fetchone())
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="reset_system_prompt_block",
+            request=request,
+            target_resource_type="system_prompt_block",
+            target_resource_id=block_id,
+            details=f"Reset block to default: {sk}"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content=updated)
+
+
+@app.post("/api/system-prompt-blocks/restore/{system_key}")
+async def api_restore_system_prompt_block(system_key: str, request: Request, current_user: User = Depends(get_current_user)):
+    """Restore a missing system block from code defaults."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    if system_key not in SYSTEM_BLOCK_METADATA:
+        return JSONResponse(status_code=404, content={"error": "Unknown system key"})
+
+    default = DEFAULT_SYSTEM_BLOCKS[system_key]
+    meta = SYSTEM_BLOCK_METADATA[system_key]
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id FROM SYSTEM_PROMPT_BLOCKS WHERE system_key = ?",
+            (system_key,)
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return JSONResponse(status_code=409, content={"error": "Block already exists"})
+
+        cursor = await conn.execute(
+            """INSERT INTO SYSTEM_PROMPT_BLOCKS
+               (system_key, name, content, description, position, condition, is_enabled, is_system, display_order)
+               VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)""",
+            (system_key, system_key.replace("_", " ").title(), default["content"], "",
+             meta["position"], meta["condition"], meta["display_order"])
+        )
+        await conn.commit()
+        new_id = cursor.lastrowid
+
+        cursor = await conn.execute(
+            "SELECT id, system_key, name, content, description, position, condition, is_enabled, is_system, display_order, updated_at FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (new_id,)
+        )
+        created = dict(await cursor.fetchone())
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="restore_system_prompt_block",
+            request=request,
+            target_resource_type="system_prompt_block",
+            target_resource_id=new_id,
+            details=f"Restored missing system block: {system_key}"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content=created, status_code=201)
+
+
+@app.delete("/api/system-prompt-blocks/{block_id}")
+async def api_delete_system_prompt_block(block_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    """Delete a custom system prompt block."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT id, name, is_system FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?",
+            (block_id,)
+        )
+        block = await cursor.fetchone()
+        if not block:
+            return JSONResponse(status_code=404, content={"error": "Block not found"})
+
+        block = dict(block)
+        if block["is_system"]:
+            return JSONResponse(status_code=403, content={"error": "System blocks cannot be deleted"})
+
+        await conn.execute("DELETE FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?", (block_id,))
+        await conn.commit()
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="delete_system_prompt_block",
+            request=request,
+            target_resource_type="system_prompt_block",
+            target_resource_id=block_id,
+            details=f"Deleted custom block: {block['name']}"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content={"success": True})
+
+
+@app.put("/api/system-prompt-blocks/reorder")
+async def api_reorder_system_prompt_blocks(request: Request, current_user: User = Depends(get_current_user)):
+    """Reorder custom system prompt blocks (system blocks have frozen order)."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
+
+    data = await request.json()
+    if not isinstance(data, list):
+        return JSONResponse(status_code=422, content={"error": "Expected a list of {id, display_order}"})
+
+    async with get_db_connection() as conn:
+        for item in data:
+            item_id = item.get("id")
+            new_order = item.get("display_order")
+            if item_id is None or new_order is None:
+                return JSONResponse(status_code=422, content={"error": "Each item must have 'id' and 'display_order'"})
+
+            cursor = await conn.execute(
+                "SELECT is_system FROM SYSTEM_PROMPT_BLOCKS WHERE id = ?", (item_id,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return JSONResponse(status_code=422, content={"error": f"Block {item_id} not found"})
+            if row[0]:
+                return JSONResponse(status_code=422, content={"error": f"Cannot reorder system block {item_id}"})
+
+            await conn.execute(
+                "UPDATE SYSTEM_PROMPT_BLOCKS SET display_order = ? WHERE id = ?",
+                (int(new_order), item_id)
+            )
+        await conn.commit()
+
+    try:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="reorder_system_prompt_blocks",
+            request=request,
+            target_resource_type="system_prompt_block",
+            details=f"Reordered {len(data)} custom blocks"
+        )
+    except Exception:
+        pass
+
+    return JSONResponse(content={"success": True})
 
 
 @app.get("/api/elevenlabs/voices")
@@ -8981,6 +9741,30 @@ async def get_messages(
 
         await conn.close()
 
+    # Auto-repair: detect and remove empty bot messages
+    empty_bot_ids = [row['message_id'] for row in rows
+                     if row['type'] == 'bot' and (not row['message'] or not row['message'].strip())]
+
+    if empty_bot_ids:
+        logger.warning(f"Auto-repair: removing {len(empty_bot_ids)} empty bot message(s) "
+                       f"from conversation {conversation_id}: {empty_bot_ids}")
+        async with get_db_connection(readonly=False) as write_conn:
+            placeholders = ','.join('?' * len(empty_bot_ids))
+            await write_conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                empty_bot_ids
+            )
+            await write_conn.commit()
+        empty_bot_set = set(empty_bot_ids)
+        rows = [r for r in rows if r['message_id'] not in empty_bot_set]
+
+    # Also log (but don't delete) empty user messages
+    empty_user_ids = [row['message_id'] for row in rows
+                      if row['type'] == 'user' and (not row['message'] or not row['message'].strip())]
+    if empty_user_ids:
+        logger.warning(f"Found {len(empty_user_ids)} empty USER message(s) in conversation "
+                       f"{conversation_id}: {empty_user_ids}. Not auto-deleting.")
+
     # Build conversation_info from the dedicated query
     bot_profile_picture = conv_row['bot_picture'] if conv_row else None
     if bot_profile_picture:
@@ -9773,6 +10557,24 @@ async def stop_message(conversation_id: int, current_user: User = Depends(get_cu
         raise HTTPException(status_code=403, detail="You do not have permission to stop this conversation")
 
     stop_signals[conversation_id] = True
+
+    # Propagate stop to Redis for cross-process GranSabio cancellation (Dramatiq workers)
+    try:
+        from rediscfg import redis_client as _redis
+        await _redis.set(f"gransabio:stop:{conversation_id}", "1", ex=300)
+        # Also call GranSabio stop API directly if session_id is known
+        session_id = await _redis.get(f"gransabio:session:{conversation_id}")
+        if session_id:
+            import httpx
+            from gransabio_config import get_gransabio_config
+            cfg = await get_gransabio_config()
+            gs_url = cfg.get("gransabio_url", "")
+            if gs_url:
+                async with httpx.AsyncClient(timeout=5.0) as c:
+                    await c.post(f"{gs_url}/stop/{session_id}")
+    except Exception:
+        pass  # Best-effort: local stop_signals is the primary mechanism
+
     return {"success": True, "message": "Stop signal sent."}
 
 @app.post('/api/conversations/{conversation_id}/bookmark')
@@ -10532,6 +11334,10 @@ async def branch_conversation(
         source_llm_id = source_conv['llm_id']
         source_extension_id = source_conv['active_extension_id']
         source_chat_name = source_conv['chat_name']
+
+        # Validate prompt access (user may have lost access since original conversation)
+        if source_role_id and not await can_user_access_prompt(current_user, source_role_id, cursor):
+            raise HTTPException(status_code=403, detail="Access denied to this prompt")
 
         # 2. Block branching for external platform conversations
         await cursor.execute(
@@ -11889,7 +12695,7 @@ async def stripe_webhook(request: Request):
                             cur_file = ud_row[2] if ud_row else 0
                             cur_imggen = ud_row[3] if ud_row else 0
 
-                            if lrc.get("billing_mode") == "manager_pays" and creator_id:
+                            if lrc.get("billing_mode") == "user_pays" and creator_id:
                                 if cur_billing is None:
                                     await cursor.execute(
                                         "UPDATE USER_DETAILS SET billing_account_id = ? WHERE user_id = ?",
@@ -12063,73 +12869,16 @@ async def stripe_webhook(request: Request):
                     bal_row = await bal_cursor.fetchone()
                     buyer_balance_before = bal_row[0] if bal_row else 0
 
-                    # Apply landing_registration_config to buyer
                     initial_balance_cost = 0
                     if prompt_data and prompt_data[1]:
                         import json as _json
                         try:
                             lrc = _json.loads(prompt_data[1]) if isinstance(prompt_data[1], str) else prompt_data[1]
-                            ib = float(lrc.get("initial_balance", 0))
-                            if ib > 0:
-                                scale = (1 - discount_value / 100) if discount_value > 0 else 1
-                                scaled_ib = ib * scale
-                                if scaled_ib > creator_share:
-                                    logger.warning(
-                                        "Prompt %s: initial_balance %.2f exceeds creator_share %.2f, clamping",
-                                        prompt_id, scaled_ib, creator_share
-                                    )
-                                    scaled_ib = creator_share
-                                if scaled_ib > 0:
-                                    initial_balance_cost = scaled_ib
-                                    await cursor.execute(
-                                        "UPDATE USER_DETAILS SET balance = balance + ? WHERE user_id = ?",
-                                        (scaled_ib, buyer_user_id)
-                                    )
-                            # Expand permissions (never restrict) - same pattern as pack webhook
-                            ud_cur = await cursor.execute(
-                                """SELECT public_prompts_access, billing_account_id,
-                                          allow_file_upload, allow_image_generation
-                                   FROM USER_DETAILS WHERE user_id = ?""",
-                                (buyer_user_id,)
-                            )
-                            ud_row = await ud_cur.fetchone()
-                            cur_public = ud_row[0] if ud_row else 0
-                            cur_billing = ud_row[1] if ud_row else None
-                            cur_file = ud_row[2] if ud_row else 0
-                            cur_imggen = ud_row[3] if ud_row else 0
-
-                            if lrc.get("billing_mode") == "manager_pays" and creator_id:
-                                if cur_billing is None:
-                                    await cursor.execute(
-                                        "UPDATE USER_DETAILS SET billing_account_id = ? WHERE user_id = ?",
-                                        (creator_id, buyer_user_id)
-                                    )
-                                else:
-                                    logger.warning("Webhook: billing_account_id not overwritten for user %s (already %s)", buyer_user_id, cur_billing)
-                            if "public_prompts_access" in lrc:
-                                if lrc["public_prompts_access"] and not cur_public:
-                                    await cursor.execute(
-                                        "UPDATE USER_DETAILS SET public_prompts_access = 1 WHERE user_id = ?",
-                                        (buyer_user_id,)
-                                    )
-                                elif not lrc["public_prompts_access"] and cur_public:
-                                    logger.warning("Webhook: skipping public_prompts_access downgrade for user %s", buyer_user_id)
-                            if "allow_file_upload" in lrc:
-                                if lrc["allow_file_upload"] and not cur_file:
-                                    await cursor.execute(
-                                        "UPDATE USER_DETAILS SET allow_file_upload = 1 WHERE user_id = ?",
-                                        (buyer_user_id,)
-                                    )
-                                elif not lrc["allow_file_upload"] and cur_file:
-                                    logger.warning("Webhook: skipping allow_file_upload downgrade for user %s", buyer_user_id)
-                            if "allow_image_generation" in lrc:
-                                if lrc["allow_image_generation"] and not cur_imggen:
-                                    await cursor.execute(
-                                        "UPDATE USER_DETAILS SET allow_image_generation = 1 WHERE user_id = ?",
-                                        (buyer_user_id,)
-                                    )
-                                elif not lrc["allow_image_generation"] and cur_imggen:
-                                    logger.warning("Webhook: skipping allow_image_generation downgrade for user %s", buyer_user_id)
+                            initial_balance_cost = await _apply_landing_config_to_user(
+                                conn, lrc, buyer_user_id,
+                                creator_user_id=creator_id,
+                                discount_pct=discount_value,
+                                creator_share=creator_share)
                         except Exception as lrc_err:
                             logger.warning(f"Failed to apply prompt landing config: {lrc_err}")
 
@@ -12730,7 +13479,7 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
         if not is_public:
             raise HTTPException(status_code=404, detail="Prompt not found")
 
-        if purchase_price is None:
+        if purchase_price is None or purchase_price == 0:
             raise HTTPException(status_code=400, detail="This prompt is not available for individual purchase")
 
         # Self-purchase prevention
@@ -12861,6 +13610,18 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
                         await upsert_creator_relationship(conn, current_user.id, creator_user_id, 'purchased_from', 'prompt', prompt_id)
                     except Exception as ucr_err:
                         logger.warning(f"Could not record creator relationship for free prompt purchase: {ucr_err}")
+
+                # Apply landing_registration_config (same as paid purchases)
+                if landing_reg_config:
+                    try:
+                        import json as _json
+                        lrc = _json.loads(landing_reg_config) if isinstance(landing_reg_config, str) else landing_reg_config
+                        await _apply_landing_config_to_user(
+                            conn, lrc, current_user.id,
+                            creator_user_id=creator_user_id,
+                            discount_pct=discount_value)
+                    except Exception as lrc_err:
+                        logger.warning(f"Failed to apply landing config for free purchase: {lrc_err}")
 
                 await conn.commit()
             except Exception:
@@ -13744,29 +14505,27 @@ async def admin_watchdog_events(request: Request, current_user: User = Depends(g
     showing_start = offset + 1 if total_events > 0 else 0
     showing_end = offset + len(events)
 
-    return templates.TemplateResponse(
-        "admin_watchdog.html",
-        {
-            "request": request,
-            "events": events,
-            "prompts": prompts,
-            "stats": {"hints": hints, "errors": errors},
-            "filters": {
-                "prompt_id": int(f_prompt_id) if f_prompt_id.isdigit() else None,
-                "severity": f_severity or None,
-                "event_type": f_event_type or None,
-                "conversation_id": int(f_conversation_id) if f_conversation_id.isdigit() else None,
-            },
-            "event_types": ["drift", "rabbit_hole", "stuck", "inconsistency", "saturation", "none", "error", "security"],
-            "severities": ["info", "nudge", "redirect", "alert"],
-            "page": page,
-            "per_page": per_page,
-            "total_events": total_events,
-            "total_pages": total_pages,
-            "showing_start": showing_start,
-            "showing_end": showing_end,
+    context = await get_template_context(request, current_user)
+    context.update({
+        "events": events,
+        "prompts": prompts,
+        "stats": {"hints": hints, "errors": errors},
+        "filters": {
+            "prompt_id": int(f_prompt_id) if f_prompt_id.isdigit() else None,
+            "severity": f_severity or None,
+            "event_type": f_event_type or None,
+            "conversation_id": int(f_conversation_id) if f_conversation_id.isdigit() else None,
         },
-    )
+        "event_types": ["drift", "rabbit_hole", "stuck", "inconsistency", "saturation", "none", "error", "security"],
+        "severities": ["info", "nudge", "redirect", "alert"],
+        "page": page,
+        "per_page": per_page,
+        "total_events": total_events,
+        "total_pages": total_pages,
+        "showing_start": showing_start,
+        "showing_end": showing_end,
+    })
+    return templates.TemplateResponse("admin_watchdog.html", context)
 
 
 # ============================================================================
@@ -14717,6 +15476,79 @@ async def whatsapp_webhook(request: Request):
         # Prepare files list with all downloaded images
         files = files_list if files_list else None
 
+        # --- GranSabio check: if enabled, process in background ---
+        async with get_db_connection(readonly=True) as conn_gs:
+            gs_row = await conn_gs.execute(
+                "SELECT COALESCE(ep.gransabio_enabled, 0) FROM CONVERSATIONS c "
+                "LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id "
+                "LEFT JOIN PROMPTS ep ON ep.id = COALESCE(c.role_id, ud.current_prompt_id) "
+                "WHERE c.id = ?", (conversation_id,)
+            )
+            gs_result = await gs_row.fetchone()
+        is_gransabio = bool((gs_result or [0])[0])
+
+        if is_gransabio:
+            # Reject file attachments for GranSabio (text only)
+            if files_list:
+                await async_twilio.send_message(
+                    body="File attachments are not supported with GranSabio mode. Please send text only.",
+                    from_=to_number, to=from_number,
+                )
+                return JSONResponse(content={"status": "success"})
+
+            from gransabio_config import GRANSABIO_USE_DRAMATIQ, get_gransabio_config
+            from gransabio_service import (
+                merge_gransabio_config, estimate_pipeline_timeout,
+                load_prompt_gransabio_config, process_gransabio_external,
+            )
+
+            admin_config = await get_gransabio_config()
+            if admin_config.get("gransabio_enabled") != "true":
+                await async_twilio.send_message(
+                    body="GranSabio is currently disabled.",
+                    from_=to_number, to=from_number,
+                )
+                return JSONResponse(content={"status": "success"})
+
+            prompt_config = await load_prompt_gransabio_config(conversation_id)
+            merged_config = merge_gransabio_config(prompt_config, admin_config)
+            estimated_timeout = estimate_pipeline_timeout(merged_config)
+
+            platform_context = {
+                "from_number": from_number,
+                "to_number": to_number,
+                "answer_mode": answer_mode,
+                "conversation_id": conversation_id,
+            }
+
+            if GRANSABIO_USE_DRAMATIQ:
+                from tasks import gransabio_external_task
+                gransabio_external_task.send_with_options(
+                    args=(
+                        conversation_id,
+                        orjson.dumps(user_message).decode(),
+                        "whatsapp",
+                        orjson.dumps(platform_context).decode(),
+                        estimated_timeout,
+                    ),
+                    time_limit=28_800_000,
+                )
+            else:
+                import asyncio
+                asyncio.create_task(
+                    process_gransabio_external(
+                        conversation_id=conversation_id,
+                        user_id=current_user.id,
+                        user_message=user_message,
+                        platform="whatsapp",
+                        platform_context=platform_context,
+                        estimated_timeout=estimated_timeout,
+                    )
+                )
+
+            return JSONResponse(content={"status": "success"})
+
+        # --- Normal (non-GranSabio) path continues below ---
         # Use process_save_message directly to avoid Form() object issues
         response = await process_save_message(
             request=request,
@@ -15314,7 +16146,75 @@ async def telegram_webhook(request: Request):
         msg_type = "audio" if transcribed_text else ("image" if files_list else "text")
         await _log_telegram('in', current_user.id, chat_id, msg_type, answer_mode)
 
-        # --- Process message through AI ---
+        # --- GranSabio check: if enabled, process in background ---
+        async with get_db_connection(readonly=True) as conn_gs:
+            gs_row = await conn_gs.execute(
+                "SELECT COALESCE(ep.gransabio_enabled, 0) FROM CONVERSATIONS c "
+                "LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id "
+                "LEFT JOIN PROMPTS ep ON ep.id = COALESCE(c.role_id, ud.current_prompt_id) "
+                "WHERE c.id = ?", (conversation_id,)
+            )
+            gs_result = await gs_row.fetchone()
+        is_gransabio = bool((gs_result or [0])[0])
+
+        if is_gransabio:
+            # Reject file attachments for GranSabio (text only)
+            if files_list:
+                await async_telegram.send_message(
+                    chat_id, "File attachments are not supported with GranSabio mode. Please send text only."
+                )
+                return JSONResponse(content={"ok": True})
+
+            from gransabio_config import GRANSABIO_USE_DRAMATIQ, get_gransabio_config
+            from gransabio_service import (
+                merge_gransabio_config, estimate_pipeline_timeout,
+                load_prompt_gransabio_config, process_gransabio_external,
+            )
+
+            admin_config = await get_gransabio_config()
+            if admin_config.get("gransabio_enabled") != "true":
+                await async_telegram.send_message(chat_id, "GranSabio is currently disabled.")
+                return JSONResponse(content={"ok": True})
+
+            prompt_config = await load_prompt_gransabio_config(conversation_id)
+            merged_config = merge_gransabio_config(prompt_config, admin_config)
+            estimated_timeout = estimate_pipeline_timeout(merged_config)
+
+            platform_context = {
+                "chat_id": chat_id,
+                "answer_mode": answer_mode,
+                "conversation_id": conversation_id,
+            }
+
+            if GRANSABIO_USE_DRAMATIQ:
+                from tasks import gransabio_external_task
+                gransabio_external_task.send_with_options(
+                    args=(
+                        conversation_id,
+                        orjson.dumps(user_message).decode(),
+                        "telegram",
+                        orjson.dumps(platform_context).decode(),
+                        estimated_timeout,
+                    ),
+                    time_limit=28_800_000,
+                )
+            else:
+                import asyncio
+                asyncio.create_task(
+                    process_gransabio_external(
+                        conversation_id=conversation_id,
+                        user_id=current_user.id,
+                        user_message=user_message,
+                        platform="telegram",
+                        platform_context=platform_context,
+                        estimated_timeout=estimated_timeout,
+                    )
+                )
+
+            # Acknowledge webhook immediately (incoming already logged above)
+            return JSONResponse(content={"ok": True})
+
+        # --- Normal (non-GranSabio) path continues below ---
         files = files_list if files_list else None
         response = await process_save_message(
             request=request,
@@ -15944,7 +16844,7 @@ async def register_page_user(
 
     response = templates.TemplateResponse("register_public.html", {
         "request": request,
-        "target_role": "user",
+        "target_role": "customer",
         "prompt": prompt,
         "login_url": f"{base_url}/login",
         "captcha": get_captcha_config(),
@@ -16269,14 +17169,14 @@ async def custom_domain_register(request: Request):
     """
     Registration page for custom domains.
     If request comes from a custom domain, render registration for that prompt.
-    Otherwise, fall through to manager registration.
+    Otherwise, fall through to user registration.
     """
     # Check if this is a custom domain request
     if not getattr(request.state, 'custom_domain', False):
-        # Not a custom domain - use manager registration
+        # Not a custom domain - use user registration
         response = templates.TemplateResponse("register_public.html", {
             "request": request,
-            "target_role": "manager",
+            "target_role": "user",
             "prompt": None,
             "login_url": "/login",
             "captcha": get_captcha_config(),
@@ -16297,7 +17197,7 @@ async def custom_domain_register(request: Request):
 
         response = templates.TemplateResponse("register_public.html", {
             "request": request,
-            "target_role": "user",
+            "target_role": "customer",
             "prompt": prompt,
             "login_url": "/login",
             "captcha": get_captcha_config(),
@@ -16505,7 +17405,7 @@ async def _resolve_pack_oauth_context(pack_id):
                 stored_config = orjson.loads(pack_config_row[0])
                 landing_config.update(stored_config)
 
-            pack_owner_id = pack_config_row[1] if landing_config.get("billing_mode") == "manager_pays" else None
+            pack_owner_id = pack_config_row[1] if landing_config.get("billing_mode") == "user_pays" else None
             return (pack_id, first_prompt_id, False, landing_config, pack_owner_id, None)
     except Exception as e:
         logger.warning(f"Could not resolve pack OAuth context for pack {pack_id}: {e}")
@@ -16640,7 +17540,7 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
             return RedirectResponse(url="/login?error=no_email")
 
         # Determine target role based on context
-        target_role = "user" if (prompt_id or pack_id) else "manager"
+        target_role = "customer" if (prompt_id or pack_id) else "user"
 
         # === CASE 1: User with this google_id already exists ===
         user = await get_user_by_google_id(google_id)
@@ -16765,11 +17665,11 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
                 company_id=None,
                 current_user=None,
                 category_access=category_access,
-                billing_account_id=prompt_owner_id if landing_config.get("billing_mode") == "manager_pays" else None,
-                billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "manager_pays" else None,
-                billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "manager_pays" else "block",
-                billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "manager_pays" else 10.0,
-                billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "manager_pays" else None
+                billing_account_id=prompt_owner_id if landing_config.get("billing_mode") == "user_pays" else None,
+                billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "user_pays" else None,
+                billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "user_pays" else "block",
+                billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "user_pays" else 10.0,
+                billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" else None
             )
         else:
             # Original add_user call (no pack config)
@@ -16779,8 +17679,8 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
                 all_prompts_access=False,
                 public_prompts_access=True,
                 llm_id=default_llm_id,
-                allow_file_upload=(target_role == "manager"),
-                allow_image_generation=(target_role == "manager"),
+                allow_file_upload=(target_role == "user"),
+                allow_image_generation=(target_role == "user"),
                 balance=0.0,
                 phone=None,
                 role_name=target_role,
@@ -16916,7 +17816,7 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
 
 
 # =============================================================================
-# Manager Registration - MOVED to custom_domain_register() which handles both
+# User Registration - MOVED to custom_domain_register() which handles both
 # =============================================================================
 
 
@@ -16984,7 +17884,7 @@ async def verify_email(request: Request, token: str):
     # Create the user
     try:
         # Determine settings based on role
-        is_manager = pending["target_role"] == "manager"
+        is_user = pending["target_role"] == "user"
         prompt_id = pending["prompt_id"]
         pack_id = pending.get("pack_id")
 
@@ -16996,7 +17896,7 @@ async def verify_email(request: Request, token: str):
         analytics_pack_id = pack_id  # Preserve for analytics even if pack_id is cleared
         paid_pack_landing_url = None
 
-        if pack_id and not is_manager:
+        if pack_id and not is_user:
             # Pack registration: revalidate pack state and use pack's landing_reg_config
             try:
                 async with get_db_connection(readonly=True) as conn:
@@ -17042,19 +17942,19 @@ async def verify_email(request: Request, token: str):
                                 stored_config = orjson.loads(pack_config_row[0])
                                 landing_config.update(stored_config)
                             ucr_creator_id = pack_config_row[1]
-                            if landing_config.get("billing_mode") == "manager_pays":
+                            if landing_config.get("billing_mode") == "user_pays":
                                 prompt_owner_id = pack_config_row[1]
             except Exception as config_err:
                 logger.warning(f"Could not get landing config for pack {pack_id}: {config_err}")
                 pack_id = None
                 prompt_id = None
                 analytics_pack_id = None
-        elif prompt_id and not is_manager:
+        elif prompt_id and not is_user:
             try:
                 landing_config = await get_landing_registration_config(prompt_id)
                 ucr_creator_id = await get_prompt_owner_id(prompt_id)
-                # If manager_pays mode, reuse the same owner ID for billing
-                if landing_config.get("billing_mode") == "manager_pays":
+                # If user_pays mode, reuse the same owner ID for billing
+                if landing_config.get("billing_mode") == "user_pays":
                     prompt_owner_id = ucr_creator_id
             except Exception as config_err:
                 logger.warning(f"Could not get landing config for prompt {prompt_id}: {config_err}")
@@ -17081,21 +17981,21 @@ async def verify_email(request: Request, token: str):
             role_name=pending["target_role"],
             authentication_mode="password_only",
             initial_password=None,  # We'll set the hash directly
-            prompt_id=prompt_id if not is_manager else None,
+            prompt_id=prompt_id if not is_user else None,
             all_prompts_access=False,
-            public_prompts_access=landing_config.get("public_prompts_access", True) if not is_manager else True,
-            llm_id=default_llm_id if not is_manager else 1,
-            allow_file_upload=is_manager or landing_config.get("allow_file_upload", False),
-            allow_image_generation=is_manager or landing_config.get("allow_image_generation", False),
-            balance=landing_config.get("initial_balance", 0.0) if not is_manager else 0.0,
+            public_prompts_access=landing_config.get("public_prompts_access", True) if not is_user else True,
+            llm_id=default_llm_id if not is_user else 1,
+            allow_file_upload=is_user or landing_config.get("allow_file_upload", False),
+            allow_image_generation=is_user or landing_config.get("allow_image_generation", False),
+            balance=landing_config.get("initial_balance", 0.0) if not is_user else 0.0,
             phone=None,
             current_user=None,
-            category_access=category_access if not is_manager else None,
-            billing_account_id=prompt_owner_id if landing_config.get("billing_mode") == "manager_pays" and not is_manager else None,
-            billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "manager_pays" and not is_manager else None,
-            billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "manager_pays" and not is_manager else "block",
-            billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "manager_pays" and not is_manager else 10.0,
-            billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "manager_pays" and not is_manager else None
+            category_access=category_access if not is_user else None,
+            billing_account_id=prompt_owner_id if landing_config.get("billing_mode") == "user_pays" and not is_user else None,
+            billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "user_pays" and not is_user else None,
+            billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "user_pays" and not is_user else "block",
+            billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "user_pays" and not is_user else 10.0,
+            billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" and not is_user else None
         )
 
         if not user_id:
@@ -17114,7 +18014,7 @@ async def verify_email(request: Request, token: str):
                 logger.warning(f"Could not record creator relationship for user {user_id}: {ucr_err}")
 
         # Record captive domain relationship if user is captive
-        effective_public = landing_config.get("public_prompts_access", True) if not is_manager else True
+        effective_public = landing_config.get("public_prompts_access", True) if not is_user else True
         if not effective_public and prompt_id:
             try:
                 async with get_db_connection() as cd_conn:
@@ -17152,7 +18052,7 @@ async def verify_email(request: Request, token: str):
             await conn.commit()
 
         # Record initial_balance as TRANSACTION for audit trail
-        reg_initial_balance = landing_config.get("initial_balance", 0.0) if not is_manager else 0.0
+        reg_initial_balance = landing_config.get("initial_balance", 0.0) if not is_user else 0.0
         if reg_initial_balance > 0:
             try:
                 async with get_db_connection() as conn:
@@ -17718,7 +18618,7 @@ async def delete_landing_page(
 # =============================================================================
 # Landing Page Registration Configuration API
 # =============================================================================
-# These endpoints allow managers to configure how users are created when
+# These endpoints allow users to configure how customers are created when
 # they register from a landing page.
 
 @app.get("/api/landing/{prompt_id}/registration", response_class=JSONResponse)
@@ -17742,9 +18642,9 @@ async def get_landing_config_endpoint(
         # Get the configuration
         config = await get_landing_registration_config(prompt_id)
 
-        # Get available LLMs for the dropdown
+        # Get available LLMs for the dropdown (exclude synthetic GranSabio row)
         async with get_db_connection(readonly=True) as conn:
-            async with conn.execute("SELECT id, machine, model FROM LLM ORDER BY machine, model") as cursor:
+            async with conn.execute("SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model") as cursor:
                 llms = [{"id": row[0], "name": f"{row[1]} - {row[2]}"} for row in await cursor.fetchall()]
 
             # Get available categories for the dropdown
@@ -17773,7 +18673,7 @@ async def set_landing_config_endpoint(
 ):
     """
     Set the landing registration configuration for a prompt.
-    Only the prompt owner/manager or admin can modify this.
+    Only the prompt owner or admin can modify this.
     """
     if current_user is None:
         return unauthenticated_response()
@@ -17791,21 +18691,21 @@ async def set_landing_config_endpoint(
             return JSONResponse({"success": False, "message": "Invalid JSON"}, status_code=400)
 
         # Validate billing_mode specific logic
-        billing_mode = data.get("billing_mode", "user_pays")
-        if billing_mode == "manager_pays":
-            # Verify the current user has balance to pay for users
+        billing_mode = data.get("billing_mode", "customer_pays")
+        if billing_mode == "user_pays":
+            # Verify the current user has balance to pay for customers
             async with get_db_connection(readonly=True) as conn:
                 async with conn.execute(
                     "SELECT balance FROM USER_DETAILS WHERE user_id = ?",
                     (current_user.id,)
                 ) as cursor:
                     result = await cursor.fetchone()
-                    manager_balance = result[0] if result else 0
+                    owner_balance = result[0] if result else 0
 
-            if manager_balance <= 0:
+            if owner_balance <= 0:
                 return JSONResponse({
                     "success": False,
-                    "message": "You need a positive balance to enable 'manager pays' mode"
+                    "message": "You need a positive balance to enable 'user pays' mode"
                 }, status_code=400)
 
         # Validate: public_prompts_access=false requires an active custom domain
@@ -20164,7 +21064,7 @@ async def _send_entitlement_claim_email(
         claim_url = f"{scheme}://{host}/claim-entitlement/{token}"
 
     # Get product name and branding for the email
-    from common import get_manager_branding
+    from common import get_user_branding
     product_name = None
     branding = None
     try:
@@ -20176,7 +21076,7 @@ async def _send_entitlement_claim_email(
                 row = await cur.fetchone()
                 if row:
                     product_name = row[0]
-                    branding = await get_manager_branding(row[1])
+                    branding = await get_user_branding(row[1])
             elif prompt_id:
                 cur = await conn.execute(
                     "SELECT name, created_by_user_id FROM PROMPTS WHERE id = ?", (prompt_id,)
@@ -20185,7 +21085,7 @@ async def _send_entitlement_claim_email(
                 if row:
                     product_name = row[0]
                     if row[1]:
-                        branding = await get_manager_branding(row[1])
+                        branding = await get_user_branding(row[1])
     except Exception as e:
         logger.warning(f"Could not get product name/branding for claim email: {e}")
 
@@ -20396,7 +21296,7 @@ async def register_submit(
         })
 
     # Determine role and get prompt info
-    target_role = "user" if prompt_id else "manager"
+    target_role = "customer" if prompt_id else "user"
     prompt_name = None
     prompt_owner_id = None
 
@@ -20513,14 +21413,14 @@ async def register_submit(
     # Get branding from prompt owner if registering via landing page
     branding = None
     if prompt_owner_id:
-        from common import get_manager_branding
-        branding = await get_manager_branding(prompt_owner_id)
+        from common import get_user_branding
+        branding = await get_user_branding(prompt_owner_id)
 
     # Send verification email
     email_sent = email_service.send_verification_email(
         to_email=email,
         verification_url=verification_url,
-        is_manager=(target_role == "manager"),
+        is_user=(target_role == "user"),
         prompt_name=prompt_name,
         branding=branding
     )
@@ -20666,7 +21566,7 @@ async def register_pack_submit(request: Request):
         username=username,
         password_hash=password_hash,
         token=token,
-        target_role="user",
+        target_role="customer",
         prompt_id=first_prompt_id,
         expires_at=expires_at,
         pack_id=pack_id,
@@ -20688,14 +21588,14 @@ async def register_pack_submit(request: Request):
     # Get branding from pack owner
     branding = None
     if pack_owner_id:
-        from common import get_manager_branding
-        branding = await get_manager_branding(pack_owner_id)
+        from common import get_user_branding
+        branding = await get_user_branding(pack_owner_id)
 
     # Send verification email
     email_service.send_verification_email(
         to_email=email,
         verification_url=verification_url,
-        is_manager=False,
+        is_user=False,
         prompt_name=None,
         branding=branding
     )
@@ -21476,7 +22376,7 @@ async def disable_cloudflare_cache(current_user: User = Depends(get_current_user
     if current_user is None:
         return unauthenticated_response()
         
-    if not (await current_user.is_admin or await current_user.is_manager):
+    if not (await current_user.is_admin or await current_user.is_user):
         return JSONResponse(content={"error": "You do not have permission to access this action."}, status_code=403)
 
     try:
@@ -21490,7 +22390,7 @@ async def clear_audio_cache(time_arg: dict, current_user: User = Depends(get_cur
     if current_user is None:
         return unauthenticated_response()
 
-    if not (await current_user.is_admin or await current_user.is_manager):
+    if not (await current_user.is_admin or await current_user.is_user):
         return JSONResponse(content={"error": "You do not have permission to access this action."}, status_code=403)
 
     try:
@@ -22537,12 +23437,21 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
 
         # Get user's accessible prompts not in any pack
         await cursor.execute('''
-            SELECT ud.all_prompts_access, ud.current_prompt_id, ud.public_prompts_access
+            SELECT ud.all_prompts_access, ud.current_prompt_id, ud.public_prompts_access, ud.category_access
             FROM USER_DETAILS ud WHERE ud.user_id = ?
         ''', (user_id,))
         ud = await cursor.fetchone()
         all_prompts_access = bool(ud['all_prompts_access']) if ud else False
         public_prompts_access = bool(ud['public_prompts_access']) if ud else False
+        category_access = ud['category_access'] if ud else None
+
+        pack_exclusion = '''
+            AND p.id NOT IN (
+                SELECT pi.prompt_id FROM PACK_ITEMS pi
+                JOIN PACK_ACCESS pa ON pa.pack_id = pi.pack_id
+                WHERE pa.user_id = ? AND pi.is_active = 1
+            )
+        '''
 
         if all_prompts_access:
             await cursor.execute('''
@@ -22552,31 +23461,39 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
                             WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp2 WHERE pp2.prompt_id = p.id AND pp2.user_id = ? AND pp2.permission_level = 'owner') THEN 1
                             ELSE 0 END as is_mine
                 FROM PROMPTS p
-                WHERE p.id NOT IN (
-                    SELECT pi.prompt_id FROM PACK_ITEMS pi
-                    JOIN PACK_ACCESS pa ON pa.pack_id = pi.pack_id
-                    WHERE pa.user_id = ? AND pi.is_active = 1
-                )
+                WHERE 1=1
+            ''' + pack_exclusion + '''
                 ORDER BY p.name
                 LIMIT 50
             ''', (user_id, user_id, user_id))
         else:
-            await cursor.execute('''
-                SELECT p.id, p.name, p.description, p.image, p.extensions_enabled,
+            query = '''
+                SELECT DISTINCT p.id, p.name, p.description, p.image, p.extensions_enabled,
                        (SELECT COUNT(*) FROM PROMPT_EXTENSIONS pe WHERE pe.prompt_id = p.id) as extension_count,
                        CASE WHEN p.created_by_user_id = ? THEN 1
                             WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp2 WHERE pp2.prompt_id = p.id AND pp2.user_id = ? AND pp2.permission_level = 'owner') THEN 1
                             ELSE 0 END as is_mine
                 FROM PROMPTS p
-                WHERE EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp WHERE pp.prompt_id = p.id AND pp.user_id = ?)
-                AND p.id NOT IN (
-                    SELECT pi.prompt_id FROM PACK_ITEMS pi
-                    JOIN PACK_ACCESS pa ON pa.pack_id = pi.pack_id
-                    WHERE pa.user_id = ? AND pi.is_active = 1
-                )
-                ORDER BY p.name
-                LIMIT 50
-            ''', (user_id, user_id, user_id, user_id))
+                LEFT JOIN PROMPT_PERMISSIONS pp ON p.id = pp.prompt_id AND pp.user_id = ?
+                WHERE (
+                    EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp2 WHERE pp2.prompt_id = p.id AND pp2.user_id = ?)
+            '''
+            params = [user_id, user_id, user_id, user_id]
+
+            if public_prompts_access:
+                if category_access is None:
+                    query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
+                else:
+                    query += """ OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0) AND EXISTS (
+                        SELECT 1 FROM PROMPT_CATEGORIES pc
+                        WHERE pc.prompt_id = p.id
+                        AND pc.category_id IN (SELECT value FROM json_each(?))
+                    ))"""
+                    params.append(category_access)
+
+            query += ")" + pack_exclusion + " ORDER BY p.name LIMIT 50"
+            params.append(user_id)
+            await cursor.execute(query, params)
 
         loose_prompts = [dict(row) for row in await cursor.fetchall()]
 
@@ -22589,13 +23506,13 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
             except Exception:
                 p['has_welcome'] = False
 
-        # Get manager branding via UCR (USER_CREATOR_RELATIONSHIPS)
+        # Get user branding via UCR (USER_CREATOR_RELATIONSHIPS)
         branding = None
         await cursor.execute('''
-            SELECT mb.company_name, mb.logo_url, mb.brand_color_primary, mb.brand_color_secondary,
-                   mb.footer_text, mb.forced_theme, mb.disable_theme_selector, mb.hide_platform_branding
+            SELECT ub.company_name, ub.logo_url, ub.brand_color_primary, ub.brand_color_secondary,
+                   ub.footer_text, ub.forced_theme, ub.disable_theme_selector, ub.hide_platform_branding
             FROM USER_CREATOR_RELATIONSHIPS ucr
-            JOIN MANAGER_BRANDING mb ON mb.manager_id = ucr.creator_id
+            JOIN USER_BRANDING ub ON ub.user_id = ucr.creator_id
             WHERE ucr.user_id = ? AND ucr.is_primary = 1
         ''', (user_id,))
         branding_row = await cursor.fetchone()
@@ -22616,11 +23533,18 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
         # Latest public marketplace prompts
         latest_prompts = []
         if public_prompts_access or all_prompts_access:
-            await cursor.execute('''
-                SELECT p.id, p.name, p.created_at FROM PROMPTS p
-                WHERE p.public = 1
-                ORDER BY p.created_at DESC LIMIT 5
-            ''')
+            if all_prompts_access:
+                await cursor.execute('''
+                    SELECT p.id, p.name, p.created_at FROM PROMPTS p
+                    WHERE p.public = 1
+                    ORDER BY p.created_at DESC LIMIT 5
+                ''')
+            else:
+                await cursor.execute('''
+                    SELECT p.id, p.name, p.created_at FROM PROMPTS p
+                    WHERE p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0)
+                    ORDER BY p.created_at DESC LIMIT 5
+                ''')
             latest_prompts = [dict(row) for row in await cursor.fetchall()]
 
             # Check welcome files for latest prompts
@@ -23739,6 +24663,8 @@ async def shutdown_event():
     # Wait for all tasks to be cancelled
     await asyncio.gather(*tasks, return_exceptions=True)
         
+_dual_mode_active = False  # Set before uvicorn.run, read by GranSabio startup check
+
 if __name__ == '__main__':
     # Parse command line arguments for different modes
     dual_mode = False
@@ -23762,6 +24688,8 @@ if __name__ == '__main__':
     else:
         # Default dual mode: try HTTPS first, fallback to HTTP
         dual_mode = True
+        _dual_mode_active = True
+        os.environ["_AURVEK_DUAL_MODE"] = "1"  # Propagate to workers via env
         print("Starting in DUAL mode (HTTPS + HTTP fallback)")
     
     # Check SSL certificates if needed

@@ -142,8 +142,8 @@
             <select class="form-select" id="filterRole">
                 <option value="">All Roles</option>
                 <option value="admin">Admin</option>
-                <option value="manager">Manager</option>
                 <option value="user">User</option>
+                <option value="customer">Customer</option>
             </select>
         </div>
     </div>
@@ -227,7 +227,7 @@
                         <td class="role-cell" title="{{ user.role|capitalize }}">
                             {% if user.role == 'admin' %}
                             <i class="fas fa-crown text-warning"></i>
-                            {% elif user.role == 'manager' %}
+                            {% elif user.role == 'user' %}
                             <i class="fas fa-user-tie text-info"></i>
                             {% else %}
                             <i class="fas fa-user text-muted"></i>

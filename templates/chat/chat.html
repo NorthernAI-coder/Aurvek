@@ -178,7 +178,7 @@
                 <a href="/explore" class="btn-home-sidebar" title="Explore">
                     <i class="fas fa-compass"></i>
                 </a>
-                {% if is_admin or is_manager %}
+                {% if is_admin or is_user %}
                 <a href="/dashboard" class="btn-home-sidebar" title="Dashboard">
                     <i class="fas fa-tachometer-alt"></i>
                 </a>
@@ -317,7 +317,7 @@
                 <div class="user-info-text" role="button" id="userDropdownDesktop" data-bs-toggle="dropdown" aria-expanded="false">
                     <div class="user-info-name">{{ username }}</div>
                     <div class="user-info-role">
-                        {% if is_admin %}Administrator{% elif is_manager %}Manager{% else %}User{% endif %}
+                        {% if is_admin %}Administrator{% elif is_user %}User{% else %}Customer{% endif %}
                     </div>
                 </div>
                 <ul class="dropdown-menu" aria-labelledby="userDropdownDesktop">
@@ -593,6 +593,11 @@
         </div>
     </div>
 
+    </div><!-- End chat-layout-wrapper -->
+    </div><!-- End page-content -->
+
+    <!-- Modals: placed outside #page-content to avoid stacking context z-index issues (nekoglass theme) -->
+
     <!-- Multi-AI Compare Modal -->
     <div class="modal fade" id="multiAiModal" tabindex="-1" aria-labelledby="multiAiModalLabel" aria-hidden="true">
         <div class="modal-dialog modal-dialog-centered">
@@ -687,8 +692,6 @@
             </div>
         </div>
     </div>
-    </div><!-- End chat-layout-wrapper -->
-    </div><!-- End page-content -->
 
     <!-- Skeleton to content swap script -->
     <script>
@@ -734,7 +737,7 @@
         var userProfilePicture = "{{ user_profile_picture | default('', true) }}";
         var botProfilePicture = "{{ bot_profile_picture | default('', true) }}";
         var isAdmin = {{ is_admin|tojson }};
-        var isManager = {{ is_manager|tojson }};
+        var isUser = {{ is_user|tojson }};
         var promptDescription = {{ prompt_description|tojson|safe }};
         var availableModels = {{ llm_models|tojson|safe }};
         // API Key Mode variables

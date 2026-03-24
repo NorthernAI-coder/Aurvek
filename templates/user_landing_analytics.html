@@ -270,7 +270,7 @@
 
     async function loadAnalytics() {
         try {
-            const response = await fetch('/api/manager/landing-analytics');
+            const response = await fetch('/api/user/landing-analytics');
             const data = await response.json();
 
             if (!response.ok) {
@@ -394,7 +394,7 @@
         modal.show();
 
         try {
-            const response = await fetch(`/api/manager/landing-analytics/${promptId}`);
+            const response = await fetch(`/api/user/landing-analytics/${promptId}`);
             const data = await response.json();
 
             if (!response.ok) {
@@ -509,7 +509,7 @@
 
     async function loadPackAnalytics() {
         try {
-            const response = await fetch('/api/manager/pack-landing-analytics');
+            const response = await fetch('/api/user/pack-landing-analytics');
             if (!response.ok) {
                 document.getElementById('packsTableBody').innerHTML = '';
                 document.getElementById('noPacksMessage').style.display = 'block';
@@ -567,7 +567,7 @@
         modal.show();
 
         try {
-            const response = await fetch(`/api/manager/pack-landing-analytics/${packId}`);
+            const response = await fetch(`/api/user/pack-landing-analytics/${packId}`);
             const data = await response.json();
 
             if (!response.ok) {

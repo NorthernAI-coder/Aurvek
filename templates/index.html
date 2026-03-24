@@ -35,7 +35,7 @@
         border-radius: 10px;
         font-weight: 700;
     }
-    .dashboard-badge-manager {
+    .dashboard-badge-user {
         background: var(--bg-tertiary);
         color: var(--accent);
         border: 1px solid var(--accent);
@@ -95,12 +95,12 @@
 {% block content %}
 <div class="container mt-3">
     <div class="row">
-        <!-- Business Tools (visible for managers and admins) -->
-        {% if is_manager or is_admin %}
+        <!-- Business Tools (visible for users and admins) -->
+        {% if is_user or is_admin %}
         <div class="col-md-12 mb-4">
             <div class="d-flex align-items-center justify-content-center gap-2 mb-4">
                 <h5 class="fw-bold mb-0" style="font-size:1rem;">Business Tools</h5>
-                <span class="dashboard-badge-role dashboard-badge-manager">Manager</span>
+                <span class="dashboard-badge-role dashboard-badge-user">User</span>
             </div>
             <div class="row">
                 <!-- Content card -->
@@ -155,7 +155,7 @@
                             <a href="/curation-settings" class="dashboard-card-link"><i class="fas fa-star"></i> Curation Settings</a>
                             <a href="/my-branding" class="dashboard-card-link"><i class="fas fa-paint-brush"></i> My Branding</a>
                             <a href="/my-storefront" class="dashboard-card-link"><i class="fas fa-store"></i> My Storefront</a>
-                            <a href="/manager/landing-analytics" class="dashboard-card-link"><i class="fas fa-chart-area"></i> Landing Analytics</a>
+                            <a href="/user/landing-analytics" class="dashboard-card-link"><i class="fas fa-chart-area"></i> Landing Analytics</a>
                         </div>
                     </div>
                 </div>
@@ -166,7 +166,7 @@
                         <div class="d-flex flex-column">
                             <a href="/create-user" class="dashboard-card-link"><i class="fas fa-user-plus"></i> Create User</a>
                             <a href="/users-list" class="dashboard-card-link"><i class="fas fa-users-cog"></i> Manage Users</a>
-                            <a href="/manager/team-billing" class="dashboard-card-link"><i class="fas fa-file-invoice-dollar"></i> Team Billing</a>
+                            <a href="/user/team-billing" class="dashboard-card-link"><i class="fas fa-file-invoice-dollar"></i> Team Billing</a>
                         </div>
                     </div>
                 </div>
@@ -191,7 +191,9 @@
                             <a href="/admin/openrouter" class="dashboard-card-link"><i class="fas fa-route"></i> OpenRouter Models</a>
                             <a href="/admin/voices" class="dashboard-card-link"><i class="fas fa-microphone-alt"></i> Voices Management</a>
                             <a href="/admin/elevenlabs-tts" class="dashboard-card-link"><i class="fas fa-sliders-h"></i> ElevenLabs TTS Settings</a>
+                            <a href="/admin/system-prompts" class="dashboard-card-link"><i class="fas fa-shield-alt"></i> System Prompts</a>
                             <a href="/admin/services" class="dashboard-card-link"><i class="fas fa-server"></i> Service Management</a>
+                            <a href="/admin/gransabio" class="dashboard-card-link"><i class="fas fa-brain"></i> GranSabio</a>
                         </div>
                     </div>
                 </div>

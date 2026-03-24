@@ -440,6 +440,24 @@
         <input type="hidden" id="watchdogConfigInput" name="watchdog_config" value="">
     </div>
 
+    <!-- Section: GranSabio Pipeline (toggle only, full config via edit) -->
+    <div class="section-container">
+        <div class="section-title">
+            <i class="fas fa-brain me-2"></i>GranSabio Pipeline
+        </div>
+        <div class="mb-3 form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="gransabioEnabled" name="gransabio_enabled">
+            <label class="form-check-label" for="gransabioEnabled">
+                Enable GranSabio QA Pipeline
+            </label>
+        </div>
+        <p class="text-muted small">
+            <i class="fas fa-info-circle me-1"></i>
+            Full GranSabio configuration (QA layers, models, etc.) available after creation via the edit form.
+        </p>
+        <input type="hidden" id="gransabioConfigInput" name="gransabio_config" value="">
+    </div>
+
     <!-- Section 5: Categories (shown for public prompts) -->
     <div class="section-container" id="categoriesSection" style="display: none;">
         <div class="section-title"><i class="fas fa-tags me-2"></i>Categories</div>
@@ -470,15 +488,15 @@
             <div class="form-check">
                 <input class="form-check-input" type="radio" name="is_paid" id="pricingFree" value="0" checked onchange="togglePricingOptions()">
                 <label class="form-check-label" for="pricingFree">
-                    <i class="fas fa-gift me-1 text-success"></i>Free
-                    <small class="text-muted d-block">Anyone can use without paying markup</small>
+                    <i class="fas fa-gift me-1 text-success"></i>Standard
+                    <small class="text-muted d-block">Anyone can use. No creator earnings.</small>
                 </label>
             </div>
             <div class="form-check mt-2">
                 <input class="form-check-input" type="radio" name="is_paid" id="pricingPaid" value="1" onchange="togglePricingOptions()">
                 <label class="form-check-label" for="pricingPaid">
-                    <i class="fas fa-coins me-1 text-warning"></i>Paid
-                    <small class="text-muted d-block">Earn money when others use this prompt</small>
+                    <i class="fas fa-coins me-1 text-warning"></i>Premium / VIP
+                    <small class="text-muted d-block">Earn money when others use this prompt.</small>
                 </label>
             </div>
         </div>
@@ -1189,6 +1207,8 @@
         document.getElementById('createPromptForm').addEventListener('submit', function(e) {
             serializeExtensionsConfig();
             serializeWatchdogConfig();
+            // GranSabio: just pass through the hidden input (no complex config on create)
+            // gransabio_enabled is a checkbox, gransabio_config stays empty on create
             // Serialize allowed LLMs for restricted mode
             const llmMode = document.querySelector('input[name="llm_mode"]:checked')?.value;
             if (llmMode === 'restricted') {

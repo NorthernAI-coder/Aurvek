@@ -306,8 +306,8 @@
                 <div class="mb-3">
                     <label class="form-label" for="lrcBilling">Billing Mode</label>
                     <select class="form-select" id="lrcBilling">
-                        <option value="user_pays" {{ 'selected' if lrc.billing_mode|default('user_pays') == 'user_pays' else '' }}>User Pays</option>
-                        <option value="manager_pays" {{ 'selected' if lrc.billing_mode|default('') == 'manager_pays' else '' }}>Manager Pays</option>
+                        <option value="customer_pays" {{ 'selected' if lrc.billing_mode|default('customer_pays') == 'customer_pays' else '' }}>Customer Pays</option>
+                        <option value="user_pays" {{ 'selected' if lrc.billing_mode|default('') == 'user_pays' else '' }}>User Pays</option>
                     </select>
                 </div>
             </div>

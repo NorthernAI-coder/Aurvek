@@ -216,9 +216,9 @@ async def warmup_pack_landing_cache():
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _require_admin_or_manager(current_user: User):
-    """Raise 403 if user is not admin or manager."""
-    if not await current_user.is_admin and not await current_user.is_manager:
+async def _require_admin_or_user(current_user: User):
+    """Raise 403 if user is not admin or user (elevated role)."""
+    if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
 
 
@@ -302,7 +302,7 @@ def _inject_pack_analytics(html_content: str, pack_id: int) -> str:
 async def admin_packs_list(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     is_admin = await current_user.is_admin
     async with get_db_connection(readonly=True) as conn:
@@ -317,7 +317,7 @@ async def admin_packs_list(request: Request, current_user: User = Depends(get_cu
 async def admin_pack_new(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     pricing_config = await get_pricing_config()
     context = await get_template_context(request, current_user)
@@ -334,7 +334,7 @@ async def admin_pack_new(request: Request, current_user: User = Depends(get_curr
 async def admin_pack_edit(request: Request, pack_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -386,7 +386,7 @@ async def admin_pack_edit(request: Request, pack_id: int, current_user: User = D
 async def api_create_pack(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     body = await request.json()
     name = (body.get("name") or "").strip()
@@ -421,12 +421,12 @@ async def api_create_pack(request: Request, current_user: User = Depends(get_cur
                 lrc = None
         if isinstance(lrc, dict):
             lrc = sanitize_landing_reg_config(lrc, max_initial_balance=MAX_FREE_INITIAL_BALANCE)
-            if lrc.get("billing_mode") == "manager_pays":
+            if lrc.get("billing_mode") == "user_pays":
                 creator_balance = await get_balance(current_user.id)
                 if creator_balance <= 0:
                     raise HTTPException(
                         status_code=400,
-                        detail="You need a positive balance to enable 'manager pays' mode"
+                        detail="You need a positive balance to enable 'user pays' mode"
                     )
             lrc_json = orjson.dumps(lrc).decode("utf-8")
 
@@ -460,7 +460,7 @@ async def api_create_pack(request: Request, current_user: User = Depends(get_cur
 async def api_list_packs(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     is_admin = await current_user.is_admin
     async with get_db_connection(readonly=True) as conn:
@@ -473,7 +473,7 @@ async def api_list_packs(request: Request, current_user: User = Depends(get_curr
 async def api_get_pack(pack_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -489,7 +489,7 @@ async def api_get_pack(pack_id: int, current_user: User = Depends(get_current_us
 async def api_update_pack(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -580,13 +580,13 @@ async def api_update_pack(pack_id: int, request: Request, current_user: User = D
                             lrc = existing_config
 
         if lrc is not None:
-            # Validate manager_pays requires creator to have positive balance
-            if lrc.get("billing_mode") == "manager_pays":
+            # Validate user_pays requires creator to have positive balance
+            if lrc.get("billing_mode") == "user_pays":
                 creator_balance = await get_balance(pack_row["created_by_user_id"])
                 if creator_balance <= 0:
                     raise HTTPException(
                         status_code=400,
-                        detail="Pack creator needs a positive balance to enable 'manager pays' mode"
+                        detail="Pack creator needs a positive balance to enable 'user pays' mode"
                     )
             fields["landing_reg_config"] = orjson.dumps(lrc).decode("utf-8")
 
@@ -625,7 +625,7 @@ async def api_update_pack(pack_id: int, request: Request, current_user: User = D
 async def api_delete_pack(pack_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -662,7 +662,7 @@ async def api_delete_pack(pack_id: int, current_user: User = Depends(get_current
 async def api_add_pack_item(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -710,7 +710,7 @@ async def api_add_pack_item(pack_id: int, request: Request, current_user: User =
 async def api_remove_pack_item(pack_id: int, prompt_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -724,7 +724,7 @@ async def api_remove_pack_item(pack_id: int, prompt_id: int, current_user: User 
 async def api_reorder_pack_items(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -744,7 +744,7 @@ async def api_reorder_pack_items(pack_id: int, request: Request, current_user: U
 async def api_available_prompts(pack_id: int, search: str = "", current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -762,7 +762,7 @@ async def api_available_prompts(pack_id: int, search: str = "", current_user: Us
 async def api_publish_pack(pack_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -897,7 +897,7 @@ async def api_publish_pack(pack_id: int, current_user: User = Depends(get_curren
 async def api_unpublish_pack(pack_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection() as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -924,7 +924,7 @@ async def api_upload_cover_image(
     """Upload a cover image for a pack (240, 512, fullsize at 16:9)."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1033,7 +1033,7 @@ async def serve_pack_cover(
     current_user: Optional[User] = Depends(get_current_user),
 ):
     """Serve a pack cover image. Public access for published packs,
-    admin/manager owner access for drafts."""
+    admin/user owner access for drafts."""
     if size not in ("240", "512", "fullsize"):
         raise HTTPException(status_code=400, detail="Invalid size. Use 240, 512, or fullsize")
 
@@ -1045,7 +1045,7 @@ async def serve_pack_cover(
 
     is_public_published = pack_row["status"] == "published" and pack_row["is_public"]
     if not is_public_published:
-        # Allow admin (any pack) or owner (admin/manager) to see covers on non-published packs
+        # Allow admin (any pack) or owner (admin/user) to see covers on non-published packs
         is_authorized = False
         if current_user is not None:
             is_owner = pack_row["created_by_user_id"] == current_user.id
@@ -1074,7 +1074,7 @@ async def api_delete_cover_image(
     """Delete all cover image files for a pack and clear the DB field."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1215,7 +1215,7 @@ async def admin_pack_landing_config(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1289,7 +1289,7 @@ async def pack_ai_wizard_generate(
     """Start a background job to generate a landing page for a pack via AI Wizard."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     # Verify Claude CLI is available
     claude_available, _ = is_claude_available()
@@ -1416,7 +1416,7 @@ async def pack_ai_wizard_modify(
     """Start a background job to modify an existing pack landing page via AI Wizard."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     claude_available, _ = is_claude_available()
     if not claude_available:
@@ -1531,7 +1531,7 @@ async def pack_ai_wizard_status(
     """Get the status of a pack landing page generation/modification job."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1575,7 +1575,7 @@ async def pack_ai_wizard_active_job(
     """Check if there's an active (pending/running) job for this pack."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1606,7 +1606,7 @@ async def pack_welcome_wizard_generate(
     """Start a background job to generate a welcome page for a pack via AI Wizard."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     # Verify Claude CLI is available
     claude_available, _ = is_claude_available()
@@ -1727,7 +1727,7 @@ async def pack_welcome_wizard_modify(
     """Start a background job to modify an existing pack welcome page via AI Wizard."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     claude_available, _ = is_claude_available()
     if not claude_available:
@@ -1836,7 +1836,7 @@ async def pack_welcome_wizard_status(
     """Get the status of a pack welcome page generation/modification job."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1885,7 +1885,7 @@ async def pack_welcome_wizard_active_job(
     """Check if there's an active (pending/running) welcome job for this pack."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1913,7 +1913,7 @@ async def pack_welcome_list_files(
     """List all files in the pack's welcome page directory."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1941,7 +1941,7 @@ async def pack_welcome_delete_all_files(
     """Delete all welcome page files for a pack (preserves images)."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1981,7 +1981,7 @@ async def pack_landing_list_files(
     """List all files in the pack's landing page directory."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2009,7 +2009,7 @@ async def pack_landing_delete_all_files(
     """Delete all landing page files for a pack (preserves images)."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2047,7 +2047,7 @@ async def pack_landing_create_page(
     """Create a new HTML page in the pack landing directory."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2109,7 +2109,7 @@ async def pack_landing_delete_page(
     """Delete an HTML page from the pack landing directory."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     if not page_name or not re.match(r"^[a-zA-Z0-9_-]+$", page_name):
         raise HTTPException(status_code=400, detail="Invalid page name")
@@ -2147,7 +2147,7 @@ async def pack_landing_edit_page(
     if not re.match(r"^[a-zA-Z0-9_-]+$", section):
         raise HTTPException(status_code=400, detail="Invalid section name")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2212,7 +2212,7 @@ async def pack_landing_save_page(
     if not re.match(r"^[a-zA-Z0-9_-]+$", section):
         raise HTTPException(status_code=400, detail="Invalid section name")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2264,7 +2264,7 @@ async def pack_landing_list_components(
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2314,7 +2314,7 @@ async def pack_landing_edit_component(
 
     component_name = _secure_filename(component_name)
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2374,7 +2374,7 @@ async def pack_landing_save_component(
 
     component_name = _secure_filename(component_name)
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2431,7 +2431,7 @@ async def pack_landing_create_component(
 
     component_name = _secure_filename(component_name)
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2490,7 +2490,7 @@ async def pack_landing_delete_component(
     if not component_name or not re.match(r"^[a-zA-Z0-9_-]+$", component_name):
         raise HTTPException(status_code=400, detail="Invalid component name")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2523,7 +2523,7 @@ async def pack_landing_list_images(
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2562,7 +2562,7 @@ async def pack_landing_upload_images(
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -2647,7 +2647,7 @@ async def pack_landing_delete_image(
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -3025,7 +3025,7 @@ async def api_get_pack_purchases(pack_id: int, current_user: User = Depends(get_
     """Return purchase history for a pack (admin or pack creator only)."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    await _require_admin_or_manager(current_user)
+    await _require_admin_or_user(current_user)
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -3085,7 +3085,7 @@ async def _apply_pack_config_to_user(conn, pack, user_id, discount_pct=0):
             updates.append("balance = balance + ?")
             params.append(scaled_ib)
 
-    if lrc.get("billing_mode") == "manager_pays":
+    if lrc.get("billing_mode") == "user_pays":
         creator_balance = await get_balance(pack["created_by_user_id"])
         if creator_balance <= 0:
             raise HTTPException(
@@ -3096,6 +3096,21 @@ async def _apply_pack_config_to_user(conn, pack, user_id, discount_pct=0):
         if cur_billing is None:
             updates.append("billing_account_id = ?")
             params.append(pack["created_by_user_id"])
+            # Set billing limits when newly assigning billing account
+            bl = lrc.get("billing_limit")
+            if bl is not None:
+                updates.append("billing_limit = ?")
+                params.append(float(bl))
+            bla = lrc.get("billing_limit_action", "block")
+            updates.append("billing_limit_action = ?")
+            params.append(bla)
+            bara = lrc.get("billing_auto_refill_amount", 10.0)
+            updates.append("billing_auto_refill_amount = ?")
+            params.append(float(bara))
+            bml = lrc.get("billing_max_limit")
+            if bml is not None:
+                updates.append("billing_max_limit = ?")
+                params.append(float(bml))
         else:
             logger.warning(
                 "Pack config: billing_account_id not overwritten for user %s (already set to %s)",

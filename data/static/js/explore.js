@@ -331,12 +331,10 @@ function renderPrompts() {
             .join('');
 
         let paidBadge = '';
-        if (prompt.purchase_price !== null && prompt.purchase_price !== undefined) {
-            paidBadge = prompt.purchase_price > 0
-                ? `<span class="card-paid-badge">$${Number(prompt.purchase_price).toFixed(2)}</span>`
-                : '<span class="card-paid-badge" style="background:var(--success,#43b581)">FREE</span>';
+        if (prompt.is_paid && prompt.purchase_price > 0) {
+            paidBadge = '<span class="card-paid-badge card-badge-vip">VIP</span>';
         } else if (prompt.is_paid) {
-            paidBadge = '<span class="card-paid-badge">PRO</span>';
+            paidBadge = '<span class="card-paid-badge card-badge-premium">Premium</span>';
         }
 
         let visibilityBadge = '';
@@ -583,6 +581,9 @@ function openModal(prompt) {
         ${visibilityNotice}
         <div class="modal-description">${escapeHtml(description)}</div>
         <div class="modal-tags">${tagsHtml}</div>
+        ${(prompt.purchase_price > 0 && !prompt.user_has_access && !prompt.is_mine)
+            ? `<div class="modal-price-info"><i class="fas fa-crown"></i> One-time access &middot; $${Number(prompt.purchase_price).toFixed(2)}</div>`
+            : ''}
         ${getPromptCTA(prompt)}
         <div class="modal-secondary-actions">
             ${landingBtn}
@@ -597,25 +598,16 @@ function openModal(prompt) {
 }
 
 function getPromptCTA(prompt) {
-    // If user already has access or is the owner, show "Chat Now"
     if (prompt.user_has_access || prompt.is_mine) {
         return `<button class="modal-cta" onclick="chatWithPrompt(${prompt.id}, '${escapeAttr(prompt.name)}')">
             <i class="fas fa-comments"></i> Chat Now
         </button>`;
     }
-    // If purchase_price is set and > 0, show buy button
-    if (prompt.purchase_price !== null && prompt.purchase_price !== undefined && prompt.purchase_price > 0) {
-        return `<button class="modal-cta" onclick="purchasePrompt(${prompt.id})">
-            <i class="fas fa-shopping-cart"></i> Buy for $${Number(prompt.purchase_price).toFixed(2)}
+    if (prompt.purchase_price > 0) {
+        return `<button class="modal-cta modal-cta-vip" onclick="purchasePrompt(${prompt.id})">
+            <i class="fas fa-crown"></i> Unlock VIP Access
         </button>`;
     }
-    // If purchase_price === 0, show free access button
-    if (prompt.purchase_price !== null && prompt.purchase_price !== undefined && prompt.purchase_price === 0) {
-        return `<button class="modal-cta" onclick="purchasePrompt(${prompt.id})">
-            <i class="fas fa-unlock"></i> Get Access &mdash; Free
-        </button>`;
-    }
-    // Default: Chat Now (public access)
     return `<button class="modal-cta" onclick="chatWithPrompt(${prompt.id}, '${escapeAttr(prompt.name)}')">
         <i class="fas fa-comments"></i> Chat Now
     </button>`;
@@ -1087,11 +1079,8 @@ function updatePreviewBar(item, type) {
             if (item.user_has_access || item.is_mine) {
                 ctaBtn.textContent = 'Chat Now';
                 ctaBtn.onclick = () => { closeLandingPreview(); chatWithPrompt(item.id, item.name); };
-            } else if (item.purchase_price !== null && item.purchase_price !== undefined && item.purchase_price > 0) {
-                ctaBtn.textContent = 'Buy $' + Number(item.purchase_price).toFixed(2);
-                ctaBtn.onclick = () => { closeLandingPreview(); purchasePrompt(item.id); };
-            } else if (item.purchase_price === 0) {
-                ctaBtn.textContent = 'Get Free';
+            } else if (item.purchase_price > 0) {
+                ctaBtn.textContent = 'Unlock VIP Access';
                 ctaBtn.onclick = () => { closeLandingPreview(); purchasePrompt(item.id); };
             } else {
                 ctaBtn.textContent = 'Chat Now';

@@ -35,7 +35,7 @@ class EmailService:
             to_email: Recipient email address
             magic_link: The magic link URL
             username: Username for personalization
-            branding: Optional branding dict from manager settings
+            branding: Optional branding dict from user settings
 
         Returns:
             bool: True if successful, False otherwise
@@ -104,7 +104,7 @@ class EmailService:
             logger.error(f"[ULTRA ADMIN+] Error sending elevation code email: {e}")
             return False
 
-    def send_verification_email(self, to_email: str, verification_url: str, is_manager: bool = False,
+    def send_verification_email(self, to_email: str, verification_url: str, is_user: bool = False,
                                  prompt_name: str = None, branding: Dict = None) -> bool:
         """
         Send email verification link for new user registration.
@@ -112,9 +112,9 @@ class EmailService:
         Args:
             to_email: Recipient email address
             verification_url: The verification URL
-            is_manager: True if registering as manager, False for regular user
-            prompt_name: Name of the prompt (only for user registration from landing)
-            branding: Optional branding dict from manager settings
+            is_user: True if registering as user (creator), False for customer
+            prompt_name: Name of the prompt (only for customer registration from landing)
+            branding: Optional branding dict from user settings
 
         Returns:
             bool: True if successful, False otherwise
@@ -123,7 +123,7 @@ class EmailService:
             # Console fallback when email service is disabled
             logger.info(f"[VERIFICATION EMAIL] To: {to_email}")
             logger.info(f"[VERIFICATION EMAIL] URL: {verification_url}")
-            logger.info(f"[VERIFICATION EMAIL] Type: {'Manager' if is_manager else 'User'}")
+            logger.info(f"[VERIFICATION EMAIL] Type: {'User' if is_user else 'Customer'}")
             if prompt_name:
                 logger.info(f"[VERIFICATION EMAIL] Prompt: {prompt_name}")
             return True
@@ -132,7 +132,7 @@ class EmailService:
             logger.error("POSTMARK_SERVER_TOKEN not configured")
             return False
 
-        return self._send_verification_via_postmark(to_email, verification_url, is_manager, prompt_name, branding)
+        return self._send_verification_via_postmark(to_email, verification_url, is_user, prompt_name, branding)
 
     def send_claim_entitlement_email(self, to_email: str, claim_url: str,
                                       product_name: str = None, branding: Dict = None) -> bool:
@@ -143,7 +143,7 @@ class EmailService:
             to_email: Recipient email address
             claim_url: Secure URL to claim the entitlement
             product_name: Name of the prompt or pack being claimed
-            branding: Optional branding dict from manager settings
+            branding: Optional branding dict from user settings
 
         Returns:
             bool: True if successful, False otherwise
@@ -169,7 +169,7 @@ class EmailService:
         result.update({k: v for k, v in branding.items() if v is not None})
         return result
 
-    def _send_verification_via_postmark(self, to_email: str, verification_url: str, is_manager: bool,
+    def _send_verification_via_postmark(self, to_email: str, verification_url: str, is_user: bool,
                                          prompt_name: str = None, branding: Dict = None) -> bool:
         """Send verification email via Postmark API"""
         url = "https://api.postmarkapp.com/email"
@@ -180,11 +180,11 @@ class EmailService:
         }
 
         b = self._get_branding(branding)
-        html_body = self._create_verification_email_template(verification_url, is_manager, prompt_name, b)
+        html_body = self._create_verification_email_template(verification_url, is_user, prompt_name, b)
 
         # Use branding company name for subject
         company_name = b.get('company_name') or 'Aurvek'
-        if is_manager:
+        if is_user:
             subject = f"Verify your {company_name} account"
         else:
             display_name = prompt_name or company_name
@@ -212,7 +212,7 @@ class EmailService:
             logger.error(f"Error sending verification email via Postmark: {e}")
             return False
 
-    def _create_verification_email_template(self, verification_url: str, is_manager: bool,
+    def _create_verification_email_template(self, verification_url: str, is_user: bool,
                                              prompt_name: str = None, branding: Dict = None) -> str:
         """Create HTML email template for verification with branding support"""
         b = branding or DEFAULT_BRANDING
@@ -224,7 +224,7 @@ class EmailService:
         email_signature = b.get('email_signature') or ''
         hide_platform_branding = b.get('hide_platform_branding', False)
 
-        if is_manager:
+        if is_user:
             title = f"Welcome to {company_name}"
             intro = f"Thank you for signing up as a creator on {company_name}!"
             description = "You're one step away from creating AI-powered experiences."

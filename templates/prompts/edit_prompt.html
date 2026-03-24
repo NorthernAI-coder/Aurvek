@@ -750,6 +750,217 @@
         <input type="hidden" id="watchdogConfigInput" name="watchdog_config" value="">
     </div>
 
+    <!-- Section: GranSabio Pipeline -->
+    <div class="section-container">
+        <div class="section-title">
+            <i class="fas fa-brain me-2"></i>GranSabio Pipeline
+        </div>
+        <div class="mb-3 form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="gransabioEnabled"
+                   name="gransabio_enabled" onchange="toggleGranSabioPanel()"
+                   {% if gransabio_enabled %}checked{% endif %}>
+            <label class="form-check-label" for="gransabioEnabled">
+                Enable GranSabio QA Pipeline
+            </label>
+        </div>
+        <div id="gransabioPanel" style="{% if not gransabio_enabled %}display: none;{% endif %}">
+            <!-- Generator Model -->
+            <div class="mb-3">
+                <label class="form-label">Generator Model</label>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="gs_generator_choice" id="gsGeneratorDefault"
+                           value="default" onchange="toggleGsGeneratorCustom()"
+                           {% if not gransabio_config.generator_model %}checked{% endif %}>
+                    <label class="form-check-label" for="gsGeneratorDefault">Use admin default</label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="gs_generator_choice" id="gsGeneratorCustom"
+                           value="custom" onchange="toggleGsGeneratorCustom()"
+                           {% if gransabio_config.generator_model %}checked{% endif %}>
+                    <label class="form-check-label" for="gsGeneratorCustom">Custom:</label>
+                </div>
+                <input type="text" class="form-control mt-1" id="gsGeneratorModel" placeholder="e.g. claude-sonnet-4"
+                       value="{{ gransabio_config.generator_model or '' }}"
+                       {% if not gransabio_config.generator_model %}disabled{% endif %}>
+            </div>
+
+            <!-- QA Models -->
+            <div class="mb-3">
+                <label class="form-label">QA Models</label>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="gs_qa_models_choice" id="gsQaModelsDefault"
+                           value="default" onchange="toggleGsQaModelsCustom()"
+                           {% if not gransabio_config.qa_models %}checked{% endif %}>
+                    <label class="form-check-label" for="gsQaModelsDefault">Use admin defaults</label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="gs_qa_models_choice" id="gsQaModelsCustom"
+                           value="custom" onchange="toggleGsQaModelsCustom()"
+                           {% if gransabio_config.qa_models %}checked{% endif %}>
+                    <label class="form-check-label" for="gsQaModelsCustom">Custom:</label>
+                </div>
+                <div id="gsQaModelsPanel" style="{% if not gransabio_config.qa_models %}display: none;{% endif %}">
+                    <div id="gsQaModelsList">
+                        {% if gransabio_config.qa_models %}
+                        {% for m in gransabio_config.qa_models %}
+                        <div class="d-flex gap-2 mb-1 gs-qa-model-row">
+                            <input type="text" class="form-control gs-qa-model-input" value="{{ m }}" placeholder="e.g. gpt-5-mini">
+                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.gs-qa-model-row').remove()"><i class="fas fa-times"></i></button>
+                        </div>
+                        {% endfor %}
+                        {% endif %}
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-primary mt-1" onclick="addGsQaModel()"><i class="fas fa-plus me-1"></i>Add Model</button>
+                </div>
+            </div>
+
+            <!-- QA Layers -->
+            <div class="mb-3">
+                <label class="form-label">QA Layers <button type="button" class="btn btn-sm btn-outline-primary ms-2" onclick="addGranSabioLayer()"><i class="fas fa-plus"></i> Add Layer</button></label>
+                <div id="gsQaLayers">
+                    {% if gransabio_config.qa_layers %}
+                    {% for layer in gransabio_config.qa_layers %}
+                    <div class="gs-qa-layer card mb-2 p-3" data-index="{{ loop.index0 }}">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <strong>Layer {{ loop.index }}</strong>
+                            <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.gs-qa-layer').remove()"><i class="fas fa-trash"></i></button>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-md-6">
+                                <input type="text" class="form-control gs-layer-name" placeholder="Name (e.g. Historical Accuracy)" value="{{ layer.name or '' }}">
+                            </div>
+                            <div class="col-md-6">
+                                <input type="number" class="form-control gs-layer-min-score" placeholder="Min Score" step="0.1" min="0" max="10" value="{{ layer.min_score if layer.min_score is not none else 7.0 }}">
+                            </div>
+                            <div class="col-12">
+                                <input type="text" class="form-control gs-layer-description" placeholder="Description" value="{{ layer.description or '' }}">
+                            </div>
+                            <div class="col-12">
+                                <input type="text" class="form-control gs-layer-criteria" placeholder="Criteria" value="{{ layer.criteria or '' }}">
+                            </div>
+                            <div class="col-md-8">
+                                <input type="text" class="form-control gs-layer-dealbreaker" placeholder="Deal breaker criteria (optional)" value="{{ layer.deal_breaker_criteria or '' }}">
+                            </div>
+                            <div class="col-md-4">
+                                <div class="form-check mt-2">
+                                    <input class="form-check-input gs-layer-mandatory" type="checkbox" {% if layer.is_mandatory %}checked{% endif %}>
+                                    <label class="form-check-label">Mandatory</label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- Arbiter & Escalation -->
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Gran Sabio Model</label>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="radio" name="gs_gransabio_model_choice" id="gsGranSabioModelDefault"
+                               value="default" onchange="toggleGsModelField('gsGranSabioModel')"
+                               {% if not gransabio_config.gran_sabio_model %}checked{% endif %}>
+                        <label class="form-check-label" for="gsGranSabioModelDefault">Default</label>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="radio" name="gs_gransabio_model_choice" id="gsGranSabioModelCustom"
+                               value="custom" onchange="toggleGsModelField('gsGranSabioModel')"
+                               {% if gransabio_config.gran_sabio_model %}checked{% endif %}>
+                        <label class="form-check-label" for="gsGranSabioModelCustom">Custom</label>
+                    </div>
+                    <input type="text" class="form-control mt-1" id="gsGranSabioModel" placeholder="e.g. claude-opus-4-6"
+                           value="{{ gransabio_config.gran_sabio_model or '' }}"
+                           {% if not gransabio_config.gran_sabio_model %}disabled{% endif %}>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Arbiter Model</label>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="radio" name="gs_arbiter_model_choice" id="gsArbiterModelDefault"
+                               value="default" onchange="toggleGsModelField('gsArbiterModel')"
+                               {% if not gransabio_config.arbiter_model %}checked{% endif %}>
+                        <label class="form-check-label" for="gsArbiterModelDefault">Default</label>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="radio" name="gs_arbiter_model_choice" id="gsArbiterModelCustom"
+                               value="custom" onchange="toggleGsModelField('gsArbiterModel')"
+                               {% if gransabio_config.arbiter_model %}checked{% endif %}>
+                        <label class="form-check-label" for="gsArbiterModelCustom">Custom</label>
+                    </div>
+                    <input type="text" class="form-control mt-1" id="gsArbiterModel" placeholder="e.g. claude-sonnet-4"
+                           value="{{ gransabio_config.arbiter_model or '' }}"
+                           {% if not gransabio_config.arbiter_model %}disabled{% endif %}>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Gran Sabio Fallback</label>
+                    <select class="form-select" id="gsGranSabioFallback">
+                        <option value="" {% if gransabio_config.gran_sabio_fallback is none %}selected{% endif %}>Admin default</option>
+                        <option value="true" {% if gransabio_config.gran_sabio_fallback == true %}selected{% endif %}>Yes</option>
+                        <option value="false" {% if gransabio_config.gran_sabio_fallback == false %}selected{% endif %}>No</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Pipeline Parameters -->
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Min Global Score</label>
+                    <input type="number" class="form-control" id="gsMinScore" step="0.1" min="0" max="10"
+                           placeholder="Admin default" value="{{ gransabio_config.min_global_score or '' }}">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Max Iterations</label>
+                    <input type="number" class="form-control" id="gsMaxIterations" min="1" max="20"
+                           placeholder="Admin default" value="{{ gransabio_config.max_iterations or '' }}">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Smart Editing</label>
+                    <select class="form-select" id="gsSmartEdit">
+                        <option value="" {% if not gransabio_config.smart_editing_mode %}selected{% endif %}>Admin default</option>
+                        <option value="auto" {% if gransabio_config.smart_editing_mode == 'auto' %}selected{% endif %}>Auto</option>
+                        <option value="always" {% if gransabio_config.smart_editing_mode == 'always' %}selected{% endif %}>Always</option>
+                        <option value="never" {% if gransabio_config.smart_editing_mode == 'never' %}selected{% endif %}>Never</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">Language</label>
+                    <input type="text" class="form-control" id="gsLanguage" placeholder="ISO 639-1 (blank = auto)"
+                           value="{{ gransabio_config.language or '' }}">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Content Type</label>
+                    <input type="text" class="form-control" id="gsContentType" placeholder="e.g. biography, article"
+                           value="{{ gransabio_config.content_type or '' }}">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Context Max Tokens</label>
+                    <input type="number" class="form-control" id="gsContextTokens" min="0"
+                           placeholder="Admin default" value="{{ gransabio_config.context_max_tokens or '' }}">
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">Verbose Mode</label>
+                <select class="form-select" id="gsVerbose">
+                    <option value="" {% if gransabio_config.verbose is none %}selected{% endif %}>Admin default</option>
+                    <option value="true" {% if gransabio_config.verbose == true %}selected{% endif %}>On (show detailed pipeline progress)</option>
+                    <option value="false" {% if gransabio_config.verbose == false %}selected{% endif %}>Off</option>
+                </select>
+            </div>
+
+            <p class="text-muted small">
+                <i class="fas fa-info-circle me-1"></i>
+                When GranSabio is enabled: LLM selector in chat is overridden by Generator Model.
+                Tools (web search, image gen) are not available. File attachments are not supported (text only).
+            </p>
+        </div>
+        <input type="hidden" id="gransabioConfigInput" name="gransabio_config" value="">
+    </div>
+
     <!-- Section 5: Categories (shown for public prompts) -->
     <div class="section-container" id="categoriesSection" style="{% if not is_public %}display: none;{% endif %}">
         <div class="section-title"><i class="fas fa-tags me-2"></i>Categories</div>
@@ -777,15 +988,15 @@
             <div class="form-check">
                 <input class="form-check-input" type="radio" name="is_paid" id="pricingFree" value="0" {% if not is_paid %}checked{% endif %} onchange="togglePricingOptions()">
                 <label class="form-check-label" for="pricingFree">
-                    <i class="fas fa-gift me-1 text-success"></i>Free
-                    <small class="text-muted d-block">Anyone can use without paying markup</small>
+                    <i class="fas fa-gift me-1 text-success"></i>Standard
+                    <small class="text-muted d-block">Open access. No creator earnings from usage.</small>
                 </label>
             </div>
             <div class="form-check mt-2">
                 <input class="form-check-input" type="radio" name="is_paid" id="pricingPaid" value="1" {% if is_paid %}checked{% endif %} onchange="togglePricingOptions()">
                 <label class="form-check-label" for="pricingPaid">
-                    <i class="fas fa-coins me-1 text-warning"></i>Paid
-                    <small class="text-muted d-block">Earn money when others use this prompt</small>
+                    <i class="fas fa-coins me-1 text-warning"></i>Premium / VIP
+                    <small class="text-muted d-block">Earn money per message. Set a purchase price to make it VIP.</small>
                 </label>
             </div>
         </div>
@@ -807,15 +1018,20 @@
                 <strong>You will earn:</strong> <span id="previewEarnings">$0.00</span> per million tokens (70% of markup)
             </div>
 
+            <div id="levelIndicator" class="alert alert-info mt-2" style="{% if not is_paid %}display:none;{% endif %}">
+                <strong>Level:</strong> <span id="levelLabel">{% if purchase_price and purchase_price > 0 %}VIP{% else %}Premium{% endif %}</span>
+                <small class="d-block" id="levelDescription">{% if purchase_price and purchase_price > 0 %}Requires one-time purchase + per-message markup{% else %}Open access with per-message markup{% endif %}</small>
+            </div>
+
             <div class="mb-3 mt-3">
                 <label for="purchasePriceInput" class="form-label">One-time purchase price (USD)</label>
                 <div class="input-group">
                     <span class="input-group-text">$</span>
                     <input type="number" class="form-control" id="purchasePriceInput" name="purchase_price"
-                           value="{{ purchase_price if purchase_price is not none else '' }}"
-                           step="0.01" min="0" placeholder="Leave empty to disable individual purchase">
+                           value="{{ purchase_price if purchase_price is not none and purchase_price > 0 else '' }}"
+                           step="0.01" min="0" placeholder="Leave empty for open access (Premium)">
                 </div>
-                <small class="text-muted">Set a one-time price for users to buy permanent access to this prompt. Leave empty to disable individual purchases. Set to 0 for free access grants.</small>
+                <small class="text-muted">Set a one-time price for VIP access. Minimum $0.50. Leave empty for open access.</small>
             </div>
         </div>
     </div>
@@ -1160,6 +1376,176 @@
         setTimeout(() => URL.revokeObjectURL(url), 60000);
     }
 
+    // --- GranSabio functions ---
+    function toggleGranSabioPanel() {
+        const enabled = document.getElementById('gransabioEnabled').checked;
+        document.getElementById('gransabioPanel').style.display = enabled ? 'block' : 'none';
+    }
+
+    function toggleGsGeneratorCustom() {
+        const isCustom = document.getElementById('gsGeneratorCustom').checked;
+        document.getElementById('gsGeneratorModel').disabled = !isCustom;
+        if (!isCustom) document.getElementById('gsGeneratorModel').value = '';
+    }
+
+    function toggleGsQaModelsCustom() {
+        const isCustom = document.getElementById('gsQaModelsCustom').checked;
+        document.getElementById('gsQaModelsPanel').style.display = isCustom ? 'block' : 'none';
+    }
+
+    function toggleGsModelField(fieldId) {
+        // Generic toggle for radio default/custom model fields
+        const field = document.getElementById(fieldId);
+        const radios = field.closest('.col-md-4').querySelectorAll('input[type="radio"]');
+        const isCustom = radios[1].checked; // second radio = custom
+        field.disabled = !isCustom;
+        if (!isCustom) field.value = '';
+    }
+
+    function addGsQaModel(value) {
+        const container = document.getElementById('gsQaModelsList');
+        const row = document.createElement('div');
+        row.className = 'd-flex gap-2 mb-1 gs-qa-model-row';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'form-control gs-qa-model-input';
+        input.placeholder = 'e.g. gpt-5-mini';
+        input.value = value || '';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-danger';
+        btn.innerHTML = '<i class="fas fa-times"></i>';
+        btn.onclick = function() { row.remove(); };
+        row.appendChild(input);
+        row.appendChild(btn);
+        container.appendChild(row);
+    }
+
+    function addGranSabioLayer() {
+        const container = document.getElementById('gsQaLayers');
+        const index = container.querySelectorAll('.gs-qa-layer').length;
+        const html = `
+        <div class="gs-qa-layer card mb-2 p-3" data-index="${index}">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong>Layer ${index + 1}</strong>
+                <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.gs-qa-layer').remove()"><i class="fas fa-trash"></i></button>
+            </div>
+            <div class="row g-2">
+                <div class="col-md-6">
+                    <input type="text" class="form-control gs-layer-name" placeholder="Name (e.g. Historical Accuracy)">
+                </div>
+                <div class="col-md-6">
+                    <input type="number" class="form-control gs-layer-min-score" placeholder="Min Score" step="0.1" min="0" max="10" value="7.0">
+                </div>
+                <div class="col-12">
+                    <input type="text" class="form-control gs-layer-description" placeholder="Description">
+                </div>
+                <div class="col-12">
+                    <input type="text" class="form-control gs-layer-criteria" placeholder="Criteria">
+                </div>
+                <div class="col-md-8">
+                    <input type="text" class="form-control gs-layer-dealbreaker" placeholder="Deal breaker criteria (optional)">
+                </div>
+                <div class="col-md-4">
+                    <div class="form-check mt-2">
+                        <input class="form-check-input gs-layer-mandatory" type="checkbox">
+                        <label class="form-check-label">Mandatory</label>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+        container.insertAdjacentHTML('beforeend', html);
+    }
+
+    function serializeGranSabioConfig() {
+        const enabled = document.getElementById('gransabioEnabled').checked;
+        if (!enabled) {
+            document.getElementById('gransabioConfigInput').value = '';
+            return;
+        }
+
+        const config = {};
+
+        // Generator model
+        if (document.getElementById('gsGeneratorCustom').checked) {
+            const val = document.getElementById('gsGeneratorModel').value.trim();
+            if (val) config.generator_model = val;
+        }
+
+        // QA models
+        if (document.getElementById('gsQaModelsCustom').checked) {
+            const models = [];
+            document.querySelectorAll('.gs-qa-model-input').forEach(input => {
+                const v = input.value.trim();
+                if (v) models.push(v);
+            });
+            if (models.length > 0) config.qa_models = models;
+        }
+
+        // QA layers
+        const layers = [];
+        document.querySelectorAll('.gs-qa-layer').forEach(layerEl => {
+            const name = layerEl.querySelector('.gs-layer-name').value.trim();
+            const description = layerEl.querySelector('.gs-layer-description').value.trim();
+            const criteria = layerEl.querySelector('.gs-layer-criteria').value.trim();
+            if (name && description && criteria) {
+                const layer = { name, description, criteria };
+                const minScore = parseFloat(layerEl.querySelector('.gs-layer-min-score').value);
+                if (!isNaN(minScore)) layer.min_score = minScore;
+                const dealbreaker = layerEl.querySelector('.gs-layer-dealbreaker').value.trim();
+                if (dealbreaker) layer.deal_breaker_criteria = dealbreaker;
+                if (layerEl.querySelector('.gs-layer-mandatory').checked) layer.is_mandatory = true;
+                layers.push(layer);
+            }
+        });
+        if (layers.length > 0) config.qa_layers = layers;
+
+        // Gran Sabio model
+        if (document.getElementById('gsGranSabioModelCustom').checked) {
+            const val = document.getElementById('gsGranSabioModel').value.trim();
+            if (val) config.gran_sabio_model = val;
+        }
+
+        // Arbiter model
+        if (document.getElementById('gsArbiterModelCustom').checked) {
+            const val = document.getElementById('gsArbiterModel').value.trim();
+            if (val) config.arbiter_model = val;
+        }
+
+        // Gran Sabio fallback (tri-state: null = admin default, true, false)
+        const fallbackVal = document.getElementById('gsGranSabioFallback').value;
+        if (fallbackVal === 'true') config.gran_sabio_fallback = true;
+        else if (fallbackVal === 'false') config.gran_sabio_fallback = false;
+        // empty = admin default, don't include in config
+
+        // Pipeline parameters
+        const minScore = document.getElementById('gsMinScore').value;
+        if (minScore !== '') config.min_global_score = parseFloat(minScore);
+
+        const maxIter = document.getElementById('gsMaxIterations').value;
+        if (maxIter !== '') config.max_iterations = parseInt(maxIter);
+
+        const smartEdit = document.getElementById('gsSmartEdit').value;
+        if (smartEdit) config.smart_editing_mode = smartEdit;
+
+        const language = document.getElementById('gsLanguage').value.trim();
+        if (language) config.language = language;
+
+        const contentType = document.getElementById('gsContentType').value.trim();
+        if (contentType) config.content_type = contentType;
+
+        const contextTokens = document.getElementById('gsContextTokens').value;
+        if (contextTokens !== '') config.context_max_tokens = parseInt(contextTokens);
+
+        // Verbose (tri-state: null = admin default, true, false)
+        const verboseVal = document.getElementById('gsVerbose').value;
+        if (verboseVal === 'true') config.verbose = true;
+        else if (verboseVal === 'false') config.verbose = false;
+
+        document.getElementById('gransabioConfigInput').value =
+            Object.keys(config).length > 0 ? JSON.stringify(config) : '';
+    }
+
     function serializeExtensionsConfig() {
         document.getElementById('hidden_extensions_enabled').value =
             document.getElementById('extensions_enabled').checked ? '1' : '0';
@@ -1204,10 +1590,12 @@
     function togglePricingOptions() {
         const isPaid = document.getElementById('pricingPaid').checked;
         document.getElementById('markupOptions').style.display = isPaid ? 'block' : 'none';
+        document.getElementById('levelIndicator').style.display = isPaid ? 'block' : 'none';
         if (!isPaid) {
             document.getElementById('markupInput').value = '0';
         }
         updateEarningsPreview();
+        updateLevelIndicator();
     }
 
     function updateEarningsPreview() {
@@ -1215,6 +1603,24 @@
         const earnings = markup * 0.70;  // 70% to creator
         document.getElementById('previewEarnings').textContent = `$${earnings.toFixed(2)}`;
     }
+
+    function updateLevelIndicator() {
+        var price = document.getElementById('purchasePriceInput').value;
+        var label = document.getElementById('levelLabel');
+        var desc = document.getElementById('levelDescription');
+        if (price && parseFloat(price) > 0) {
+            label.textContent = 'VIP';
+            desc.textContent = 'Requires one-time purchase + per-message markup';
+        } else {
+            label.textContent = 'Premium';
+            desc.textContent = 'Open access with per-message markup';
+        }
+    }
+
+    document.getElementById('purchasePriceInput').addEventListener('input', updateLevelIndicator);
+
+    // Set initial level indicator state on page load
+    updateLevelIndicator();
 
     function toggleLLMOptions() {
         const mode = document.querySelector('input[name="llm_mode"]:checked')?.value || 'any';
@@ -2165,6 +2571,7 @@
         document.getElementById('editPromptForm').addEventListener('submit', function(e) {
             serializeExtensionsConfig();
             serializeWatchdogConfig();
+            serializeGranSabioConfig();
             // Serialize allowed LLMs for restricted mode
             const llmMode = document.querySelector('input[name="llm_mode"]:checked')?.value;
             if (llmMode === 'restricted') {

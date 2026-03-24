@@ -114,9 +114,9 @@ async def get_current_user(request: Request) -> Optional[User]:
         authentication_mode=user_info.get("authentication_mode", "magic_link_only"),
         can_change_password=user_info.get("can_change_password", False),
         is_admin=user_info["is_admin"],
-        is_manager=user_info["is_manager"],
+        is_user=user_info.get("is_user", user_info.get("is_manager")),
     )
-    
+
     # Add indicator of whether magic link was used to the user
     user.used_magic_link = user_info.get("used_magic_link", False)
 
@@ -165,7 +165,7 @@ def create_user_from_row(row):
         google_id=row['google_id'],
         auth_provider=row['auth_provider'] or 'local',
         is_admin=None,
-        is_manager=None,
+        is_user=None,
     )
 
 async def get_user_by_id(user_id: int) -> Optional[User]:
@@ -278,7 +278,7 @@ async def get_current_user_from_websocket(websocket: WebSocket) -> Optional[User
         authentication_mode=user_info.get("authentication_mode", "magic_link_only"),
         can_change_password=user_info.get("can_change_password", False),
         is_admin=user_info.get("is_admin"),
-        is_manager=user_info.get("is_manager"),
+        is_user=user_info.get("is_user", user_info.get("is_manager")),
     )
 
     # Add indicator of whether magic link was used to the user
@@ -322,7 +322,8 @@ async def create_user_info(user, used_magic_link):
         "id": user.id,
         "username": user.username,
         "is_admin": await user.is_admin,
-        "is_manager": await user.is_manager,
+        "is_user": await user.is_user,
+        "is_customer": await user.is_customer,
         "is_enabled": user.is_enabled,
         "can_send_files": user.can_send_files,
         "can_generate_images": user.can_generate_images,

@@ -125,10 +125,10 @@
                     <p class="storefront-card-desc">{{ prompt.description[:120] }}{% if prompt.description|length > 120 %}...{% endif %}</p>
                     {% endif %}
                     <div class="storefront-card-meta">
-                        {% if prompt.is_paid %}
-                        <span class="storefront-badge storefront-badge-paid">Premium</span>
-                        {% else %}
-                        <span class="storefront-badge storefront-badge-free">Free</span>
+                        {% if prompt.is_paid and prompt.purchase_price and prompt.purchase_price > 0 %}
+                        <span class="storefront-badge storefront-badge-vip">VIP</span>
+                        {% elif prompt.is_paid %}
+                        <span class="storefront-badge storefront-badge-premium">Premium</span>
                         {% endif %}
                         {% if prompt.id in storefront.viewer_access.prompt_ids %}
                         <span class="storefront-badge storefront-badge-owned">Owned</span>

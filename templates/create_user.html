@@ -61,12 +61,12 @@
                 <div class="mb-3">
                     <label for="userType" class="form-label">User Type</label>
                     <select class="form-select" id="userType" name="user_type">
+                        <option value="customer">Customer</option>
                         <option value="user">User</option>
-                        <option value="manager">Manager</option>
                     </select>
                 </div>
                 {% else %}
-                    <input type="hidden" name="user_type" value="user">
+                    <input type="hidden" name="user_type" value="customer">
                 {% endif %}
                 <div class="mb-3">
                     <label for="authenticationMode" class="form-label">Authentication Mode</label>
@@ -227,15 +227,15 @@
 
         <div class="mb-3">
             <div class="form-check">
-                <input type="radio" class="form-check-input" name="billing_mode" value="user_pays" id="billingUserPays" checked onchange="toggleBillingOptions()">
-                <label class="form-check-label" for="billingUserPays">
-                    <strong>User pays their own balance</strong>
-                    <br><small class="text-muted">User must add balance to their account to use the platform.</small>
+                <input type="radio" class="form-check-input" name="billing_mode" value="customer_pays" id="billingCustomerPays" checked onchange="toggleBillingOptions()">
+                <label class="form-check-label" for="billingCustomerPays">
+                    <strong>Customer pays their own balance</strong>
+                    <br><small class="text-muted">Customer must add balance to their account to use the platform.</small>
                 </label>
             </div>
             <div class="form-check mt-2">
-                <input type="radio" class="form-check-input" name="billing_mode" value="manager_pays" id="billingManagerPays" onchange="toggleBillingOptions()">
-                <label class="form-check-label" for="billingManagerPays">
+                <input type="radio" class="form-check-input" name="billing_mode" value="user_pays" id="billingUserPays" onchange="toggleBillingOptions()">
+                <label class="form-check-label" for="billingUserPays">
                     <strong>I cover this user's AI usage costs</strong>
                     <br><small class="text-muted">All AI costs will be charged to YOUR balance.</small>
                 </label>
@@ -303,7 +303,7 @@
 
             <div class="alert alert-info small mb-0">
                 <i class="fas fa-info-circle me-1"></i>
-                Spending resets on the 1st of each month. You can view team billing in the <a href="/manager/team-billing">Team Billing dashboard</a>.
+                Spending resets on the 1st of each month. You can view team billing in the <a href="/user/team-billing">Team Billing dashboard</a>.
             </div>
         </div>
     </div>
@@ -629,12 +629,12 @@
 
     // Team Billing functions
     function toggleBillingOptions() {
-        const managerPays = document.getElementById('billingManagerPays').checked;
+        const userPays = document.getElementById('billingUserPays').checked;
         const optionsDiv = document.getElementById('teamBillingOptions');
-        optionsDiv.style.display = managerPays ? 'block' : 'none';
+        optionsDiv.style.display = userPays ? 'block' : 'none';
 
-        if (!managerPays) {
-            // Reset to defaults when switching to user pays
+        if (!userPays) {
+            // Reset to defaults when switching to customer pays
             document.getElementById('limitUnlimited').checked = true;
             document.getElementById('billingLimitInput').disabled = true;
             document.getElementById('billingLimitInput').value = '';

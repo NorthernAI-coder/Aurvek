@@ -177,7 +177,7 @@
     function getLandingRegConfig() {
         return {
             initial_balance: parseFloat(document.getElementById('lrcBalance')?.value || '5.0'),
-            billing_mode: document.getElementById('lrcBilling')?.value || 'user_pays',
+            billing_mode: document.getElementById('lrcBilling')?.value || 'customer_pays',
             public_prompts_access: document.getElementById('lrcPublicPrompts')?.checked || false,
             allow_file_upload: document.getElementById('lrcFileUpload')?.checked || false,
             allow_image_generation: document.getElementById('lrcImageGen')?.checked || false,

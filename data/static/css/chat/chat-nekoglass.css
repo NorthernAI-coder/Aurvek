@@ -106,7 +106,7 @@ body {
     position: fixed;
     inset: 0;
     z-index: 0;
-    background: url('/static/img/themes/nekoglass-wallpaper.webp') center/cover no-repeat;
+    background: url('/static/img/themes/nekoglass-wallpaper.webp?v=3') center/cover no-repeat;
 }
 
 .neko-wallpaper-overlay {
@@ -2538,6 +2538,30 @@ body {
     display: flex;
     flex-wrap: wrap;
     gap: 2px;
+}
+
+/* ==========================================================
+   Thinking Block (Extended Thinking) inside messages
+   ========================================================== */
+
+.message.bot .thinking-block {
+    border-left-color: rgba(167, 139, 250, 0.5);
+}
+
+.message.bot .thinking-block summary {
+    color: #7c6bc4 !important;
+    text-shadow: 0 1px 3px rgba(255, 255, 255, 0.6);
+}
+
+.message.bot .thinking-block > pre.thinking-content {
+    background-color: rgba(15, 15, 35, 0.40) !important;
+    color: rgba(255, 255, 255, 0.9) !important;
+    border: 1px solid rgba(167, 139, 250, 0.2) !important;
+    border-radius: 10px !important;
+    padding: 12px !important;
+    margin: 8px 0 0 0 !important;
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
 }
 
 /* Thinking Tokens Control Styles */

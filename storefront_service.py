@@ -5,7 +5,7 @@ from typing import Optional
 
 import orjson
 
-from common import get_manager_branding, slugify
+from common import get_user_branding, slugify
 from database import get_db_connection
 from log_config import logger
 from security_config import is_forbidden_prompt_name
@@ -216,7 +216,7 @@ async def get_creator_storefront_data(
         profile = _row_to_profile(profile_row)
 
         # 2. Branding -------------------------------------------------------
-        branding = await get_manager_branding(creator_user_id, conn)
+        branding = await get_user_branding(creator_user_id, conn)
 
         # 3. Avatar URL -----------------------------------------------------
         avatar_url = profile['avatar_url'] if profile['avatar_url'] else None
@@ -225,7 +225,7 @@ async def get_creator_storefront_data(
         cursor = await conn.execute(
             """
             SELECT p.id, p.name, p.description, p.image, p.public_id,
-                   p.is_paid, p.markup_per_mtokens
+                   p.is_paid, p.markup_per_mtokens, p.purchase_price
             FROM PROMPTS p
             JOIN PROMPT_PERMISSIONS pp ON p.id = pp.prompt_id
             WHERE pp.user_id = ? AND pp.permission_level = 'owner'
@@ -245,6 +245,7 @@ async def get_creator_storefront_data(
                 'public_id': r[4],
                 'is_paid': bool(r[5]),
                 'markup_per_mtokens': r[6],
+                'purchase_price': r[7],
                 'slug': slugify(r[1]) if r[1] else '',
             }
             for r in prompt_rows

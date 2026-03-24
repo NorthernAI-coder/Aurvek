@@ -1,0 +1,402 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}GranSabio Integration - AURVEK{% endblock %}
+
+{% block page_title %}GranSabio Integration{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Configure the GranSabio multi-model orchestration pipeline</p>
+{% endblock %}
+
+{% block styles %}
+<style>
+    .qa-model-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    .qa-model-entry {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .qa-model-entry .form-control {
+        flex: 1;
+    }
+    .qa-model-entry .btn-remove-qa {
+        flex-shrink: 0;
+    }
+    .connection-status {
+        display: none;
+        margin-top: 12px;
+        padding: 12px 16px;
+        border-radius: 8px;
+        background: var(--bg-tertiary, #202225);
+    }
+    .connection-status.visible {
+        display: block;
+    }
+    .connection-status .status-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 4px;
+    }
+    .connection-status .status-item:last-child {
+        margin-bottom: 0;
+    }
+    .field-note {
+        font-size: 0.8rem;
+        color: var(--text-muted, #72767d);
+        margin-top: 4px;
+    }
+</style>
+{% endblock %}
+
+{% block alerts %}
+<div id="alertContainer"></div>
+{% endblock %}
+
+{% block content %}
+<!-- Connection Section -->
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-plug"></i> Connection
+    </div>
+    <div class="mb-3">
+        <label class="form-label" for="gransabio_url">GranSabio URL</label>
+        <div class="d-flex gap-2">
+            <input class="form-control" type="url" id="gransabio_url" name="gransabio_url"
+                   value="{{ config.url or '' }}" placeholder="http://10.0.100.20:8000">
+            <button type="button" class="btn btn-outline-secondary flex-shrink-0" id="testConnectionBtn" onclick="testConnection()">
+                <span id="testSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
+                <i class="fas fa-satellite-dish me-1" id="testIcon"></i> Test
+            </button>
+        </div>
+        <p class="field-note"><i class="fas fa-shield-alt me-1"></i>URL must be an IP literal in private range (SSRF protection)</p>
+    </div>
+    <div class="connection-status" id="connectionStatus">
+        <div class="status-item">
+            <i class="fas fa-circle-check" id="connStatusIcon" style="color: var(--success);"></i>
+            <span id="connStatusText">Connected</span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-code-branch" style="color: var(--text-muted);"></i>
+            <span>Version: <strong id="connVersion">-</strong></span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-cubes" style="color: var(--text-muted);"></i>
+            <span>Models: <strong id="connModelCount">-</strong></span>
+        </div>
+    </div>
+</div>
+
+<!-- Global Enable/Disable -->
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-power-off"></i> Global Status
+    </div>
+    <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="gransabio_enabled" name="gransabio_enabled"
+               {% if config.enabled %}checked{% endif %}>
+        <label class="form-check-label" for="gransabio_enabled">
+            <strong>Enable GranSabio</strong> -- Route qualifying requests through the multi-model pipeline
+        </label>
+    </div>
+</div>
+
+<!-- Default Settings Section -->
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-brain"></i> Default Settings
+    </div>
+    <div class="flex-row">
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="generator_model">Generator Model</label>
+                <input class="form-control" type="text" id="generator_model" name="generator_model"
+                       value="{{ config.generator_model or '' }}" placeholder="e.g. gpt-4o">
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="gran_sabio_model">Gran Sabio Model</label>
+                <input class="form-control" type="text" id="gran_sabio_model" name="gran_sabio_model"
+                       value="{{ config.gran_sabio_model or '' }}" placeholder="e.g. claude-sonnet-4-20250514">
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="arbiter_model">Arbiter Model</label>
+                <input class="form-control" type="text" id="arbiter_model" name="arbiter_model"
+                       value="{{ config.arbiter_model or '' }}" placeholder="e.g. gpt-4o">
+            </div>
+        </div>
+    </div>
+
+    <!-- QA Models (dynamic list) -->
+    <div class="mb-3">
+        <label class="form-label">QA Models</label>
+        <div class="qa-model-list" id="qaModelList">
+            {% for model in config.qa_models or [] %}
+            <div class="qa-model-entry">
+                <input class="form-control qa-model-input" type="text" value="{{ model }}" placeholder="e.g. claude-sonnet-4-20250514">
+                <button type="button" class="btn btn-sm btn-outline-danger btn-remove-qa" onclick="removeQaModel(this)" title="Remove">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            {% endfor %}
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary mt-2" onclick="addQaModel()">
+            <i class="fas fa-plus me-1"></i> Add QA Model
+        </button>
+    </div>
+
+    <hr class="my-4">
+
+    <div class="flex-row">
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="min_global_score">Min Global Score</label>
+                <input class="form-control" type="number" id="min_global_score" name="min_global_score"
+                       value="{{ config.min_global_score if config.min_global_score is not none else 8.0 }}"
+                       min="0" max="10" step="0.1">
+                <p class="field-note">Threshold score (0.0 - 10.0) for accepting generated content</p>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="max_iterations">Max Iterations</label>
+                <input class="form-control" type="number" id="max_iterations" name="max_iterations"
+                       value="{{ config.max_iterations if config.max_iterations is not none else 3 }}"
+                       min="1" max="20" step="1">
+                <p class="field-note">Maximum generation-review cycles (1 - 20)</p>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="smart_editing_mode">Smart Editing Mode</label>
+                <select class="form-select" id="smart_editing_mode" name="smart_editing_mode">
+                    <option value="auto" {% if (config.smart_editing_mode or 'auto') == 'auto' %}selected{% endif %}>Auto</option>
+                    <option value="always" {% if config.smart_editing_mode == 'always' %}selected{% endif %}>Always</option>
+                    <option value="never" {% if config.smart_editing_mode == 'never' %}selected{% endif %}>Never</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <div class="mb-3">
+        <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="gran_sabio_fallback" name="gran_sabio_fallback"
+                   {% if config.gran_sabio_fallback %}checked{% endif %}>
+            <label class="form-check-label" for="gran_sabio_fallback">Gran Sabio Fallback</label>
+        </div>
+    </div>
+    <div class="mb-3">
+        <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="verbose" name="verbose"
+                   {% if config.verbose %}checked{% endif %}>
+            <label class="form-check-label" for="verbose">Verbose by Default</label>
+        </div>
+        <p class="field-note">Enable for debugging -- logs full pipeline traces to console</p>
+    </div>
+</div>
+
+<!-- Advanced Section -->
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-sliders-h"></i> Advanced
+    </div>
+    <div class="flex-row">
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="context_max_tokens">Context Max Tokens</label>
+                <input class="form-control" type="number" id="context_max_tokens" name="context_max_tokens"
+                       value="{{ config.context_max_tokens or '' }}" placeholder="e.g. 128000" min="1">
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="cost_safety_multiplier">Cost Safety Multiplier</label>
+                <input class="form-control" type="number" id="cost_safety_multiplier" name="cost_safety_multiplier"
+                       value="{{ config.cost_safety_multiplier if config.cost_safety_multiplier is not none else 3 }}"
+                       min="1" max="10" step="1">
+                <p class="field-note">Multiplier applied to estimated cost before deducting balance (1 - 10)</p>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label" for="extra_allowed_ips">Extra Allowed IPs</label>
+                <input class="form-control" type="text" id="extra_allowed_ips" name="extra_allowed_ips"
+                       value="{{ config.extra_allowed_ips or '' }}" placeholder="e.g. 10.0.200.5/32, fd00::1/128">
+                <p class="field-note">Comma-separated CIDRs (only /32 or /128 host addresses)</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Save Button -->
+<div class="d-flex justify-content-end mb-4">
+    <button type="button" class="btn btn-primary" id="saveConfigBtn" onclick="saveConfig()">
+        <span id="saveSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
+        <i class="fas fa-save me-1" id="saveIcon"></i> Save Configuration
+    </button>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+    // -- QA Models dynamic list --
+
+    function addQaModel(value) {
+        var list = document.getElementById('qaModelList');
+        var entry = document.createElement('div');
+        entry.className = 'qa-model-entry';
+        entry.innerHTML =
+            '<input class="form-control qa-model-input" type="text" value="' + (value || '') + '" placeholder="e.g. claude-sonnet-4-20250514">' +
+            '<button type="button" class="btn btn-sm btn-outline-danger btn-remove-qa" onclick="removeQaModel(this)" title="Remove">' +
+            '<i class="fas fa-times"></i></button>';
+        list.appendChild(entry);
+    }
+
+    function removeQaModel(btn) {
+        btn.closest('.qa-model-entry').remove();
+    }
+
+    // -- Gather QA model values --
+
+    function getQaModels() {
+        var inputs = document.querySelectorAll('.qa-model-input');
+        var models = [];
+        inputs.forEach(function(input) {
+            var val = input.value.trim();
+            if (val) models.push(val);
+        });
+        return models;
+    }
+
+    // -- Test Connection --
+
+    async function testConnection() {
+        var url = document.getElementById('gransabio_url').value.trim();
+        if (!url) {
+            NotificationModal.error('Missing URL', 'Enter the GranSabio URL before testing.');
+            return;
+        }
+
+        var btn = document.getElementById('testConnectionBtn');
+        var spinner = document.getElementById('testSpinner');
+        var icon = document.getElementById('testIcon');
+        var statusDiv = document.getElementById('connectionStatus');
+
+        btn.disabled = true;
+        spinner.style.display = 'inline-block';
+        icon.style.display = 'none';
+        statusDiv.classList.remove('visible');
+
+        try {
+            var response = await fetch('/admin/gransabio/test-connection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url, extra_allowed_ips: document.getElementById('extra_allowed_ips').value.trim() })
+            });
+            var data = await response.json();
+
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Connection failed');
+            }
+
+            document.getElementById('connStatusIcon').style.color = 'var(--success)';
+            document.getElementById('connStatusIcon').className = 'fas fa-circle-check';
+            document.getElementById('connStatusText').textContent = 'Connected';
+            document.getElementById('connVersion').textContent = data.version || '-';
+            document.getElementById('connModelCount').textContent = data.model_count != null ? data.model_count : '-';
+            statusDiv.classList.add('visible');
+
+        } catch (err) {
+            document.getElementById('connStatusIcon').style.color = 'var(--danger)';
+            document.getElementById('connStatusIcon').className = 'fas fa-circle-xmark';
+            document.getElementById('connStatusText').textContent = 'Failed: ' + err.message;
+            document.getElementById('connVersion').textContent = '-';
+            document.getElementById('connModelCount').textContent = '-';
+            statusDiv.classList.add('visible');
+
+        } finally {
+            btn.disabled = false;
+            spinner.style.display = 'none';
+            icon.style.display = 'inline-block';
+        }
+    }
+
+    // -- Save Configuration --
+
+    async function saveConfig() {
+        var btn = document.getElementById('saveConfigBtn');
+        var spinner = document.getElementById('saveSpinner');
+        var icon = document.getElementById('saveIcon');
+        var originalHtml = btn.innerHTML;
+
+        btn.disabled = true;
+        spinner.style.display = 'inline-block';
+        icon.style.display = 'none';
+
+        var payload = {
+            url: document.getElementById('gransabio_url').value.trim(),
+            enabled: document.getElementById('gransabio_enabled').checked,
+            generator_model: document.getElementById('generator_model').value.trim(),
+            qa_models: getQaModels(),
+            gran_sabio_model: document.getElementById('gran_sabio_model').value.trim(),
+            arbiter_model: document.getElementById('arbiter_model').value.trim(),
+            min_global_score: parseFloat(document.getElementById('min_global_score').value) || 8.0,
+            max_iterations: parseInt(document.getElementById('max_iterations').value, 10) || 3,
+            smart_editing_mode: document.getElementById('smart_editing_mode').value,
+            gran_sabio_fallback: document.getElementById('gran_sabio_fallback').checked,
+            verbose: document.getElementById('verbose').checked,
+            context_max_tokens: parseInt(document.getElementById('context_max_tokens').value, 10) || null,
+            cost_safety_multiplier: parseInt(document.getElementById('cost_safety_multiplier').value, 10) || 3,
+            extra_allowed_ips: document.getElementById('extra_allowed_ips').value.trim()
+        };
+
+        try {
+            var response = await fetch('/admin/gransabio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var data = await response.json();
+
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Save failed');
+            }
+
+            // Show success state briefly
+            btn.innerHTML = '<i class="fas fa-check me-1"></i> Saved!';
+            showAlert('success', 'Configuration saved successfully.');
+
+            setTimeout(function() {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+            }, 2000);
+
+        } catch (err) {
+            NotificationModal.error('Save Error', 'Failed to save configuration: ' + err.message);
+            btn.innerHTML = originalHtml;
+            btn.disabled = false;
+        }
+    }
+
+    // -- Alert helper --
+
+    function showAlert(type, message) {
+        var container = document.getElementById('alertContainer');
+        var iconClass = type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle';
+        var alertClass = type === 'success' ? 'alert-success' : 'alert-danger';
+        var alertHtml =
+            '<div class="alert ' + alertClass + ' alert-dismissible fade show" role="alert">' +
+            '<i class="fas ' + iconClass + ' me-2"></i>' + message +
+            '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>' +
+            '</div>';
+        container.innerHTML = alertHtml;
+    }
+</script>
+{% endblock %}

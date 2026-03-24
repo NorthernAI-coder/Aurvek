@@ -452,16 +452,16 @@
                             <div class="mb-4">
                                 <h6 class="fw-semibold border-bottom pb-2"><i class="fas fa-credit-card me-2 text-primary"></i>Who pays for AI usage?</h6>
                                 <div class="form-check">
-                                    <input type="radio" class="form-check-input" id="billingUserPays" name="billing_mode" value="user_pays" checked>
-                                    <label class="form-check-label" for="billingUserPays">
-                                        Users pay from their own balance
+                                    <input type="radio" class="form-check-input" id="billingCustomerPays" name="billing_mode" value="customer_pays" checked>
+                                    <label class="form-check-label" for="billingCustomerPays">
+                                        Customers pay from their own balance
                                     </label>
-                                    <div class="form-text">Users must add funds to their account to use AI</div>
+                                    <div class="form-text">Customers must add funds to their account to use AI</div>
                                 </div>
                                 <div class="form-check mt-2">
-                                    <input type="radio" class="form-check-input" id="billingManagerPays" name="billing_mode" value="manager_pays">
-                                    <label class="form-check-label" for="billingManagerPays">
-                                        I cover usage costs for my users
+                                    <input type="radio" class="form-check-input" id="billingUserPays" name="billing_mode" value="user_pays">
+                                    <label class="form-check-label" for="billingUserPays">
+                                        I cover usage costs for my customers
                                     </label>
                                     <div class="form-text">AI usage costs will be deducted from your balance</div>
                                 </div>
@@ -473,7 +473,7 @@
                                     <span class="input-group-text">$</span>
                                     <input type="text" class="form-control" id="initialBalance" name="initial_balance" value="0.00" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" oninput="this.value = this.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1')">
                                 </div>
-                                <div class="form-text">Starting balance for new users (only when users pay their own balance)</div>
+                                <div class="form-text">Starting balance for new customers (only when customers pay their own balance)</div>
                             </div>
 
                             <!-- ========== ADVANCED SETTINGS ========== -->
@@ -531,7 +531,7 @@
                                     <div class="form-text">The AI model new users will have selected by default</div>
                                 </div>
 
-                                <!-- Billing Limits (only visible when manager_pays) -->
+                                <!-- Billing Limits (only visible when user_pays) -->
                                 <div id="billingLimitSection" class="mb-4 ms-2" style="display: none;">
                                     <h6 class="fw-semibold border-bottom pb-2"><i class="fas fa-tachometer-alt me-2 text-primary"></i>Billing Limits</h6>
                                     <div class="row g-2 align-items-end">
@@ -1693,10 +1693,10 @@
             }
 
             // Billing
-            if (config.billing_mode === 'manager_pays') {
-                document.getElementById('billingManagerPays').checked = true;
-            } else {
+            if (config.billing_mode === 'user_pays') {
                 document.getElementById('billingUserPays').checked = true;
+            } else {
+                document.getElementById('billingCustomerPays').checked = true;
             }
             toggleBillingSection();
 
@@ -1737,10 +1737,10 @@
         }
 
         function toggleBillingSection() {
-            const managerPays = document.getElementById('billingManagerPays').checked;
-            document.getElementById('billingLimitSection').style.display = managerPays ? 'block' : 'none';
-            // Auto-open Advanced section when manager_pays is selected so billing limits are visible
-            if (managerPays) {
+            const userPays = document.getElementById('billingUserPays').checked;
+            document.getElementById('billingLimitSection').style.display = userPays ? 'block' : 'none';
+            // Auto-open Advanced section when user_pays is selected so billing limits are visible
+            if (userPays) {
                 const advancedDetails = document.querySelector('#regConfigForm > details');
                 if (advancedDetails) advancedDetails.open = true;
             }
@@ -1754,8 +1754,8 @@
         }
 
         function toggleBalanceSection() {
-            const userPays = document.getElementById('billingUserPays').checked;
-            document.getElementById('initialBalanceSection').style.display = userPays ? 'block' : 'none';
+            const customerPays = document.getElementById('billingCustomerPays').checked;
+            document.getElementById('initialBalanceSection').style.display = customerPays ? 'block' : 'none';
         }
 
         function updateRegSummary() {
@@ -1774,7 +1774,7 @@
             }
 
             // Billing
-            if (document.getElementById('billingManagerPays').checked) {
+            if (document.getElementById('billingUserPays').checked) {
                 const limit = document.getElementById('billingLimit').value;
                 if (limit && parseFloat(limit) > 0) {
                     parts.push(`you pay (max $${parseFloat(limit).toFixed(2)}/month)`);
@@ -1814,11 +1814,11 @@
             toggleCategorySection();
             updateRegSummary();
         });
-        document.getElementById('billingUserPays').addEventListener('change', () => {
+        document.getElementById('billingCustomerPays').addEventListener('change', () => {
             toggleBillingSection();
             updateRegSummary();
         });
-        document.getElementById('billingManagerPays').addEventListener('change', () => {
+        document.getElementById('billingUserPays').addEventListener('change', () => {
             toggleBillingSection();
             updateRegSummary();
         });

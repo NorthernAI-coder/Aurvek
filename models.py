@@ -60,7 +60,7 @@ class User:
         all_prompts_access: bool = False,
         public_prompts_access: bool = False,
         is_admin: Optional[bool] = None,
-        is_manager: Optional[bool] = None,
+        is_user: Optional[bool] = None,
         authentication_mode: str = "magic_link_only",
         can_change_password: bool = False,
         google_id: Optional[str] = None,
@@ -86,7 +86,7 @@ class User:
 
         # We initialize the role attributes
         self._is_admin = is_admin
-        self._is_manager = is_manager
+        self._is_user = is_user
         self.role_ids = None  # Cache for role IDs
 
     async def fetch_role_ids(self):
@@ -108,17 +108,17 @@ class User:
         return self._is_admin
 
     @property
-    async def is_manager(self):
-        if self._is_manager is not None:
-            return self._is_manager
+    async def is_user(self):
+        if self._is_user is not None:
+            return self._is_user
         await self.fetch_role_ids()
-        self._is_manager = self.role_id == self.role_ids.get('manager')
-        return self._is_manager
+        self._is_user = self.role_id == self.role_ids.get('user')
+        return self._is_user
 
     @property
-    async def is_user(self):
+    async def is_customer(self):
         await self.fetch_role_ids()
-        return self.role_id == self.role_ids.get('user')
+        return self.role_id == self.role_ids.get('customer')
 
     async def get_magic_link_expiration(self) -> Optional[datetime]:
         async with get_db_connection(readonly=True) as conn:

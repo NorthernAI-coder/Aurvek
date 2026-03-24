@@ -404,7 +404,11 @@
                     <tr>
                         <td>
                             <strong>${escapeHtml(p.prompt_name)}</strong>
-                            ${p.is_paid ? '<span class="badge bg-warning text-dark ms-1">Paid</span>' : ''}
+                            ${p.is_paid && p.purchase_price > 0
+                                ? '<span class="badge bg-warning text-dark ms-1">VIP</span>'
+                                : p.is_paid
+                                    ? '<span class="badge bg-info text-dark ms-1">Premium</span>'
+                                    : ''}
                         </td>
                         <td class="text-center">${p.unique_users}</td>
                         <td class="text-end">${formatTokens(p.total_tokens)}</td>
