@@ -1,4 +1,5 @@
 const MAX_PDF_SIZE_MB = 25;
+const MAX_IMAGE_SIZE_MB = 20;
 
 function isAcceptedFileType(file) {
     return file.type.startsWith('image/') || file.type === 'application/pdf';
@@ -7,6 +8,10 @@ function isAcceptedFileType(file) {
 function validateFileSize(file) {
     if (file.type === 'application/pdf' && file.size > MAX_PDF_SIZE_MB * 1024 * 1024) {
         NotificationModal.warning('File too large', `PDF files must be under ${MAX_PDF_SIZE_MB}MB`);
+        return false;
+    }
+    if (file.type.startsWith('image/') && file.size > MAX_IMAGE_SIZE_MB * 1024 * 1024) {
+        NotificationModal.warning('File too large', `Images must be under ${MAX_IMAGE_SIZE_MB}MB`);
         return false;
     }
     return true;
@@ -20,6 +25,7 @@ function handlePasteEvent(event) {
         var item = items[index];
         if (item.kind === 'file' && item.type.startsWith('image/')) {
             var blob = item.getAsFile();
+            if (!blob || !validateFileSize(blob)) continue;
             attachedFiles.push(blob);
             var reader = new FileReader();
             reader.onload = function(event){

@@ -302,7 +302,7 @@ async def create_prompt_post(
             # Async FK check for llm_id on both sub-configs
             for sub_key in ("pre_watchdog", "post_watchdog"):
                 sub_cfg = sanitized_wd.get(sub_key, {})
-                if sub_cfg.get("enabled") and sub_cfg.get("llm_id") is not None:
+                if sub_cfg.get("llm_id") is not None:
                     async with get_db_connection(readonly=True) as conn_check:
                         cursor_check = await conn_check.execute("SELECT id FROM LLM WHERE id = ?", (sub_cfg["llm_id"],))
                         if not await cursor_check.fetchone():
@@ -672,7 +672,7 @@ async def update_prompt(
             # Async FK check for llm_id on both sub-configs
             for sub_key in ("pre_watchdog", "post_watchdog"):
                 sub_cfg = sanitized_wd.get(sub_key, {})
-                if sub_cfg.get("enabled") and sub_cfg.get("llm_id") is not None:
+                if sub_cfg.get("llm_id") is not None:
                     async with get_db_connection(readonly=True) as conn_check:
                         cursor_check = await conn_check.execute("SELECT id FROM LLM WHERE id = ?", (sub_cfg["llm_id"],))
                         if not await cursor_check.fetchone():
@@ -1774,34 +1774,34 @@ def _validate_pre_watchdog_config(config: dict) -> dict:
         enabled = bool(enabled)
     sanitized["enabled"] = enabled
 
-    if not enabled:
-        return sanitized
-
-    # llm_id (required when enabled)
+    # llm_id — required when enabled, preserved when disabled
     llm_id = config.get("llm_id")
-    if llm_id is None:
+    if enabled and llm_id is None:
         raise ValueError("pre_watchdog.llm_id is required when enabled")
-    try:
-        sanitized["llm_id"] = int(llm_id)
-    except (TypeError, ValueError):
-        raise ValueError("pre_watchdog.llm_id must be an integer")
+    if llm_id is not None:
+        try:
+            sanitized["llm_id"] = int(llm_id)
+        except (TypeError, ValueError):
+            if enabled:
+                raise ValueError("pre_watchdog.llm_id must be an integer")
 
-    # objectives (required when enabled)
+    # objectives — required when enabled, preserved when disabled
     objectives = config.get("objectives", [])
-    if not isinstance(objectives, list) or not objectives:
+    if enabled and (not isinstance(objectives, list) or not objectives):
         raise ValueError("pre_watchdog requires at least one objective when enabled")
-    if len(objectives) > WATCHDOG_OBJ_MAX_COUNT:
-        raise ValueError(f"pre_watchdog: maximum {WATCHDOG_OBJ_MAX_COUNT} objectives allowed")
-    sanitized_objectives = []
-    for obj in objectives:
-        if not isinstance(obj, str):
-            continue
-        obj = obj.strip()[:WATCHDOG_OBJ_MAX_CHARS]
-        if obj:
-            sanitized_objectives.append(obj)
-    if not sanitized_objectives:
-        raise ValueError("pre_watchdog requires at least one non-empty objective")
-    sanitized["objectives"] = sanitized_objectives
+    if isinstance(objectives, list):
+        if len(objectives) > WATCHDOG_OBJ_MAX_COUNT:
+            raise ValueError(f"pre_watchdog: maximum {WATCHDOG_OBJ_MAX_COUNT} objectives allowed")
+        sanitized_objectives = []
+        for obj in objectives:
+            if not isinstance(obj, str):
+                continue
+            obj = obj.strip()[:WATCHDOG_OBJ_MAX_CHARS]
+            if obj:
+                sanitized_objectives.append(obj)
+        if enabled and not sanitized_objectives:
+            raise ValueError("pre_watchdog requires at least one non-empty objective")
+        sanitized["objectives"] = sanitized_objectives
 
     # steering_prompt (optional)
     steering_prompt = config.get("steering_prompt", "")
@@ -1844,40 +1844,41 @@ def _validate_post_watchdog_config(config: dict) -> dict:
         enabled = bool(enabled)
     sanitized["enabled"] = enabled
 
-    if not enabled:
-        return sanitized
-
-    # llm_id (required when enabled)
+    # llm_id — required when enabled, preserved when disabled
     llm_id = config.get("llm_id")
-    if llm_id is None:
+    if enabled and llm_id is None:
         raise ValueError("post_watchdog.llm_id is required when enabled")
-    try:
-        sanitized["llm_id"] = int(llm_id)
-    except (TypeError, ValueError):
-        raise ValueError("post_watchdog.llm_id must be an integer")
+    if llm_id is not None:
+        try:
+            sanitized["llm_id"] = int(llm_id)
+        except (TypeError, ValueError):
+            if enabled:
+                raise ValueError("post_watchdog.llm_id must be an integer")
 
     # mode
     mode = config.get("mode", "custom")
-    if mode not in VALID_WATCHDOG_MODES:
+    if mode in VALID_WATCHDOG_MODES:
+        sanitized["mode"] = mode
+    elif enabled:
         raise ValueError(f"post_watchdog.mode must be one of: {', '.join(VALID_WATCHDOG_MODES)}")
-    sanitized["mode"] = mode
 
-    # objectives (required when enabled)
+    # objectives — required when enabled, preserved when disabled
     objectives = config.get("objectives", [])
-    if not isinstance(objectives, list) or not objectives:
+    if enabled and (not isinstance(objectives, list) or not objectives):
         raise ValueError("post_watchdog requires at least one objective when enabled")
-    if len(objectives) > WATCHDOG_OBJ_MAX_COUNT:
-        raise ValueError(f"post_watchdog: maximum {WATCHDOG_OBJ_MAX_COUNT} objectives allowed")
-    sanitized_objectives = []
-    for obj in objectives:
-        if not isinstance(obj, str):
-            continue
-        obj = obj.strip()[:WATCHDOG_OBJ_MAX_CHARS]
-        if obj:
-            sanitized_objectives.append(obj)
-    if not sanitized_objectives:
-        raise ValueError("post_watchdog requires at least one non-empty objective")
-    sanitized["objectives"] = sanitized_objectives
+    if isinstance(objectives, list):
+        if len(objectives) > WATCHDOG_OBJ_MAX_COUNT:
+            raise ValueError(f"post_watchdog: maximum {WATCHDOG_OBJ_MAX_COUNT} objectives allowed")
+        sanitized_objectives = []
+        for obj in objectives:
+            if not isinstance(obj, str):
+                continue
+            obj = obj.strip()[:WATCHDOG_OBJ_MAX_CHARS]
+            if obj:
+                sanitized_objectives.append(obj)
+        if enabled and not sanitized_objectives:
+            raise ValueError("post_watchdog requires at least one non-empty objective")
+        sanitized["objectives"] = sanitized_objectives
 
     # steering_prompt (optional)
     steering_prompt = config.get("steering_prompt", "")
@@ -2016,7 +2017,7 @@ async def set_watchdog_config(prompt_id: int, config: dict) -> bool:
     # Async FK validation: check llm_id exists in LLM table for both sub-configs
     for sub_key in ("pre_watchdog", "post_watchdog"):
         sub_cfg = sanitized.get(sub_key, {})
-        if sub_cfg.get("enabled") and sub_cfg.get("llm_id") is not None:
+        if sub_cfg.get("llm_id") is not None:
             async with get_db_connection(readonly=True) as conn:
                 async with conn.cursor() as cursor:
                     await cursor.execute("SELECT id FROM LLM WHERE id = ?", (sub_cfg["llm_id"],))

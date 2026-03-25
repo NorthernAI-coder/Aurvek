@@ -4,44 +4,18 @@
 
 {% block styles %}
 <style>
-    /* Page-specific styles */
-    .conversation-title {
-        font-size: 16px;
-        font-weight: bold;
-        margin-bottom: 10px;
-        padding: 10px;
-        background: var(--bg-tertiary, #f8f9fa);
-        border-radius: 6px;
-    }
-    .message {
-        padding: 12px;
-        margin-bottom: 10px;
-        border-radius: 8px;
-    }
-    .message.user {
-        background: var(--bg-secondary, #e3f2fd);
-        border-left: 3px solid var(--primary-color, #1976d2);
-    }
-    .message.bot {
-        background: var(--bg-tertiary, #f5f5f5);
-        border-left: 3px solid var(--accent-color, #9c27b0);
-    }
-    .message img {
-        max-width: 200px;
-        border-radius: 4px;
-        margin-top: 8px;
-    }
-    .modal-body {
-        max-height: 70vh;
-        overflow-y: auto;
-    }
-    .tokens-badge {
-        font-size: 0.8rem;
-        padding: 4px 8px;
-        border-radius: 4px;
-        background: var(--bg-tertiary, #f0f0f0);
-        color: var(--text-secondary, #666);
-    }
+    .chat-name-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .modal-conv-info { font-size: 0.85rem; padding: 10px 14px; background: var(--bg-tertiary, #f8f9fa); border-radius: 6px; margin-bottom: 12px; }
+    .load-more-btn { display: block; margin: 10px auto; }
+    tr[data-locked="1"] { border-left: 3px solid var(--danger, #dc3545); }
+    /* Messages inside modal */
+    #modalBody .msg { padding: 12px; margin-bottom: 10px; border-radius: 8px; }
+    #modalBody .msg.msg-user { background: var(--bg-secondary); border-left: 3px solid var(--accent); }
+    #modalBody .msg.msg-bot { background: var(--bg-tertiary); border-left: 3px solid var(--text-muted); }
+    #modalBody .msg img { max-width: 200px; border-radius: 4px; margin-top: 8px; }
+    /* Row actions: show on hover only */
+    .table tbody tr .dropdown .btn { opacity: 0; transition: opacity 0.15s; }
+    .table tbody tr:hover .dropdown .btn { opacity: 1; }
 </style>
 {% endblock %}
 
@@ -52,67 +26,283 @@
 {% endblock %}
 
 {% block page_actions %}
-<button id="selectButton" onclick="toggleSelection()" class="btn btn-outline-secondary">
-    <i class="fas fa-check-square"></i> Select
+<span class="stat-badge" style="margin-right: 8px;">
+    <i class="fas fa-list"></i>
+    {% if conversations|length > 0 %}
+        Showing <strong>{{ showing_start }}-{{ showing_end }}</strong> of <strong>{{ stats.total }}</strong>
+    {% else %}
+        <strong>0</strong> conversations
+    {% endif %}
+</span>
+<span class="stat-badge" style="margin-right: 12px;">
+    <i class="fas fa-lock"></i> <strong>{{ stats.locked }}</strong> Locked
+</span>
+<button id="selectBtn" onclick="toggleSelection()" class="btn btn-outline-secondary btn-sm">
+    <i class="fas fa-check-square me-1"></i> Select
 </button>
-<button id="deleteSelectedButton" onclick="deleteSelected()" class="btn btn-outline-danger" style="display:none;">
-    <i class="fas fa-trash"></i> Delete Selected
-</button>
-<button onclick="fetchConversations()" class="btn btn-outline-primary" title="Refresh" data-bs-toggle="tooltip">
+<a href="/admin/chat" class="btn btn-outline-primary btn-sm" title="Refresh">
     <i class="fas fa-sync-alt"></i>
-</button>
+</a>
 {% endblock %}
 
 {% block content %}
-<!-- Stats Row -->
-<div class="stats-row">
-    <span class="stat-badge">
-        <i class="fas fa-comments"></i> <strong id="conversationCount">0</strong> Conversations
-    </span>
-    <span class="stat-badge" id="statsSelected" style="display: none;">
-        <i class="fas fa-check-square"></i> <strong id="selectedCount">0</strong> Selected
-    </span>
-</div>
+{% set base_qs = 'search=' ~ (filters.search|urlencode) ~ '&user_exact=' ~ (filters.user_exact|urlencode) ~ '&prompt_id=' ~ (filters.prompt_id|default('', true)) ~ '&locked=' ~ (filters.locked|urlencode) ~ '&conversation_id=' ~ (filters.conversation_id|urlencode) ~ '&date_from=' ~ (filters.date_from|urlencode) ~ '&date_to=' ~ (filters.date_to|urlencode) ~ '&min_tokens=' ~ (filters.min_tokens|urlencode) ~ '&per_page=' ~ per_page ~ '&sort_by=' ~ sort_by ~ '&sort_dir=' ~ sort_dir %}
 
-<!-- Conversations Table Section -->
+<!-- Filters -->
 <div class="section-container">
     <div class="section-title">
-        <i class="fas fa-list"></i> All Conversations
+        <i class="fas fa-filter"></i> Filters
     </div>
+    <form method="get" action="/admin/chat" id="filterForm">
+        <input type="hidden" name="page" value="1">
+        <input type="hidden" name="sort_by" value="{{ sort_by }}">
+        <input type="hidden" name="sort_dir" value="{{ sort_dir }}">
+        <div class="flex-row">
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Search</label>
+                    <input name="search" type="text" class="form-control" id="filterSearch"
+                           placeholder="Username or chat name..."
+                           value="{{ filters.search }}" autocomplete="off">
+                </div>
+            </div>
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Bot</label>
+                    <select name="prompt_id" class="form-select">
+                        <option value="">All prompts</option>
+                        {% for p in prompts %}
+                        <option value="{{ p.id }}" {% if filters.prompt_id == p.id %}selected{% endif %}>{{ p.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Status</label>
+                    <select name="locked" class="form-select">
+                        <option value="">All statuses</option>
+                        <option value="locked" {% if filters.locked == 'locked' %}selected{% endif %}>Locked</option>
+                        <option value="unlocked" {% if filters.locked == 'unlocked' %}selected{% endif %}>Unlocked</option>
+                    </select>
+                </div>
+            </div>
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Conversation ID</label>
+                    <input name="conversation_id" type="text" class="form-control" placeholder="Filter by ID"
+                           value="{{ filters.conversation_id }}">
+                </div>
+            </div>
+        </div>
+        <div class="flex-row">
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Date from</label>
+                    <input name="date_from" type="date" class="form-control" value="{{ filters.date_from }}">
+                </div>
+            </div>
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Date to</label>
+                    <input name="date_to" type="date" class="form-control" value="{{ filters.date_to }}">
+                </div>
+            </div>
+            <div class="flex-column">
+                <div class="mb-3">
+                    <label class="form-label">Min tokens</label>
+                    <input name="min_tokens" type="number" class="form-control" placeholder="0"
+                           value="{{ filters.min_tokens }}" min="0">
+                </div>
+            </div>
+            <div class="flex-column"></div>
+        </div>
+        <div class="mt-2 d-flex gap-2">
+            <button type="submit" class="btn btn-primary btn-sm">
+                <i class="fas fa-search me-1"></i> Apply
+            </button>
+            <a href="/admin/chat" class="btn btn-outline-secondary btn-sm">
+                <i class="fas fa-times me-1"></i> Clear
+            </a>
+        </div>
+    </form>
+</div>
+
+<!-- Conversations Table -->
+<div class="section-container">
+    <div class="section-title" style="display: flex; align-items: center; justify-content: space-between;">
+        <span><i class="fas fa-comments"></i> Conversations</span>
+        <span class="btn-group btn-group-sm" role="group" aria-label="Rows per page" style="font-weight: 400;">
+            {% for n in [25, 50, 100] %}
+            <a href="/admin/chat?{{ base_qs|replace('per_page=' ~ per_page, 'per_page=' ~ n) }}&page=1"
+               class="btn btn-outline-secondary{% if per_page == n %} active{% endif %}"
+               style="font-size: 0.75rem; padding: 2px 10px;">{{ n }}</a>
+            {% endfor %}
+        </span>
+    </div>
+
+    <!-- Bulk Toolbar (hidden by default) -->
+    <div class="table-toolbar" id="bulkToolbar" style="display: none;">
+        <div class="toolbar-left">
+            <span><strong id="selectedCount">0</strong> selected</span>
+        </div>
+        <div class="toolbar-right">
+            <button onclick="bulkAction('lock')" class="btn btn-outline-warning btn-sm">
+                <i class="fas fa-lock me-1"></i> Lock
+            </button>
+            <button onclick="bulkAction('unlock')" class="btn btn-outline-success btn-sm">
+                <i class="fas fa-lock-open me-1"></i> Unlock
+            </button>
+            <button onclick="bulkAction('delete')" class="btn btn-outline-danger btn-sm">
+                <i class="fas fa-trash me-1"></i> Delete
+            </button>
+        </div>
+    </div>
+
     <div class="table-wrapper">
         <table class="table">
             <thead>
                 <tr>
-                    <th style="width: 40px;">
-                        <input type="checkbox" id="selectAllCheckbox" onclick="toggleSelectAll()" style="display:none; cursor:pointer; transform: scale(1.2);">
+                    <th style="width: 35px;">
+                        <input type="checkbox" id="selectAll" onclick="toggleSelectAll()" style="display: none; cursor: pointer;">
                     </th>
-                    <th>ID</th>
-                    <th>User</th>
-                    <th>Created</th>
-                    <th>Last Active</th>
-                    <th>Tokens Used</th>
-                    <th class="text-end">Actions</th>
+                    <th class="sortable {% if sort_by == 'id' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('id')" style="width:60px;">ID</th>
+                    <th class="sortable {% if sort_by == 'chat_name' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('chat_name')">Chat</th>
+                    <th class="sortable {% if sort_by == 'username' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('username')">User</th>
+                    <th class="sortable {% if sort_by == 'prompt_name' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('prompt_name')">Bot</th>
+                    <th class="sortable {% if sort_by == 'message_count' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('message_count')" title="Messages"><i class="fas fa-comment"></i></th>
+                    <th class="sortable {% if sort_by == 'total_tokens' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('total_tokens')" title="Tokens"><i class="fas fa-coins"></i></th>
+                    <th class="sortable {% if sort_by == 'start_date' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('start_date')" title="Created"><i class="fas fa-calendar-plus"></i></th>
+                    <th class="sortable {% if sort_by == 'last_activity' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('last_activity')" title="Last Active"><i class="fas fa-clock"></i></th>
+                    <th class="sortable {% if sort_by == 'locked' %}sort-{{ sort_dir }}{% endif %}" onclick="sortBy('locked')" title="Locked"><i class="fas fa-lock"></i></th>
+                    <th style="width:40px;"></th>
                 </tr>
             </thead>
-            <tbody id="conversations-list">
-                <!-- Populated via JavaScript -->
+            <tbody>
+                {% for conv in conversations %}
+                <tr data-locked="{{ 1 if conv.locked else 0 }}">
+                    <td>
+                        <input type="checkbox" class="row-check" value="{{ conv.id }}"
+                               onclick="event.stopPropagation(); updateSelected();" style="display: none; cursor: pointer;">
+                    </td>
+                    <td><strong>#{{ conv.id }}</strong></td>
+                    <td class="chat-name-cell" title="{{ conv.chat_name or '' }}">{{ (conv.chat_name or '-')[:40] }}</td>
+                    <td>
+                        <a href="/admin/chat?user_exact={{ conv.username|urlencode }}" class="text-decoration-none">
+                            {{ conv.username }}
+                        </a>
+                    </td>
+                    <td title="{{ conv.prompt_name or '' }}"><small>{{ (conv.prompt_name or '-')[:18] }}</small></td>
+                    <td>{{ conv.message_count }}</td>
+                    <td title="{{ '{:,}'.format(conv.total_tokens|int) }} tokens">
+                        {%- set tk = conv.total_tokens|int -%}
+                        {%- if tk >= 1000000 -%}{{ '%.1f'|format(tk / 1000000) }}M
+                        {%- elif tk >= 1000 -%}{{ '%.1f'|format(tk / 1000) }}K
+                        {%- else -%}{{ tk }}
+                        {%- endif -%}
+                    </td>
+                    <td><small>{{ conv.start_date[:10] if conv.start_date else '-' }}</small></td>
+                    <td title="{{ conv.last_activity or '' }}"><small>{{ conv.last_activity[5:16] if conv.last_activity else '-' }}</small></td>
+                    <td>
+                        {% if conv.locked %}
+                        <i class="fas fa-lock text-danger" title="{{ conv.locked_reason or 'Locked' }}"></i>
+                        {% endif %}
+                    </td>
+                    <td class="text-end">
+                        <div class="dropdown">
+                            <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="dropdown" title="Actions">
+                                <i class="fas fa-ellipsis-v"></i>
+                            </button>
+                            <ul class="dropdown-menu dropdown-menu-end">
+                                <li><a class="dropdown-item" href="#" onclick="viewConversation({{ conv.id }}); return false;"><i class="fas fa-eye me-2"></i>View</a></li>
+                                <li><a class="dropdown-item" href="#" onclick="toggleLock({{ conv.id }}, {{ 'false' if conv.locked else 'true' }}); return false;"><i class="fas fa-{{ 'lock-open' if conv.locked else 'lock' }} me-2"></i>{{ 'Unlock' if conv.locked else 'Lock' }}</a></li>
+                                <li><hr class="dropdown-divider"></li>
+                                <li><a class="dropdown-item text-danger" href="#" onclick="deleteConversation({{ conv.id }}); return false;"><i class="fas fa-trash me-2"></i>Delete</a></li>
+                            </ul>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="11" class="text-center text-muted py-4">
+                        <i class="fas fa-comments fa-2x mb-2 d-block opacity-50"></i>
+                        No conversations found.
+                    </td>
+                </tr>
+                {% endfor %}
             </tbody>
         </table>
     </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <nav aria-label="Conversations pagination" class="mt-3">
+        <ul class="pagination justify-content-center mb-0">
+            <!-- Previous -->
+            <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+                <a class="page-link" href="/admin/chat?{{ base_qs }}&page={{ page - 1 }}" aria-label="Previous">
+                    <span aria-hidden="true">&laquo;</span>
+                </a>
+            </li>
+
+            <!-- Page 1 always shown -->
+            <li class="page-item {% if page == 1 %}active{% endif %}">
+                <a class="page-link" href="/admin/chat?{{ base_qs }}&page=1">1</a>
+            </li>
+
+            <!-- Left ellipsis -->
+            {% if page > 4 %}
+            <li class="page-item disabled">
+                <span class="page-link">...</span>
+            </li>
+            {% endif %}
+
+            <!-- Neighbor pages around current (skip 1 and total_pages, shown separately) -->
+            {% for p in range([page - 2, 2]|max, [page + 3, total_pages]|min) %}
+            <li class="page-item {% if p == page %}active{% endif %}">
+                <a class="page-link" href="/admin/chat?{{ base_qs }}&page={{ p }}">{{ p }}</a>
+            </li>
+            {% endfor %}
+
+            <!-- Right ellipsis -->
+            {% if page < total_pages - 3 %}
+            <li class="page-item disabled">
+                <span class="page-link">...</span>
+            </li>
+            {% endif %}
+
+            <!-- Last page (if more than 1 page) -->
+            {% if total_pages > 1 %}
+            <li class="page-item {% if page == total_pages %}active{% endif %}">
+                <a class="page-link" href="/admin/chat?{{ base_qs }}&page={{ total_pages }}">{{ total_pages }}</a>
+            </li>
+            {% endif %}
+
+            <!-- Next -->
+            <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+                <a class="page-link" href="/admin/chat?{{ base_qs }}&page={{ page + 1 }}" aria-label="Next">
+                    <span aria-hidden="true">&raquo;</span>
+                </a>
+            </li>
+        </ul>
+    </nav>
+    {% endif %}
 </div>
 
 <!-- Conversation Detail Modal -->
-<div class="modal fade" id="conversationModal" tabindex="-1" aria-labelledby="conversationModalLabel" aria-hidden="true">
+<div class="modal fade" id="conversationModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title" id="conversationModalLabel">Conversation Detail</h5>
+                <h5 class="modal-title" id="modalTitle">Conversation Detail</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
-            <div class="modal-body" id="conversationMessages">
-            </div>
+            <div class="modal-body" id="modalBody"></div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button id="modalLockBtn" class="btn btn-warning btn-sm" style="display: none;" onclick="modalToggleLock()">
+                    <i class="fas fa-lock"></i> Lock
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
             </div>
         </div>
     </div>
@@ -121,291 +311,287 @@
 
 {% block scripts %}
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
 {% endblock %}
 
 {% block scripts_inline %}
 <script>
-    let currentView = 'conversations';
-    let conversationModal;
+    let convModal, currentModalConvId = null, currentModalLocked = false;
 
-    // Initialize modal on page load
     document.addEventListener('DOMContentLoaded', function() {
-        conversationModal = new bootstrap.Modal(document.getElementById('conversationModal'));
-        fetchConversations();
-    });
-
-    // Handle modal keyboard navigation
-    document.getElementById('conversationModal').addEventListener('keypress', function(event) {
-        if (event.key === 'Enter' || event.key === ' ') {
-            conversationModal.hide();
+        convModal = new bootstrap.Modal(document.getElementById('conversationModal'));
+        // Restore focus + cursor position on search field after auto-submit reload
+        var si = document.getElementById('filterSearch');
+        if (si && si.value) {
+            si.focus();
+            si.setSelectionRange(si.value.length, si.value.length);
         }
     });
 
-    function encodeForHTML(input) {
-        input = input.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-        var replacements = { "<": "&lt;", ">": "&gt;", "&": "&amp;", "\"": "&quot;" };
-        return input.replace(/[<>&"]/g, function (character) {
-            return replacements[character];
+    // --- Sorting ---
+    function sortBy(col) {
+        const form = document.getElementById('filterForm');
+        const sortByInput = form.querySelector('input[name="sort_by"]');
+        const sortDirInput = form.querySelector('input[name="sort_dir"]');
+        if (sortByInput.value === col) {
+            sortDirInput.value = sortDirInput.value === 'asc' ? 'desc' : 'asc';
+        } else {
+            sortByInput.value = col;
+            sortDirInput.value = 'desc';
+        }
+        form.submit();
+    }
+
+    // --- Search auto-submit with debounce ---
+    var searchTimer;
+    var searchInput = document.getElementById('filterSearch');
+    if (searchInput) {
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(function() {
+                document.getElementById('filterForm').submit();
+            }, 400);
         });
     }
 
-    function downloadPDF(conversationId, event) {
-        if (event) event.stopPropagation();
-        window.location.href = `/download-pdf/${conversationId}`;
-    }
-
-    function fetchConversations() {
-        currentView = 'conversations';
-        const tbody = document.getElementById('conversations-list');
-        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4"><i class="fas fa-spinner fa-spin"></i> Loading conversations...</td></tr>';
-
-        fetch('/api/admin/conversations')
-            .then(response => response.json())
-            .then(conversations => {
-                tbody.innerHTML = '';
-
-                if (conversations.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-muted">No conversations found</td></tr>';
-                    document.getElementById('conversationCount').textContent = '0';
-                    return;
-                }
-
-                conversations.forEach(conv => {
-                    const row = document.createElement('tr');
-                    row.className = 'conversation-row';
-                    row.dataset.id = conv.id;
-                    row.innerHTML = `
-                        <td>
-                            <input type="checkbox" class="delete-checkbox" value="${conv.id}" onclick="event.stopPropagation(); updateSelectedCount();" style="display:none; cursor:pointer; transform: scale(1.2);">
-                        </td>
-                        <td><strong>#${conv.id}</strong></td>
-                        <td>
-                            <a href="/admin/chat-view/${conv.user_id}" class="text-decoration-none" onclick="event.stopPropagation();">
-                                ${encodeForHTML(conv.username)}
-                            </a>
-                        </td>
-                        <td>${conv.start_date}</td>
-                        <td>${conv.last_activity || '-'}</td>
-                        <td><span class="tokens-badge"><i class="fas fa-coins me-1"></i>${conv.total_tokens_used.toLocaleString()}</span></td>
-                        <td class="text-end table-actions">
-                            <button onclick="viewConversation(${conv.id}, event)" class="btn btn-sm btn-outline-primary" title="View" data-bs-toggle="tooltip">
-                                <i class="fas fa-eye"></i>
-                            </button>
-                            <button onclick="downloadPDF(${conv.id}, event)" class="btn btn-sm btn-outline-secondary" title="Download PDF" data-bs-toggle="tooltip">
-                                <i class="fas fa-file-pdf"></i>
-                            </button>
-                            <button onclick="deleteConversation(${conv.id}, event)" class="btn btn-sm btn-outline-danger" title="Delete" data-bs-toggle="tooltip">
-                                <i class="fas fa-trash"></i>
-                            </button>
-                        </td>
-                    `;
-                    tbody.appendChild(row);
-                });
-
-                // Update stats
-                document.getElementById('conversationCount').textContent = conversations.length;
-
-                // Reinitialize tooltips for new elements
-                const newTooltips = tbody.querySelectorAll('[data-bs-toggle="tooltip"]');
-                newTooltips.forEach(el => new bootstrap.Tooltip(el));
-            })
-            .catch(error => {
-                console.error('Error loading conversations:', error);
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-danger"><i class="fas fa-exclamation-triangle me-2"></i>Error loading conversations. Please try again.</td></tr>';
-            });
-    }
-
-    function viewConversation(conversationId, event) {
-        if (event && event.target.type === 'checkbox') {
-            return;
-        }
-        if (event) event.stopPropagation();
-
-        const modalBody = document.getElementById('conversationMessages');
-        modalBody.innerHTML = '<div class="text-center py-4"><i class="fas fa-spinner fa-spin"></i> Loading messages...</div>';
-        conversationModal.show();
-
-        fetch(`/api/conversations/${conversationId}/messages`)
-            .then(response => response.json())
-            .then(data => {
-                modalBody.innerHTML = '';
-
-                if (data.messages.length > 0) {
-                    const firstMessage = data.messages[0];
-                    const titleElement = document.createElement('div');
-                    titleElement.className = 'conversation-title';
-                    titleElement.innerHTML = `
-                        <strong><i class="fas fa-user me-1"></i>User:</strong> ${encodeForHTML(firstMessage.username)} |
-                        <strong><i class="fas fa-comment-dots me-1"></i>Prompt:</strong> ${encodeForHTML(data.conversation_info.prompt_name)} |
-                        <strong><i class="fas fa-robot me-1"></i>LLM:</strong> ${encodeForHTML(data.conversation_info.machine)} - ${encodeForHTML(data.conversation_info.model)}
-                    `;
-                    modalBody.appendChild(titleElement);
-                }
-
-                data.messages.forEach(message => {
-                    const messageElement = document.createElement('div');
-                    messageElement.classList.add('message', message.type === 'user' ? 'user' : 'bot');
-
-                    const metaElement = document.createElement('small');
-                    metaElement.className = 'text-muted d-block mb-2';
-                    metaElement.innerHTML = `
-                        <strong>${message.type === 'user' ? '<i class="fas fa-user me-1"></i>User' : '<i class="fas fa-robot me-1"></i>Bot'}:</strong> ${message.date}
-                    `;
-                    messageElement.appendChild(metaElement);
-
-                    try {
-                        const messageContent = JSON.parse(message.message);
-                        messageContent.forEach(item => {
-                            if (item.type === 'text') {
-                                const textElement = document.createElement('div');
-                                textElement.innerHTML = marked.parse(item.text);
-                                messageElement.appendChild(textElement);
-                            } else if (item.type === 'image_url') {
-                                const imgElement = document.createElement('img');
-                                imgElement.src = item.image_url.url;
-                                imgElement.style.maxWidth = '200px';
-                                messageElement.appendChild(imgElement);
-                                messageElement.appendChild(document.createElement('br'));
-                            }
-                        });
-                    } catch (error) {
-                        const textElement = document.createElement('div');
-                        textElement.innerHTML = marked.parse(message.message);
-                        messageElement.appendChild(textElement);
-                    }
-
-                    modalBody.appendChild(messageElement);
-                });
-            })
-            .catch(error => {
-                console.error('Error loading messages:', error);
-                modalBody.innerHTML = '<div class="text-center py-4 text-danger"><i class="fas fa-exclamation-triangle me-2"></i>Error loading messages.</div>';
-            });
-    }
-
-    function deleteSelectedConversations() {
-        const checkboxes = document.querySelectorAll('.delete-checkbox:checked');
-        const idsToDelete = Array.from(checkboxes).map(cb => parseInt(cb.value));
-
-        if (idsToDelete.length === 0) {
-            NotificationModal.warning('No Selection', 'Please select at least one conversation to delete.');
-            return;
-        }
-
-        NotificationModal.confirm(
-            'Delete Conversations',
-            `Are you sure you want to delete ${idsToDelete.length} selected conversation(s)?`,
-            () => {
-                fetch('/admin/api/conversations/bulk_delete', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ conversation_ids: idsToDelete }),
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.message) {
-                        NotificationModal.success('Deleted', data.message);
-                        fetchConversations();
-                        toggleSelection();
-                    } else {
-                        NotificationModal.error('Delete Error', 'Error deleting conversations');
-                    }
-                })
-                .catch(error => console.error('Error deleting conversations:', error));
-            },
-            null,
-            { type: 'error', confirmText: 'Delete' }
-        );
-    }
-
-    function deleteConversation(conversationId, event) {
-        if (event) event.stopPropagation();
-        NotificationModal.confirm(
-            'Delete Conversation',
-            'Are you sure you want to delete this conversation?',
-            () => {
-                fetch(`/admin/api/conversations/${conversationId}`, {
-                    method: 'DELETE'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.message) {
-                        NotificationModal.success('Deleted', data.message);
-                        fetchConversations();
-                    } else {
-                        NotificationModal.error('Delete Error', 'Error deleting the conversation');
-                    }
-                })
-                .catch(error => console.error('Error deleting the conversation:', error));
-            },
-            null,
-            { type: 'error', confirmText: 'Delete' }
-        );
-    }
-
-    function deleteSelected() {
-        if (currentView === 'conversations') {
-            deleteSelectedConversations();
-        }
-    }
-
+    // --- Selection ---
     function toggleSelection() {
-        const checkboxes = document.querySelectorAll('.delete-checkbox');
-        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
-        const isHidden = checkboxes.length === 0 || checkboxes[0].style.display === 'none';
-        const selectButton = document.getElementById('selectButton');
-        const deleteButton = document.getElementById('deleteSelectedButton');
-        const statsSelected = document.getElementById('statsSelected');
+        const checks = document.querySelectorAll('.row-check');
+        const selectAll = document.getElementById('selectAll');
+        const btn = document.getElementById('selectBtn');
+        const toolbar = document.getElementById('bulkToolbar');
+        const showing = checks.length > 0 && checks[0].style.display !== 'none';
 
-        if (isHidden) {
-            checkboxes.forEach(cb => {
-                cb.checked = false;
-                cb.style.display = 'inline';
-            });
-            selectAllCheckbox.style.display = 'inline';
-            selectAllCheckbox.checked = false;
-            selectButton.innerHTML = '<i class="fas fa-times"></i> Cancel';
-            selectButton.classList.remove('btn-outline-secondary');
-            selectButton.classList.add('btn-secondary');
-            deleteButton.style.display = 'inline-block';
-            statsSelected.style.display = 'inline-flex';
+        if (showing) {
+            checks.forEach(function(c) { c.style.display = 'none'; c.checked = false; });
+            selectAll.style.display = 'none';
+            selectAll.checked = false;
+            btn.innerHTML = '<i class="fas fa-check-square me-1"></i> Select';
+            toolbar.style.display = 'none';
         } else {
-            checkboxes.forEach(cb => {
-                cb.style.display = 'none';
-                cb.checked = false;
-            });
-            selectAllCheckbox.style.display = 'none';
-            selectAllCheckbox.checked = false;
-            selectButton.innerHTML = '<i class="fas fa-check-square"></i> Select';
-            selectButton.classList.remove('btn-secondary');
-            selectButton.classList.add('btn-outline-secondary');
-            deleteButton.style.display = 'none';
-            statsSelected.style.display = 'none';
+            checks.forEach(function(c) { c.style.display = 'inline'; });
+            selectAll.style.display = 'inline';
+            btn.innerHTML = '<i class="fas fa-times me-1"></i> Cancel';
+            toolbar.style.display = 'flex';
         }
-        updateSelectedCount();
+        updateSelected();
     }
 
     function toggleSelectAll() {
-        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
-        const checkboxes = document.querySelectorAll('.delete-checkbox');
-        checkboxes.forEach(cb => {
-            cb.checked = selectAllCheckbox.checked;
-        });
-        updateSelectedCount();
+        const sa = document.getElementById('selectAll');
+        document.querySelectorAll('.row-check').forEach(function(c) { c.checked = sa.checked; });
+        updateSelected();
     }
 
-    function updateSelectedCount() {
-        const checkedCount = document.querySelectorAll('.delete-checkbox:checked').length;
-        document.getElementById('selectedCount').textContent = checkedCount;
+    function updateSelected() {
+        const count = document.querySelectorAll('.row-check:checked').length;
+        document.getElementById('selectedCount').textContent = count;
+    }
 
-        const allCheckboxes = document.querySelectorAll('.delete-checkbox');
-        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
-        if (allCheckboxes.length > 0) {
-            selectAllCheckbox.checked = checkedCount === allCheckboxes.length;
-            selectAllCheckbox.indeterminate = checkedCount > 0 && checkedCount < allCheckboxes.length;
+    // --- Lock/Unlock ---
+    function toggleLock(convId, lock) {
+        var title = lock ? 'Lock Conversation' : 'Unlock Conversation';
+        var msg = (lock ? 'Lock' : 'Unlock') + ' conversation #' + convId + '?';
+        NotificationModal.confirm(title, msg, async function() {
+            try {
+                var resp = await fetch('/api/conversations/' + convId + '/lock', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({lock: lock})
+                });
+                if (resp.ok) location.reload();
+                else NotificationModal.error('Error', 'Failed to toggle lock');
+            } catch(e) { NotificationModal.error('Error', e.message); }
+        }, null, { type: lock ? 'warning' : 'info', confirmText: lock ? 'Lock' : 'Unlock' });
+    }
+
+    // --- Bulk Actions ---
+    function bulkAction(action) {
+        var ids = Array.from(document.querySelectorAll('.row-check:checked')).map(function(c) { return parseInt(c.value); });
+        if (!ids.length) return;
+
+        if (action === 'delete') {
+            NotificationModal.confirm('Delete Conversations', 'Delete ' + ids.length + ' conversation(s)? This cannot be undone.', async function() {
+                try {
+                    var resp = await fetch('/admin/api/conversations/bulk_delete', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({conversation_ids: ids})
+                    });
+                    if (resp.ok) location.reload();
+                    else NotificationModal.error('Error', 'Failed to delete');
+                } catch(e) { NotificationModal.error('Error', e.message); }
+            }, null, { type: 'error', confirmText: 'Delete' });
+        } else {
+            var lock = (action === 'lock');
+            var title = lock ? 'Lock Conversations' : 'Unlock Conversations';
+            NotificationModal.confirm(title, (lock ? 'Lock' : 'Unlock') + ' ' + ids.length + ' conversation(s)?', async function() {
+                try {
+                    var resp = await fetch('/admin/api/conversations/bulk_lock', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({conversation_ids: ids, lock: lock})
+                    });
+                    if (resp.ok) location.reload();
+                    else NotificationModal.error('Error', 'Failed to update');
+                } catch(e) { NotificationModal.error('Error', e.message); }
+            }, null, { type: lock ? 'warning' : 'info', confirmText: lock ? 'Lock' : 'Unlock' });
         }
+    }
+
+    // --- View Conversation Modal ---
+    let oldestLoadedMsgId = null;
+
+    async function viewConversation(convId) {
+        currentModalConvId = convId;
+        oldestLoadedMsgId = null;
+        const body = document.getElementById('modalBody');
+        body.innerHTML = '<div class="text-center py-4"><i class="fas fa-spinner fa-spin"></i> Loading...</div>';
+        document.getElementById('modalTitle').textContent = 'Conversation #' + convId;
+        convModal.show();
+
+        try {
+            const resp = await fetch('/api/conversations/' + convId + '/messages');
+            const data = await resp.json();
+            body.innerHTML = '';
+
+            // Info bar
+            const info = data.conversation_info || {};
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'modal-conv-info';
+            let infoHtml = '<strong>Prompt:</strong> ' + escapeHtml(info.prompt_name || '-') +
+                ' | <strong>LLM:</strong> ' + escapeHtml((info.machine || '') + ' / ' + (info.model || ''));
+            if (info.message_count !== undefined) infoHtml += ' | <strong>Messages:</strong> ' + info.message_count;
+            if (info.total_tokens !== undefined) infoHtml += ' | <strong>Tokens:</strong> ' + Number(info.total_tokens).toLocaleString();
+            if (info.locked !== undefined) {
+                currentModalLocked = info.locked;
+                infoHtml += ' | <strong>Status:</strong> ' + (info.locked
+                    ? '<span class="text-danger"><i class="fas fa-lock"></i> Locked</span>'
+                    : '<span class="text-success">Active</span>');
+                if (info.locked_reason) infoHtml += ' (' + escapeHtml(info.locked_reason) + ')';
+                const lockBtn = document.getElementById('modalLockBtn');
+                lockBtn.style.display = 'inline-block';
+                lockBtn.innerHTML = info.locked
+                    ? '<i class="fas fa-lock-open"></i> Unlock'
+                    : '<i class="fas fa-lock"></i> Lock';
+                lockBtn.className = info.locked ? 'btn btn-success btn-sm' : 'btn btn-warning btn-sm';
+            }
+            infoDiv.innerHTML = infoHtml;
+            body.appendChild(infoDiv);
+
+            // Load more button
+            if (data.has_more) {
+                const loadBtn = document.createElement('button');
+                loadBtn.className = 'btn btn-outline-secondary btn-sm load-more-btn';
+                loadBtn.id = 'loadOlderBtn';
+                loadBtn.textContent = 'Load older messages';
+                loadBtn.onclick = function() { loadOlderMessages(convId); };
+                body.appendChild(loadBtn);
+            }
+
+            // Messages
+            renderMessages(data.messages, body, false);
+            if (data.messages.length > 0) {
+                oldestLoadedMsgId = data.messages[0].id;
+            }
+        } catch(e) {
+            body.innerHTML = '<div class="text-center py-4 text-danger">Error loading messages.</div>';
+        }
+    }
+
+    async function loadOlderMessages(convId) {
+        if (!oldestLoadedMsgId) return;
+        const btn = document.getElementById('loadOlderBtn');
+        if (btn) btn.disabled = true;
+
+        try {
+            const resp = await fetch('/api/conversations/' + convId + '/messages?before_id=' + oldestLoadedMsgId);
+            const data = await resp.json();
+            const body = document.getElementById('modalBody');
+            const loadBtn = document.getElementById('loadOlderBtn');
+
+            if (data.messages.length > 0) {
+                oldestLoadedMsgId = data.messages[0].id;
+                const refNode = loadBtn || body.querySelector('.modal-conv-info');
+                renderMessages(data.messages, body, true, refNode);
+            }
+
+            if (!data.has_more && loadBtn) loadBtn.remove();
+            else if (btn) btn.disabled = false;
+        } catch(e) {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    function renderMessages(messages, container, prepend, refNode) {
+        messages.forEach(function(msg) {
+            const el = document.createElement('div');
+            el.className = 'msg ' + (msg.type === 'user' ? 'msg-user' : 'msg-bot');
+
+            const meta = document.createElement('small');
+            meta.className = 'text-muted d-block mb-2';
+            meta.innerHTML = '<strong>' + (msg.type === 'user'
+                ? '<i class="fas fa-user me-1"></i>User'
+                : '<i class="fas fa-robot me-1"></i>Bot') + ':</strong> ' + escapeHtml(msg.date || '');
+            el.appendChild(meta);
+
+            const content = msg.message || '';
+            try {
+                const parsed = JSON.parse(content);
+                if (Array.isArray(parsed)) {
+                    parsed.forEach(function(item) {
+                        if (item.type === 'text') {
+                            const t = document.createElement('div');
+                            t.innerHTML = DOMPurify.sanitize(marked.parse(item.text || ''));
+                            el.appendChild(t);
+                        } else if (item.type === 'image_url') {
+                            const img = document.createElement('img');
+                            img.src = item.image_url && item.image_url.url ? item.image_url.url : '';
+                            img.style.maxWidth = '200px';
+                            el.appendChild(img);
+                        }
+                    });
+                } else {
+                    const t = document.createElement('div');
+                    t.innerHTML = DOMPurify.sanitize(marked.parse(content));
+                    el.appendChild(t);
+                }
+            } catch(e) {
+                const t = document.createElement('div');
+                t.innerHTML = DOMPurify.sanitize(marked.parse(content));
+                el.appendChild(t);
+            }
+
+            if (prepend && refNode) {
+                refNode.after(el);
+                refNode = el;
+            } else {
+                container.appendChild(el);
+            }
+        });
+    }
+
+    async function modalToggleLock() {
+        if (!currentModalConvId) return;
+        await toggleLock(currentModalConvId, !currentModalLocked);
+    }
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    // --- Delete ---
+    function deleteConversation(convId) {
+        NotificationModal.confirm('Delete Conversation', 'Delete conversation #' + convId + '? This cannot be undone.', async function() {
+            try {
+                var resp = await fetch('/admin/api/conversations/' + convId, { method: 'DELETE' });
+                if (resp.ok) location.reload();
+                else NotificationModal.error('Error', 'Failed to delete');
+            } catch(e) { NotificationModal.error('Error', e.message); }
+        }, null, { type: 'error', confirmText: 'Delete' });
     }
 </script>
 {% endblock %}

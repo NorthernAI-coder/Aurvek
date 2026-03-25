@@ -151,6 +151,10 @@ MAX_MESSAGE_SIZE = int(os.getenv('MAX_MESSAGE_SIZE', 5120))
 MAX_IMAGE_UPLOAD_SIZE = int(os.getenv('MAX_IMAGE_UPLOAD_SIZE', 10 * 1024 * 1024))  # 10MB default
 MAX_IMAGE_PIXELS = int(os.getenv('MAX_IMAGE_PIXELS', 50_000_000))  # 50 megapixels (e.g., 7000x7000)
 
+# Chat image upload limits (compression + AI API)
+MAX_RAW_UPLOAD_SIZE_MB = int(os.getenv('MAX_RAW_UPLOAD_SIZE_MB', 20))   # Pre-compression gate per file
+MAX_API_IMAGE_SIZE_MB = int(os.getenv('MAX_API_IMAGE_SIZE_MB', 5))      # Post-compression gate (Claude's API limit)
+
 # PDF upload limits
 MAX_PDF_SIZE_MB = int(os.getenv('MAX_PDF_SIZE_MB', 25))        # Under Claude's 32MB request limit
 MAX_PDF_PAGES = int(os.getenv('MAX_PDF_PAGES', 100))           # Claude's limit; Gemini supports 1000

@@ -70,6 +70,9 @@ from common import (
     get_user_api_key_mode,
     resolve_api_key_for_provider,
     users_directory,
+    MAX_IMAGE_PIXELS,
+    MAX_RAW_UPLOAD_SIZE_MB,
+    MAX_API_IMAGE_SIZE_MB,
     MAX_PDF_SIZE_MB,
     MAX_PDF_PAGES,
     MAX_PDFS_PER_MESSAGE,
@@ -535,58 +538,20 @@ async def hydrate_image_for_context(image_block: dict, machine: str, current_use
     else:
         image_path = base_url
 
-    # xAI: cannot use token URLs because the served file is WebP.
-    # Read from disk, convert to JPEG, send as base64 data URL.
-    # Workaround for xAI's lack of WebP support — remove if xAI adds it.
-    if machine == "xAI" and image_path.lower().endswith(".webp") and not force_base64:
-        # image_path is like "users/abc/defg/hash/files/001/0001/img/user/sha1_fullsize.webp"
-        # Disk location is under "data/" prefix
-        disk_path = os.path.join("data", image_path.replace("/", os.sep))
-        try:
-            img = PilImage.open(disk_path)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            return {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-            }
-        except Exception as e:
-            logger.warning(f"[hydrate_image_for_context] Could not convert WebP for xAI, skipping image: {e}")
-            return None  # Caller filters out None results
+    disk_path = os.path.join("data", image_path.replace("/", os.sep))
 
-    # Fallback: read from disk, return base64. Used when AI providers cannot download URLs.
-    if force_base64:
-        disk_path = os.path.join("data", image_path.replace("/", os.sep))
-        try:
-            with open(disk_path, "rb") as f:
-                raw_bytes = f.read()
-            b64 = base64.b64encode(raw_bytes).decode()
-            # Detect media type
-            lower_path = image_path.lower()
-            if lower_path.endswith(".png"):
-                media_type = "image/png"
-            elif lower_path.endswith((".jpg", ".jpeg")):
-                media_type = "image/jpeg"
-            else:
-                media_type = "image/webp"
-            # xAI: WebP -> JPEG conversion
-            if machine == "xAI" and media_type == "image/webp":
-                img = PilImage.open(io.BytesIO(raw_bytes))
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                b64 = base64.b64encode(buf.getvalue()).decode()
-                media_type = "image/jpeg"
-            if machine == "Claude":
-                return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
-            return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}}
-        except Exception as e:
-            logger.warning(f"[hydrate_image_for_context] force_base64 failed for {disk_path}: {e}")
-            return None
+    # Only enter thread when Pillow/IO work is actually needed
+    needs_pillow = (
+        (machine == "xAI" and image_path.lower().endswith(".webp") and not force_base64)
+        or force_base64
+    )
+
+    if needs_pillow:
+        result = await asyncio.to_thread(
+            _convert_image_for_provider_sync, disk_path, image_path, machine, force_base64
+        )
+        # result is dict (success) or None (error, already logged in sync helper)
+        return result
 
     # Generate authenticated URL
     if CLOUDFLARE_FOR_IMAGES:
@@ -788,6 +753,7 @@ async def watchdog_takeover_response(
     user_api_keys: dict,
     machine: str,
     model: str,
+    event_type: str = "security",
     source: str = "post",
 ):
     """Async generator: stream a takeover response from the watchdog LLM.
@@ -898,47 +864,15 @@ async def watchdog_takeover_response(
         await _persist_error_event(conversation_id, prompt_id, 0, 0, f"Takeover streaming error: {exc}", source)
         raise
 
-    # 9. If should_lock, lock the conversation
+    # 9. Finalize takeover (lock if needed, clean state, persist event)
+    from tools.watchdog import _finalize_takeover
+    await _finalize_takeover(
+        conversation_id, prompt_id, event_type, directive,
+        channel="web", should_lock=should_lock,
+        locked_reason=f"WATCHDOG_{event_type.upper()}_TAKEOVER" if should_lock else None,
+    )
     if should_lock:
-        try:
-            from database import get_db_connection as _get_db
-            async with _get_db() as conn:
-                await conn.execute(
-                    "UPDATE CONVERSATIONS SET locked = TRUE, locked_reason = ? WHERE id = ?",
-                    ("WATCHDOG_TAKEOVER_LOCK", conversation_id),
-                )
-                await conn.commit()
-            yield f"data: {orjson.dumps({'end_conversation': True}).decode()}\n\n"
-        except Exception:
-            logger.error("watchdog takeover: failed to lock conv=%d", conversation_id, exc_info=True)
-
-    # 10. Clear hint state after takeover
-    try:
-        from database import get_db_connection as _get_db
-        async with _get_db() as conn:
-            await conn.execute(
-                """UPDATE WATCHDOG_STATE
-                   SET pending_hint = NULL, hint_severity = NULL, consecutive_hint_count = 0
-                   WHERE conversation_id = ?""",
-                (conversation_id,),
-            )
-            await conn.commit()
-    except Exception:
-        logger.error("watchdog takeover: failed to clear state conv=%d", conversation_id, exc_info=True)
-
-    # 11. Persist takeover event
-    try:
-        from tools.watchdog import _persist_event
-        await _persist_event(
-            conversation_id, prompt_id, 0, 0,
-            "security", "redirect",
-            "Watchdog takeover activated",
-            sanitized_directive,
-            "takeover",
-            source,
-        )
-    except Exception:
-        logger.error("watchdog takeover: failed to persist event conv=%d", conversation_id, exc_info=True)
+        yield f"data: {orjson.dumps({'end_conversation': True}).decode()}\n\n"
 
 
 class _StubUser:
@@ -1244,6 +1178,148 @@ def _convert_to_jpeg_b64(image_data_b64: str) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def _maybe_compress_image(
+    img: PilImage.Image, image_data: bytes, actual_format: str
+) -> tuple[bytes, str, bool]:
+    """Compress image to WebP q90 if beneficial. Sync -- called via to_thread.
+
+    Returns:
+        (image_bytes, media_type, was_compressed) -- was_compressed is True only when
+        this function actually transcoded the image to WebP. Used to decide whether
+        fullsize can be written directly to disk (no Pillow re-encode needed).
+    """
+    COMPRESS_FORMATS = {"PNG", "BMP", "TIFF", "GIF"}
+    SIZE_THRESHOLD = 3 * 1024 * 1024  # 3 MB
+
+    # Already optimal format
+    if actual_format == "WEBP":
+        return image_data, "image/webp", False
+
+    should_compress = (
+        actual_format in COMPRESS_FORMATS
+        or len(image_data) > SIZE_THRESHOLD
+    )
+
+    if not should_compress:
+        mt = f"image/{actual_format.lower()}" if actual_format else "image/jpeg"
+        return image_data, mt, False
+
+    # Normalize mode for WebP compatibility (handles P, CMYK, LA, I, etc.)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA") if (
+            img.mode in ("PA", "LA") or img.info.get("transparency") is not None
+        ) else img.convert("RGB")
+
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", quality=90)
+    compressed = buf.getvalue()
+
+    # Only use compressed version if it is actually smaller
+    if len(compressed) < len(image_data):
+        return compressed, "image/webp", True
+
+    mt = f"image/{actual_format.lower()}" if actual_format else "image/jpeg"
+    return image_data, mt, False
+
+
+def _validate_and_compress_image(
+    image_data: bytes, filename: str
+) -> tuple[bytes, str, int, int, str, bool]:
+    """Open, validate, and optionally compress an image. Sync -- called via to_thread.
+
+    Returns:
+        (image_bytes, media_type, width, height, actual_format, was_compressed)
+
+    Raises:
+        ValueError: with user-facing error message on validation failure.
+    """
+    MAX_IMAGE_DIMENSION = 8000
+
+    try:
+        img = PilImage.open(io.BytesIO(image_data))
+        w, h = img.size
+        actual_format = img.format
+        # DO NOT call img.load() yet -- validate first to avoid decompressing pixel bombs
+    except Exception:
+        raise ValueError(f"Invalid image file: {filename}")
+
+    if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
+        raise ValueError(f"Image dimensions exceed {MAX_IMAGE_DIMENSION}px limit.")
+
+    if w * h > MAX_IMAGE_PIXELS:
+        raise ValueError("Image resolution is too high.")
+
+    # NOW safe to load pixels (validated dimensions are within bounds)
+    try:
+        img.load()
+    except Exception:
+        raise ValueError(f"Invalid image file: {filename}")
+
+    # Auto-compress
+    image_data, media_type, was_compressed = _maybe_compress_image(img, image_data, actual_format)
+
+    return image_data, media_type, w, h, actual_format, was_compressed
+
+
+def _convert_image_for_provider_sync(
+    disk_path: str, image_path: str, machine: str, force_base64: bool
+) -> dict | None:
+    """Read image from disk and convert for provider. Sync -- called via to_thread.
+
+    Returns the formatted image block dict, or None on failure (caller skips image).
+    Only called when Pillow work is needed (caller checks conditions).
+    """
+    # Branch 1: xAI WebP conversion (non-force_base64)
+    if machine == "xAI" and image_path.lower().endswith(".webp") and not force_base64:
+        try:
+            img = PilImage.open(disk_path)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            return {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+        except Exception as e:
+            logger.warning(f"[hydrate_image_for_context] Could not convert WebP for xAI, skipping image: {e}")
+            return None
+
+    # Branch 2: force_base64 (all providers)
+    if force_base64:
+        try:
+            with open(disk_path, "rb") as f:
+                raw_bytes = f.read()
+            b64 = base64.b64encode(raw_bytes).decode()
+
+            # Detect media type from file extension (not all disk files are WebP)
+            lower_path = image_path.lower()
+            if lower_path.endswith(".png"):
+                media_type = "image/png"
+            elif lower_path.endswith((".jpg", ".jpeg")):
+                media_type = "image/jpeg"
+            else:
+                media_type = "image/webp"
+
+            # xAI: WebP -> JPEG conversion
+            if machine == "xAI" and media_type == "image/webp":
+                img = PilImage.open(io.BytesIO(raw_bytes))
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                media_type = "image/jpeg"
+
+            # Claude uses a different content block format
+            if machine == "Claude":
+                return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+            return {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}}
+        except Exception as e:
+            logger.warning(f"[hydrate_image_for_context] force_base64 failed for {disk_path}: {e}")
+            return None
+
+    return None  # Should not be reached (caller checks needs_pillow)
 
 
 def format_image_for_provider(machine: str, image_url_base: str, image_data_b64: str, media_type: str):
@@ -1618,9 +1694,7 @@ async def process_save_message(
 
     if files:
         logger.debug("Has files")
-        MAX_IMAGE_SIZE_MB = 5           # Claude is the most restrictive at 5 MB
         MAX_IMAGES_PER_MESSAGE = 10     # Reasonable per-message upload limit
-        MAX_IMAGE_DIMENSION = 8000      # Claude's max dimension (<=20 images)
 
         # Classify files by type
         images = []
@@ -1664,7 +1738,7 @@ async def process_save_message(
             message_list_to_save.append(content_to_save)
             message_list_to_send.append(content_to_send)
 
-        # Validate and process images (existing logic)
+        # Validate and process images
         if len(images) > MAX_IMAGES_PER_MESSAGE:
             return JSONResponse(
                 content={'success': False, 'message': f'Maximum {MAX_IMAGES_PER_MESSAGE} images per message.'},
@@ -1673,47 +1747,70 @@ async def process_save_message(
 
         for file_item in images:
             image_data = file_item['data']
-            image_media_type = file_item.get('content_type', 'image/jpeg')
             filename = file_item.get('filename', 'image.jpg')
 
-            if len(image_data) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
-                return JSONResponse(
-                    content={'success': False, 'message': f'Image exceeds {MAX_IMAGE_SIZE_MB} MB limit.'},
-                    status_code=400
-                )
-
+            # Validate + compress in thread (does NOT block event loop)
             try:
-                img_check = PilImage.open(io.BytesIO(image_data))
-                w, h = img_check.size
-                if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
-                    return JSONResponse(
-                        content={'success': False, 'message': f'Image dimensions exceed {MAX_IMAGE_DIMENSION}px limit.'},
-                        status_code=400
-                    )
-                logger.debug(f"[process_save_message] Image validated: {filename}, {image_media_type}, {w}x{h}, {len(image_data)} bytes, provider={machine}")
-            except Exception as e:
+                image_data, image_media_type, w, h, actual_format, was_compressed = await asyncio.to_thread(
+                    _validate_and_compress_image, image_data, filename
+                )
+            except ValueError as e:
                 return JSONResponse(
-                    content={'success': False, 'message': f'Invalid image file: {filename}'},
+                    content={'success': False, 'message': str(e)},
                     status_code=400
                 )
 
+            # Post-compression size check
+            if len(image_data) > MAX_API_IMAGE_SIZE_MB * 1024 * 1024:
+                return JSONResponse(
+                    content={'success': False, 'message': 'Image is too large. Please use a smaller or lower-resolution image.'},
+                    status_code=400
+                )
+
+            logger.debug(
+                f"[process_save_message] Image processed: {filename}, "
+                f"{actual_format}, {w}x{h}, {len(image_data)} bytes, provider={machine}"
+            )
+
+            # Base64 encode (fast, stays on event loop)
             image1_data = base64.b64encode(image_data).decode("utf-8")
 
-            image_url_base_256, image_url_token_256, image_url_base_fullsize, image_url_token_fullsize = await save_image_locally(request, image_data, current_user, conversation_id, filename, "user")
-            if image_url_base_256 and image_url_token_256 and image_url_base_fullsize and image_url_token_fullsize:
-                try:
-                    image_content_to_save, image_content_to_send = format_image_for_provider(
-                        machine, image_url_base_fullsize, image1_data, image_media_type
+            # Save to disk in thread (does NOT block event loop)
+            # Only use direct-write when WE compressed it (not for user-uploaded WebPs)
+            try:
+                image_url_base_256, image_url_token_256, image_url_base_fullsize, image_url_token_fullsize = (
+                    await save_image_locally(
+                        request, image_data, current_user, conversation_id, filename, "user",
+                        pre_compressed_webp=was_compressed
                     )
-                except ValueError:
-                    return JSONResponse(
-                        content={'success': False, 'message': f'Image upload not supported for provider: {machine}'},
-                        status_code=400
-                    )
-                message_list_to_save.append(image_content_to_save)
-                message_list_to_send.append(image_content_to_send)
-            else:
+                )
+            except Exception as e:
+                logger.error(f"[process_save_message] Could not save image: {e}")
+                return JSONResponse(
+                    content={'success': False, 'message': 'Failed to save image.'},
+                    status_code=500
+                )
+
+            if not (image_url_base_256 and image_url_token_256 and image_url_base_fullsize and image_url_token_fullsize):
                 logger.error("[process_save_message] - Could not save the image")
+                continue  # Skip this image, process remaining ones
+
+            # Format for provider (in thread -- xAI may need Pillow JPEG conversion)
+            # NOTE: image_media_type here is the Pillow-detected/compression-derived type,
+            # NOT the client-reported MIME. This is correct and intentional.
+            try:
+                image_content_to_save, image_content_to_send = await asyncio.to_thread(
+                    format_image_for_provider,
+                    machine, image_url_base_fullsize, image1_data, image_media_type
+                )
+            except ValueError:
+                return JSONResponse(
+                    content={'success': False, 'message': f'Unsupported AI provider for images: {machine}'},
+                    status_code=400
+                )
+
+            message_list_to_save.append(image_content_to_save)
+            message_list_to_send.append(image_content_to_send)
 
         if user_message:
             message_content = {
@@ -2103,14 +2200,32 @@ async def save_message(
     # Convert UploadFile to dict format if files exist
     files = None
     if file:
+        # Reject early if too many files (before reading any data into memory)
+        # 13 = 10 images + 3 PDFs (MAX_IMAGES_PER_MESSAGE + MAX_PDFS_PER_MESSAGE)
+        MAX_FILES_PER_MESSAGE = 13
+        valid_files = [f for f in file if f]
+        if len(valid_files) > MAX_FILES_PER_MESSAGE:
+            return JSONResponse(
+                content={'success': False, 'message': f'Maximum {MAX_FILES_PER_MESSAGE} files per message.'},
+                status_code=400
+            )
+
         files = []
-        for f in file:
-            if f:
-                files.append({
-                    'data': await f.read(),
-                    'content_type': f.content_type,
-                    'filename': f.filename
-                })
+        for f in valid_files:
+            # Bounded read: use the larger of image/PDF limits to not truncate valid files
+            max_bytes = max(MAX_RAW_UPLOAD_SIZE_MB, MAX_PDF_SIZE_MB) * 1024 * 1024
+            data = await f.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                limit_mb = max(MAX_RAW_UPLOAD_SIZE_MB, MAX_PDF_SIZE_MB)
+                return JSONResponse(
+                    content={'success': False, 'message': f'File "{f.filename}" exceeds {limit_mb} MB limit.'},
+                    status_code=400
+                )
+            files.append({
+                'data': data,
+                'content_type': f.content_type,
+                'filename': f.filename
+            })
 
     # Convert text_compressed to bytes if it exists
     text_compressed_bytes = None
@@ -2153,6 +2268,7 @@ async def build_full_prompt_context(
         takeover_watchdog_config: dict | None
         takeover_context_messages: list | None
         takeover_source: str | None ('pre' or 'post' when action is takeover)
+        pending_hint_event_type: str (event type from watchdog hint, e.g. 'security', 'drift')
         watchdog_config: dict | None (post-watchdog config for passing to streaming)
         watchdog_hint_active: bool
         watchdog_hint_eval_id: int | None
@@ -2167,6 +2283,7 @@ async def build_full_prompt_context(
         "takeover_watchdog_config": None,
         "takeover_context_messages": None,
         "takeover_source": None,  # "pre" or "post" when action is takeover
+        "pending_hint_event_type": "",
         "watchdog_config": None,
         "watchdog_hint_active": False,
         "watchdog_hint_eval_id": None,
@@ -2354,6 +2471,7 @@ async def build_full_prompt_context(
                             )
                             pre_action = pre_result.get("action", "pass")
                             pre_hint = pre_result.get("hint", "")
+                            pre_event_type = pre_result.get("event_type", "security")
 
                             if pre_action in ("takeover", "takeover_lock"):
                                 result["action"] = pre_action
@@ -2361,6 +2479,7 @@ async def build_full_prompt_context(
                                 result["takeover_watchdog_config"] = pre_watchdog_config
                                 result["takeover_context_messages"] = context_messages
                                 result["takeover_source"] = "pre"
+                                result["pending_hint_event_type"] = pre_event_type
                                 result["watchdog_config"] = watchdog_config
                                 result["user_level"] = user_level
                                 result["original_prompt"] = prompt_base
@@ -2383,7 +2502,7 @@ async def build_full_prompt_context(
                 if post_watchdog_config and post_watchdog_config.get("enabled"):
                     watchdog_enabled = True
                     await cursor_ro.execute(
-                        """SELECT pending_hint, hint_severity, last_evaluated_message_id, consecutive_hint_count
+                        """SELECT pending_hint, hint_severity, last_evaluated_message_id, consecutive_hint_count, pending_hint_event_type
                            FROM WATCHDOG_STATE
                            WHERE conversation_id = ? AND prompt_id = ?
                            AND pending_hint IS NOT NULL""",
@@ -2393,14 +2512,42 @@ async def build_full_prompt_context(
                     if hint_row and hint_row[0]:
                         sanitized_hint = _sanitize_watchdog_directive(hint_row[0])
                         consecutive_count = hint_row[3] or 0
+                        hint_severity = hint_row[1]
+                        pending_hint_event_type = hint_row[4] or ""
 
                         if (post_watchdog_config.get("can_takeover")
+                                and hint_severity == "redirect"
                                 and consecutive_count >= post_watchdog_config.get("takeover_threshold", 5)):
-                            result["action"] = "takeover_lock" if post_watchdog_config.get("can_lock") else "takeover"
+                            from tools.watchdog import LOCKABLE_EVENT_TYPES
+                            can_lock_this = (
+                                post_watchdog_config.get("can_lock")
+                                and pending_hint_event_type in LOCKABLE_EVENT_TYPES
+                            )
+                            if can_lock_this:
+                                # Fetch real analysis for judge
+                                analysis_cursor = await cursor_ro.execute(
+                                    """SELECT analysis FROM WATCHDOG_EVENTS
+                                       WHERE conversation_id = ? AND bot_message_id = ? AND source = 'post'
+                                       LIMIT 1""",
+                                    (conversation_id, hint_row[2])
+                                )
+                                analysis_row = await analysis_cursor.fetchone()
+                                real_analysis = analysis_row[0] if analysis_row else f"Takeover escalation after {consecutive_count} ignored hints"
+
+                                from tools.watchdog import _judge_lock_decision
+                                approve, judge_reason, _ = await _judge_lock_decision(
+                                    conversation_id, effective_role_id, pending_hint_event_type, real_analysis
+                                )
+                                if not approve:
+                                    can_lock_this = False
+                                    logger.info("Lock Judge rejected takeover lock for conv=%d: %s", conversation_id, judge_reason)
+                            result["action"] = "takeover_lock" if can_lock_this else "takeover"
                             result["takeover_directive"] = sanitized_hint
                             result["takeover_watchdog_config"] = post_watchdog_config
                             result["takeover_context_messages"] = context_messages
                             result["takeover_source"] = "post"
+                            result["pending_hint_event_type"] = pending_hint_event_type
+                            result["last_evaluated_message_id"] = hint_row[2]
                             result["watchdog_config"] = watchdog_config
                             result["user_level"] = user_level
                             result["original_prompt"] = prompt_base
@@ -2649,6 +2796,7 @@ async def get_ai_response(
                                     )
                                     pre_action = pre_result.get("action", "pass")
                                     pre_hint = pre_result.get("hint", "")
+                                    pre_event_type = pre_result.get("event_type", "security")
 
                                     if pre_action in ("takeover", "takeover_lock"):
                                         # Takeover: yield from watchdog_takeover_response, then return
@@ -2668,6 +2816,7 @@ async def get_ai_response(
                                             user_api_keys=user_api_keys or {},
                                             machine=machine,
                                             model=model,
+                                            event_type=pre_event_type,
                                             source="pre",
                                         ):
                                             yield chunk
@@ -2691,7 +2840,7 @@ async def get_ai_response(
                         if post_watchdog_config and post_watchdog_config.get("enabled"):
                             watchdog_enabled = True
                             await cursor_ro.execute(
-                                """SELECT pending_hint, hint_severity, last_evaluated_message_id, consecutive_hint_count
+                                """SELECT pending_hint, hint_severity, last_evaluated_message_id, consecutive_hint_count, pending_hint_event_type
                                    FROM WATCHDOG_STATE
                                    WHERE conversation_id = ? AND prompt_id = ?
                                    AND pending_hint IS NOT NULL""",
@@ -2702,11 +2851,35 @@ async def get_ai_response(
                                 sanitized_hint = _sanitize_watchdog_directive(hint_row[0])
                                 hint_severity = hint_row[1]
                                 consecutive_count = hint_row[3] or 0
+                                pending_hint_event_type = hint_row[4] or ""
 
                                 # --- POST-WATCHDOG TAKEOVER CHECK ---
                                 if (post_watchdog_config.get("can_takeover")
+                                        and hint_severity == "redirect"
                                         and consecutive_count >= post_watchdog_config.get("takeover_threshold", 5)):
-                                    should_lock_post = post_watchdog_config.get("can_lock", False)
+                                    from tools.watchdog import LOCKABLE_EVENT_TYPES
+                                    can_lock_post = (
+                                        post_watchdog_config.get("can_lock", False)
+                                        and pending_hint_event_type in LOCKABLE_EVENT_TYPES
+                                    )
+                                    if can_lock_post:
+                                        # Fetch real analysis for judge
+                                        analysis_cursor = await cursor_ro.execute(
+                                            """SELECT analysis FROM WATCHDOG_EVENTS
+                                               WHERE conversation_id = ? AND bot_message_id = ? AND source = 'post'
+                                               LIMIT 1""",
+                                            (conversation_id, hint_row[2])
+                                        )
+                                        analysis_row = await analysis_cursor.fetchone()
+                                        real_analysis = analysis_row[0] if analysis_row else f"Takeover escalation after {consecutive_count} ignored hints"
+
+                                        from tools.watchdog import _judge_lock_decision
+                                        approve, judge_reason, _ = await _judge_lock_decision(
+                                            conversation_id, effective_role_id, pending_hint_event_type, real_analysis
+                                        )
+                                        if not approve:
+                                            can_lock_post = False
+                                            logger.info("Lock Judge rejected takeover lock for conv=%d: %s", conversation_id, judge_reason)
                                     async for chunk in watchdog_takeover_response(
                                         conversation_id=conversation_id,
                                         prompt_id=prompt_id,
@@ -2717,12 +2890,13 @@ async def get_ai_response(
                                         context_messages=context_messages,
                                         user_message=user_message,
                                         message=message,
-                                        should_lock=should_lock_post,
+                                        should_lock=can_lock_post,
                                         current_user=current_user,
                                         request=request,
                                         user_api_keys=user_api_keys or {},
                                         machine=machine,
                                         model=model,
+                                        event_type=pending_hint_event_type,
                                         source="post",
                                     ):
                                         yield chunk

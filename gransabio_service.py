@@ -1408,14 +1408,16 @@ async def process_gransabio_external(
                         "Billing failed for watchdog response. Content not delivered.")
                     return
 
-            # Lock conversation if takeover_lock
-            if prompt_ctx["action"] == "takeover_lock":
-                async with get_db_connection() as conn:
-                    await conn.execute(
-                        "UPDATE CONVERSATIONS SET locked = 1 WHERE id = ?",
-                        (conversation_id,),
-                    )
-                    await conn.commit()
+            # Finalize takeover (lock if needed, clean state, persist event)
+            from tools.watchdog import _finalize_takeover
+            takeover_event_type = prompt_ctx.get("pending_hint_event_type", "security")
+            should_lock_gs = (prompt_ctx["action"] == "takeover_lock")
+            await _finalize_takeover(
+                conversation_id, prompt_id or 0, takeover_event_type,
+                prompt_ctx["takeover_directive"] or "",
+                channel="gransabio", should_lock=should_lock_gs,
+                locked_reason=f"WATCHDOG_{takeover_event_type.upper()}_TAKEOVER" if should_lock_gs else None,
+            )
             return
 
         # Normal flow: extract assembled prompt fields

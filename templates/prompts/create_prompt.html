@@ -865,35 +865,31 @@
         const postEnabled = document.getElementById('postWatchdogEnabled').checked;
 
         const preConfig = { enabled: preEnabled };
-        if (preEnabled) {
-            const llmId = document.getElementById('preWatchdogLLM').value;
-            preConfig.llm_id = llmId ? parseInt(llmId) : null;
-            preConfig.objectives = document.getElementById('preWatchdogObjectives').value
-                .split('\n').map(s => s.trim()).filter(s => s.length > 0);
-            preConfig.steering_prompt = document.getElementById('preWatchdogSteeringPrompt').value.trim();
-            preConfig.frequency = parseInt(document.getElementById('preWatchdogFrequency').value) || 1;
-            preConfig.can_takeover = document.getElementById('preWatchdogCanTakeover').checked;
-            preConfig.can_lock = document.getElementById('preWatchdogCanLock').checked;
-        }
+        const preLlmId = document.getElementById('preWatchdogLLM').value;
+        preConfig.llm_id = preLlmId ? parseInt(preLlmId) : null;
+        preConfig.objectives = document.getElementById('preWatchdogObjectives').value
+            .split('\n').map(s => s.trim()).filter(s => s.length > 0);
+        preConfig.steering_prompt = document.getElementById('preWatchdogSteeringPrompt').value.trim();
+        preConfig.frequency = parseInt(document.getElementById('preWatchdogFrequency').value) || 1;
+        preConfig.can_takeover = document.getElementById('preWatchdogCanTakeover').checked;
+        preConfig.can_lock = document.getElementById('preWatchdogCanLock').checked;
 
         const postConfig = { enabled: postEnabled };
-        if (postEnabled) {
-            const llmId = document.getElementById('postWatchdogLLM').value;
-            postConfig.llm_id = llmId ? parseInt(llmId) : null;
-            postConfig.mode = document.getElementById('postWatchdogMode').value;
-            postConfig.objectives = document.getElementById('postWatchdogObjectives').value
-                .split('\n').map(s => s.trim()).filter(s => s.length > 0);
-            postConfig.steering_prompt = document.getElementById('postWatchdogSteeringPrompt').value.trim();
-            postConfig.frequency = parseInt(document.getElementById('postWatchdogFrequency').value) || 3;
-            postConfig.max_hint_chars = parseInt(document.getElementById('postWatchdogMaxHintChars').value) || 500;
-            postConfig.thresholds = {
-                max_turns_off_topic: parseInt(document.getElementById('postWatchdogMaxOffTopic').value) || 3,
-                max_turns_same_subtopic: parseInt(document.getElementById('postWatchdogMaxSameSubtopic').value) || 5
-            };
-            postConfig.can_takeover = document.getElementById('postWatchdogCanTakeover').checked;
-            postConfig.takeover_threshold = parseInt(document.getElementById('postWatchdogTakeoverThreshold').value) || 5;
-            postConfig.can_lock = document.getElementById('postWatchdogCanLock').checked;
-        }
+        const postLlmId = document.getElementById('postWatchdogLLM').value;
+        postConfig.llm_id = postLlmId ? parseInt(postLlmId) : null;
+        postConfig.mode = document.getElementById('postWatchdogMode').value;
+        postConfig.objectives = document.getElementById('postWatchdogObjectives').value
+            .split('\n').map(s => s.trim()).filter(s => s.length > 0);
+        postConfig.steering_prompt = document.getElementById('postWatchdogSteeringPrompt').value.trim();
+        postConfig.frequency = parseInt(document.getElementById('postWatchdogFrequency').value) || 3;
+        postConfig.max_hint_chars = parseInt(document.getElementById('postWatchdogMaxHintChars').value) || 500;
+        postConfig.thresholds = {
+            max_turns_off_topic: parseInt(document.getElementById('postWatchdogMaxOffTopic').value) || 3,
+            max_turns_same_subtopic: parseInt(document.getElementById('postWatchdogMaxSameSubtopic').value) || 5
+        };
+        postConfig.can_takeover = document.getElementById('postWatchdogCanTakeover').checked;
+        postConfig.takeover_threshold = parseInt(document.getElementById('postWatchdogTakeoverThreshold').value) || 5;
+        postConfig.can_lock = document.getElementById('postWatchdogCanLock').checked;
 
         const config = { pre_watchdog: preConfig, post_watchdog: postConfig };
         document.getElementById('watchdogConfigInput').value = JSON.stringify(config);

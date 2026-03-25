@@ -2,6 +2,7 @@
 
 import os
 import io
+import asyncio
 import hashlib
 import redis
 import aiosqlite
@@ -41,6 +42,73 @@ if USE_REDIS:
         decode_responses=True
     )
 
+def _save_image_to_disk(
+    image_data: bytes, username: str, conversation_id: int,
+    source: str, format: str = 'webp', pre_compressed_webp: bool = False
+) -> tuple[str, str, str, str]:
+    """Sync helper: hash, create dirs, open/resize/save image to disk.
+
+    Args:
+        pre_compressed_webp: If True, image_data is already WebP — write fullsize
+            directly to disk without Pillow re-encode. Only thumbnail uses Pillow.
+
+    Returns:
+        (file_hash, ext, base_url_256, base_url_fullsize)
+    """
+    # User hash-based path
+    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
+
+    # Conversation ID path components (7-digit zero-padded)
+    conversation_id_str = f"{conversation_id:07d}"
+    conversation_id_prefix1 = conversation_id_str[:3]
+    conversation_id_prefix2 = conversation_id_str[3:]
+
+    # Build directory path
+    file_location = os.path.join(
+        users_directory, hash_prefix1, hash_prefix2, user_hash,
+        "files", conversation_id_prefix1, conversation_id_prefix2, "img", source
+    )
+    os.makedirs(file_location, exist_ok=True)
+
+    # Hash + filenames
+    ext = format.lower()
+    file_hash = hashlib.sha1(image_data).hexdigest()
+    filename_256 = f"{file_hash}_256.{ext}"
+    filename_fullsize = f"{file_hash}_fullsize.{ext}"
+    file_path_256 = os.path.join(file_location, filename_256)
+    file_path_fullsize = os.path.join(file_location, filename_fullsize)
+
+    # Open image for thumbnail (always needed for resize)
+    image = PilImage.open(io.BytesIO(image_data))
+
+    # Normalize mode for WebP compatibility (CMYK, P, LA, I, etc.)
+    if ext == 'webp' and image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGBA") if (
+            image.mode in ("PA", "LA") or image.info.get("transparency") is not None
+        ) else image.convert("RGB")
+
+    # Thumbnail
+    width, height = image.size
+    if width <= 256 and height <= 256:
+        image_256 = image
+    else:
+        image_256 = resize_image(image, 256)
+    image_256.save(file_path_256, ext.upper())
+
+    # Fullsize: write directly if pre-compressed, otherwise re-encode via Pillow
+    if pre_compressed_webp and ext == 'webp':
+        with open(file_path_fullsize, 'wb') as f:
+            f.write(image_data)
+    else:
+        image.save(file_path_fullsize, ext.upper())
+
+    # Return base URLs for token/Cloudflare URL generation
+    base_url_256 = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_256}"
+    base_url_fullsize = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_fullsize}"
+
+    return file_hash, ext, base_url_256, base_url_fullsize
+
+
 async def save_image_locally(
     request: Optional[Request],
     image_data: bytes,
@@ -51,61 +119,27 @@ async def save_image_locally(
     format: str = 'webp',
     scheme: Optional[str] = None,
     host: Optional[str] = None,
-    port: Optional[int] = None
+    port: Optional[int] = None,
+    pre_compressed_webp: bool = False
 ) -> tuple:
-    # Generate user hash
-    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
-    
-    # Create the conversation prefixes according to the specified format
-    conversation_id_str = f"{conversation_id:07d}"
-    conversation_id_prefix1 = conversation_id_str[:3]
-    conversation_id_prefix2 = conversation_id_str[3:]
-    
-    # Build directory path
-    file_location = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "files", conversation_id_prefix1, conversation_id_prefix2, "img", source)
-    
-    # Create directory if it does not exist
-    if not os.path.exists(file_location):
-        os.makedirs(file_location)
+    """Save image to disk (in thread) and generate access URLs.
 
-    # Load image from received bytes
-    image = PilImage.open(io.BytesIO(image_data))
+    Args:
+        pre_compressed_webp: If True, skip Pillow re-encode for fullsize (write bytes directly).
+    """
+    # All Pillow + filesystem work runs in a thread
+    file_hash, ext, base_url_256, base_url_fullsize = await asyncio.to_thread(
+        _save_image_to_disk,
+        image_data, current_user.username, conversation_id, source, format,
+        pre_compressed_webp
+    )
 
-    # Check if the image is smaller than 256x256
-    width, height = image.size
-    if width <= 256 and height <= 256:
-        # If the image is smaller, we don't resize it
-        image_256 = image
-    else:
-        # If it's larger, we resize while maintaining the aspect ratio
-        image_256 = resize_image(image, 256)
-
-    # Generate unique file names
-    file_hash = hashlib.sha1(image_data).hexdigest()
-    
-    # Use specified format
-    ext = format.lower()
-    
-    filename_256 = f"{file_hash}_256.{ext}"
-    filename_fullsize = f"{file_hash}_fullsize.{ext}"
-
-    file_path_256 = os.path.join(file_location, filename_256)
-    file_path_fullsize = os.path.join(file_location, filename_fullsize)
-
-    # Save image (resized or not) as _256
-    image_256.save(file_path_256, ext.upper())
-
-    # Save original image as fullsize
-    image.save(file_path_fullsize, ext.upper())
-    
-    base_url_256 = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_256}"
-    base_url_fullsize = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_fullsize}"
-
+    # URL generation (lightweight, stays on event loop)
     if CLOUDFLARE_FOR_IMAGES:
         # Generate signed Cloudflare URLs
         image_link_token_256 = generate_signed_url_cloudflare(base_url_256, expiration_seconds=3600)
         image_link_token_fullsize = generate_signed_url_cloudflare(base_url_fullsize, expiration_seconds=3600)
-        
+
         image_link_base_256 = f"{CLOUDFLARE_BASE_URL}{base_url_256}"
         image_link_base_fullsize = f"{CLOUDFLARE_BASE_URL}{base_url_fullsize}"
     else:
@@ -115,10 +149,10 @@ async def save_image_locally(
 
         token_256 = generate_img_token(base_url_256, new_expiration, current_user)
         token_fullsize = generate_img_token(base_url_fullsize, new_expiration, current_user)
-        
+
         token_url_256 = f"{base_url_256}?token={token_256}"
         token_url_fullsize = f"{base_url_fullsize}?token={token_fullsize}"
-        
+
         # Use provided scheme, host and port or extract them from request object
         if scheme is None or host is None:
             if request is not None:
