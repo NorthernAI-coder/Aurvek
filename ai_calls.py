@@ -5758,25 +5758,20 @@ async def atFieldActivate(suspicious_text, messages, model, temperature, max_tok
         yield chunk
 
 
-async def change_response_mode(user_id: int, new_mode: str):
+async def change_response_mode(user_id: int, new_mode: str, platform: str = "whatsapp"):
     """
-    Change the response mode for WhatsApp (voice/text).
+    Change the response mode for a platform conversation (voice/text).
     Creates its own DB connection to avoid circular dependency.
     """
     try:
         async with get_db_connection() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute('SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?', (user_id,))
-                result = await cursor.fetchone()
-                external_platforms = orjson.loads(result[0]) if result and result[0] else {}
-
-                whatsapp_data = external_platforms.get('whatsapp', {})
-                whatsapp_data["answer"] = new_mode
-                external_platforms['whatsapp'] = whatsapp_data
-
-                await cursor.execute('UPDATE USER_DETAILS SET external_platforms = ? WHERE user_id = ?',
-                                     (orjson.dumps(external_platforms).decode(), user_id))
-                await conn.commit()
+            await conn.execute(
+                """UPDATE USER_DETAILS SET external_platforms =
+                   json_set(COALESCE(NULLIF(external_platforms, ''), '{}'), ?, ?)
+                   WHERE user_id = ?""",
+                (f'$.{platform}.answer', new_mode, user_id),
+            )
+            await conn.commit()
 
         return f"Changed to {'voice' if new_mode == 'voice' else 'text'} mode"
     except Exception as e:
@@ -6309,9 +6304,32 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 arguments = function_arguments
                 new_mode = arguments["mode"]
 
-                # Use read-write connection inside the function
-                confirmation_message = await change_response_mode(user_id, new_mode)
-                # Add separator if there's pre-tool content from Claude
+                target_platform = None
+                async with get_db_connection(readonly=True) as ro_conn:
+                    p_cursor = await ro_conn.execute(
+                        'SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?',
+                        (user_id,),
+                    )
+                    p_row = await p_cursor.fetchone()
+                    if p_row and p_row[0]:
+                        external_platforms = orjson.loads(p_row[0])
+                        for platform_name, platform_data in external_platforms.items():
+                            if (
+                                isinstance(platform_data, dict)
+                                and platform_data.get('conversation_id') == conversation_id
+                            ):
+                                target_platform = platform_name
+                                break
+
+                if not target_platform:
+                    confirmation_message = "Response mode can only be changed for WhatsApp or Telegram conversations."
+                else:
+                    confirmation_message = await change_response_mode(
+                        user_id,
+                        new_mode,
+                        target_platform,
+                    )
+
                 if content:
                     content += "\n\n"
                 content += confirmation_message

@@ -40,6 +40,79 @@ from security_config import is_forbidden_prompt_name
 
 router = APIRouter()
 
+
+async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
+    """
+    Single-prompt access check. Returns True if the user is allowed to use prompt_id.
+    Respects admin, owner/edit permissions, and public_prompts_access + category_access.
+    """
+    if await user.is_admin:
+        return True
+
+    await cursor.execute(
+        "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
+        (prompt_id, user.id),
+    )
+    perm = await cursor.fetchone()
+    if perm and perm[0] in ("owner", "edit", "access"):
+        return True
+
+    await cursor.execute(
+        """SELECT 1 FROM PACK_ACCESS pa
+           JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
+           WHERE pa.user_id = ?
+             AND pi.prompt_id = ?
+             AND pi.is_active = 1
+             AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now'))
+             AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
+        (user.id, prompt_id),
+    )
+    if await cursor.fetchone():
+        return True
+
+    await cursor.execute(
+        "SELECT public, purchase_price FROM PROMPTS WHERE id = ?",
+        (prompt_id,),
+    )
+    prompt_row = await cursor.fetchone()
+    if not prompt_row:
+        return False
+
+    is_public = prompt_row[0]
+    purchase_price = prompt_row[1]
+    if not is_public:
+        return False
+
+    await cursor.execute(
+        "SELECT all_prompts_access, public_prompts_access, category_access FROM USER_DETAILS WHERE user_id = ?",
+        (user.id,),
+    )
+    user_details = await cursor.fetchone()
+    if not user_details:
+        return False
+
+    all_prompts_access, public_prompts_access, category_access = user_details
+
+    if all_prompts_access:
+        return True
+
+    if not public_prompts_access:
+        return False
+
+    if purchase_price is not None and purchase_price > 0:
+        return False
+
+    if category_access is None:
+        return True
+
+    await cursor.execute(
+        """SELECT 1 FROM PROMPT_CATEGORIES pc
+           WHERE pc.prompt_id = ?
+           AND pc.category_id IN (SELECT value FROM json_each(?))""",
+        (prompt_id, category_access),
+    )
+    return await cursor.fetchone() is not None
+
 @router.get("/prompts", response_class=HTMLResponse)
 async def list_prompts(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None:

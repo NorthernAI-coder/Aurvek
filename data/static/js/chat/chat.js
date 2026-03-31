@@ -2219,18 +2219,7 @@ function createPlatformLink(platform, conversation) {
 
         return container;
     } else {
-        // Unassigned — check if conversation is already assigned to another platform
         const otherPlatform = conversation.external_platform;
-        if (otherPlatform && otherPlatform !== platform) {
-            const link = document.createElement('a');
-            link.href = '#';
-            link.classList.add('platform-link', 'disabled');
-            link.innerHTML = `<i class="fab ${icon}"></i> Use for ${platformName}`;
-            link.title = `Already assigned to ${otherPlatform}`;
-            link.style.opacity = '0.5';
-            link.style.pointerEvents = 'none';
-            return link;
-        }
 
         const link = document.createElement('a');
         link.href = '#';
@@ -2239,6 +2228,16 @@ function createPlatformLink(platform, conversation) {
         link.addEventListener('click', function(e) {
             e.stopPropagation();
             closeAllChatMenus();
+            if (otherPlatform && otherPlatform !== platform) {
+                const otherName = otherPlatform === 'whatsapp' ? 'WhatsApp' : 'Telegram';
+                const targetName = platform === 'whatsapp' ? 'WhatsApp' : 'Telegram';
+                NotificationModal.confirm(
+                    'Move Conversation',
+                    `This conversation is on ${otherName}. Move it to ${targetName}?`,
+                    () => toggleExternalPlatform(conversation.id, platform, isAssigned)
+                );
+                return;
+            }
             toggleExternalPlatform(conversation.id, platform, isAssigned);
         });
         return link;
@@ -2258,15 +2257,42 @@ const toggleExternalPlatform = withSession(function(conversationId, platform, is
     .then(response => response.json())
     .then(data => {
         if (data.success) {
-            updateConversationElement(conversationId, data.updatedConversations.find(conv => conv.id === parseInt(conversationId)), data.updatedConversations);
+            const updatedConversation = data.updatedConversations.find(
+                conv => conv.id === parseInt(conversationId)
+            );
+
+            if (updatedConversation) {
+                updateConversationElement(conversationId, updatedConversation, data.updatedConversations);
+            } else {
+                const externalChatsContainer = document.querySelector('#external-chats-container');
+                const dynamicChatsContainer = document.querySelector('#dynamic-chats-container');
+
+                document.querySelectorAll(`[data-conversation-id="${conversationId}"]`).forEach(el => el.remove());
+
+                data.updatedConversations.forEach(conv => {
+                    const existingElement = document.querySelector(`[data-conversation-id="${conv.id}"]`);
+                    if (existingElement) {
+                        updateSingleConversation(existingElement, conv, externalChatsContainer, dynamicChatsContainer);
+                    } else {
+                        const newElement = document.createElement('a');
+                        updateSingleConversation(newElement, conv, externalChatsContainer, dynamicChatsContainer);
+                    }
+                });
+
+                sortDynamicChats();
+                updateExternalSection();
+            }
         } else if (data.error === 'no_phone_number') {
             showPhoneRequiredModal(platform);
+        } else if (data.message) {
+            NotificationModal.error('Assignment Error', data.message);
         } else {
             console.error('Error updating external platform:', data.error);
         }
     })
     .catch(error => {
         console.error('Error:', error);
+        NotificationModal.error('Assignment Error', 'Could not update the external platform assignment.');
     });
 });
 
@@ -2355,6 +2381,11 @@ function updateSingleConversation(element, conversationData, externalContainer, 
     element.dataset.conversationId = conversationData.id;
     element.dataset.lastActivity = conversationData.last_activity || '';
     element.dataset.machine = conversationData.machine || 'undefined';
+    if (conversationData.external_platform) {
+        element.dataset.externalPlatform = conversationData.external_platform;
+    } else {
+        delete element.dataset.externalPlatform;
+    }
 
     // Wrap name in .chat-name span (matches addConversationElement structure)
     const nameSpan = document.createElement('span');
@@ -2375,12 +2406,12 @@ function updateSingleConversation(element, conversationData, externalContainer, 
 
     if (element.parentElement !== targetContainer) {
         if (targetContainer === externalContainer) {
-            const currentExternalChat = externalContainer.firstElementChild;
-            if (currentExternalChat) {
-                currentExternalChat.classList.remove('active-chat');
-                dynamicContainer.insertBefore(currentExternalChat, dynamicContainer.firstChild);
+            const existingForPlatform = externalContainer.querySelector(
+                `[data-external-platform="${conversationData.external_platform}"]`
+            );
+            if (existingForPlatform && existingForPlatform !== element) {
+                existingForPlatform.remove();
             }
-            externalContainer.innerHTML = '';
             externalContainer.appendChild(element);
         } else {
             dynamicContainer.appendChild(element); 

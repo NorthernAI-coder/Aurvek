@@ -133,6 +133,15 @@ from system_prompt_defaults import (
 
 from ai_calls import router as ai_router
 from ai_calls import save_message, process_save_message, get_ai_response, handle_function_call, call_o1_api, call_gpt_api, call_claude_api, call_gemini_api, stop_signals, get_last_message_id, conversation_write_lock
+from external_chat_management import (
+    _create_conversation_core,
+    can_use_platform,
+    create_new_platform_conversation,
+    ensure_platform_conversation,
+    get_chats_list,
+    mutate_external_platforms,
+    set_external_conversation,
+)
 
 from prompts import router as prompts_router
 from packs_router import router as packs_router
@@ -140,6 +149,7 @@ from packs_router import warmup_pack_landing_cache, _pack_landing_cache_stats, _
 from prompts import get_user_accessible_prompts as get_user_role_accessible_prompts, get_user_owned_prompts, create_prompt_directory, get_prompt_info, get_prompt_path, get_pack_path, get_prompt_templates_dir, get_prompt_components_dir, can_manage_prompt, get_manageable_prompts
 from prompts import get_user_directory, get_user_prompts_directory, list_prompts, process_prompt_image_upload, create_prompt, create_prompt_post, edit_prompt, update_prompt, delete_prompt, delete_prompt_image
 from prompts import get_landing_registration_config, set_landing_registration_config, get_prompt_owner_id, DEFAULT_LANDING_REGISTRATION_CONFIG
+from prompts import can_user_access_prompt
 from landing_wizard import is_claude_available, list_prompt_files, delete_all_landing_files, list_welcome_files, delete_all_welcome_files
 from landing_jobs import start_job, get_job, get_active_job_for_prompt, get_active_welcome_job_for_prompt, cleanup_old_jobs
 from security_guard_llm import check_security, is_security_guard_enabled
@@ -874,84 +884,6 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
 
     prompts = await cursor.fetchall()
     return [{"id": p[0], "text": p[1], "created_by_username": p[2], "public_id": p[3], "name": p[1], "custom_domain": p[4], "is_favorite": bool(p[5]), "is_mine": bool(p[6])} for p in prompts]
-
-
-async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
-    """
-    Single-prompt access check. Returns True if the user is allowed to use prompt_id.
-    Respects admin, owner/edit permissions, and public_prompts_access + category_access.
-    """
-    if await user.is_admin:
-        return True
-
-    # Check owner/edit permission
-    await cursor.execute(
-        "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
-        (prompt_id, user.id)
-    )
-    perm = await cursor.fetchone()
-    if perm and perm[0] in ('owner', 'edit', 'access'):
-        return True
-
-    # Check pack-granted access (user has PACK_ACCESS to a pack containing this prompt)
-    await cursor.execute(
-        """SELECT 1 FROM PACK_ACCESS pa
-           JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
-           WHERE pa.user_id = ?
-             AND pi.prompt_id = ?
-             AND pi.is_active = 1
-             AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now'))
-             AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
-        (user.id, prompt_id)
-    )
-    if await cursor.fetchone():
-        return True
-
-    # Check if prompt is public and user has public access with matching category
-    await cursor.execute("SELECT public, purchase_price FROM PROMPTS WHERE id = ?", (prompt_id,))
-    prompt_row = await cursor.fetchone()
-    if not prompt_row:
-        return False
-
-    is_public = prompt_row[0]
-    purchase_price = prompt_row[1]
-    if not is_public:
-        return False
-
-    # Prompt is public - check user's public_prompts_access and category restrictions
-    await cursor.execute(
-        "SELECT all_prompts_access, public_prompts_access, category_access FROM USER_DETAILS WHERE user_id = ?",
-        (user.id,)
-    )
-    ud = await cursor.fetchone()
-    if not ud:
-        return False
-
-    all_prompts_access, public_prompts_access, category_access = ud
-
-    if all_prompts_access:
-        return True
-
-    if not public_prompts_access:
-        return False
-
-    # VIP gate: paid prompts require explicit access (purchase or permission)
-    if purchase_price is not None and purchase_price > 0:
-        return False
-
-    # public_prompts_access is True - check category restrictions
-    if category_access is None:
-        # No category restriction: access to all public prompts
-        return True
-
-    # Filter by allowed categories
-    await cursor.execute(
-        """SELECT 1 FROM PROMPT_CATEGORIES pc
-           WHERE pc.prompt_id = ?
-           AND pc.category_id IN (SELECT value FROM json_each(?))""",
-        (prompt_id, category_access)
-    )
-    return await cursor.fetchone() is not None
 
 
 async def can_user_access_pack(user: User, pack_id: int, cursor) -> bool:
@@ -10302,7 +10234,7 @@ async def update_external_platform(
     current_user: User = Depends(get_current_user)
 ):
     if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
+        raise HTTPException(status_code=401, detail="Unauthorized")
     
     platform = data.get('platform')
     action = data.get('action')
@@ -10313,66 +10245,62 @@ async def update_external_platform(
     if action == 'add' and platform not in ['whatsapp', 'telegram']:
         raise HTTPException(status_code=400, detail="Invalid platform")
 
-    # Check that user has a phone number before assigning to any platform
+    visible_limit = min(max(1, int(data.get('visible_count', 10))), 50)
+    platform_conversation = None
+
     if action == 'add':
+        result = await set_external_conversation(
+            current_user.id,
+            conversation_id,
+            platform,
+            platform,
+        )
+        if not result["success"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": result["error"],
+                    "message": result["message"],
+                },
+            )
+    else:
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
             await cursor.execute(
-                'SELECT phone_number FROM USERS WHERE id = ?', (current_user.id,)
+                'SELECT user_id FROM conversations WHERE id = ?',
+                (conversation_id,),
             )
-            phone_row = await cursor.fetchone()
-            if not phone_row or not phone_row[0]:
+            row = await cursor.fetchone()
+            if not row or row[0] != current_user.id:
                 return JSONResponse(
-                    status_code=400,
+                    status_code=403,
                     content={
                         "success": False,
-                        "error": "no_phone_number",
-                        "message": "You need to set your phone number in Settings before assigning a conversation to a messaging platform.",
+                        "error": "conversation_not_found",
+                        "message": "Conversation not found.",
                     },
                 )
 
-    async with get_db_connection() as conn:
-        cursor = await conn.cursor()
-        
-        # Verify that conversation belongs to user
-        await cursor.execute('SELECT user_id FROM conversations WHERE id = ?', (conversation_id,))
-        result = await cursor.fetchone()
-        if not result or result[0] != current_user.id:
-            raise HTTPException(status_code=403, detail="Access denied")
-
-        # Get the current external platforms
-        await cursor.execute('SELECT external_platforms FROM user_details WHERE user_id = ?', (current_user.id,))
-        result = await cursor.fetchone()
-        external_platforms = orjson.loads(result[0]) if result and result[0] else {}
-
-        if action == 'add':
-            # Delete conversation from any other platform
-            for p in external_platforms:
-                if external_platforms[p].get('conversation_id') == conversation_id:
-                    del external_platforms[p]['conversation_id']
-
-            # Delete any existing conversation for current platform
-            if platform in external_platforms:
-                external_platforms[platform].pop('conversation_id', None)
-
-            # Add or update the platform
-            if platform not in external_platforms:
-                external_platforms[platform] = {}
-            external_platforms[platform]['conversation_id'] = conversation_id
-        elif action == 'remove':
+        def _web_remove(platforms):
             if platform == 'all':
-                for p in external_platforms:
-                    if external_platforms[p].get('conversation_id') == conversation_id:
-                        del external_platforms[p]['conversation_id']
-            elif platform in external_platforms and external_platforms[platform].get('conversation_id') == conversation_id:
-                del external_platforms[platform]['conversation_id']
+                for platform_name in list(platforms.keys()):
+                    if (
+                        isinstance(platforms.get(platform_name), dict)
+                        and platforms[platform_name].get('conversation_id') == conversation_id
+                    ):
+                        platforms[platform_name].pop('conversation_id', None)
+            elif (
+                platform in platforms
+                and isinstance(platforms.get(platform), dict)
+                and platforms[platform].get('conversation_id') == conversation_id
+            ):
+                platforms[platform].pop('conversation_id', None)
 
-        # Update the database
-        await cursor.execute('UPDATE user_details SET external_platforms = ? WHERE user_id = ?',
-                             (orjson.dumps(external_platforms).decode('utf-8'), current_user.id))
-        await conn.commit()
+        await mutate_external_platforms(current_user.id, _web_remove)
 
-        # Get only currently visible conversations
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
         await cursor.execute('''
             SELECT c.id, c.user_id, c.start_date, c.chat_name,
                    CASE
@@ -10386,11 +10314,9 @@ async def update_external_platform(
             WHERE c.user_id = ?
             ORDER BY c.last_activity DESC, c.id DESC
             LIMIT ?
-        ''', (current_user.id, min(max(1, int(data.get('visible_count', 10))), 50)))
+        ''', (current_user.id, visible_limit))
         visible_conversations = await cursor.fetchall()
 
-        # Get platform conversation if not in visible ones
-        platform_conversation = None
         if action == 'add':
             platform_label = platform
             await cursor.execute('''
@@ -10556,57 +10482,6 @@ async def start_new_conversation(
     
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
-        
-        await cursor.execute('''
-            SELECT llm_id, current_prompt_id
-            FROM USER_DETAILS
-            WHERE user_id = ?
-        ''', (current_user.id,))
-        user_details = await cursor.fetchone()
-        
-        if not user_details:
-            raise HTTPException(status_code=404, detail='User details not found')
-        
-        llm_id, current_prompt_id = user_details
-
-        # Use the provided prompt_id or the user's current_prompt_id
-        prompt_id = request.prompt_id if request.prompt_id is not None else current_prompt_id
-
-        forced_llm_id_value = None
-        allowed_llms_value = None
-        hide_llm_name_value = None
-
-        # Validate prompt access
-        if prompt_id and not await can_user_access_prompt(current_user, prompt_id, cursor):
-            raise HTTPException(status_code=403, detail="Access denied to this prompt")
-
-        # Check if prompt has forced_llm_id or extensions - load prompt config
-        extensions_enabled_value = False
-        is_paid_value = False
-        disable_web_search_value = False
-        force_web_search_value = False
-        if prompt_id:
-            await cursor.execute('''
-                SELECT forced_llm_id, allowed_llms, hide_llm_name, extensions_enabled, COALESCE(is_paid, 0),
-                       COALESCE(disable_web_search, 0), COALESCE(force_web_search, 0)
-                FROM PROMPTS WHERE id = ?
-            ''', (prompt_id,))
-            prompt_llm = await cursor.fetchone()
-            forced_llm_id_value = prompt_llm[0] if prompt_llm else None
-            allowed_llms_value = prompt_llm[1] if prompt_llm else None
-            hide_llm_name_value = prompt_llm[2] if prompt_llm else None
-            extensions_enabled_value = bool(prompt_llm[3]) if prompt_llm else False
-            is_paid_value = bool(prompt_llm[4]) if prompt_llm else False
-            disable_web_search_value = bool(prompt_llm[5]) if prompt_llm else False
-            force_web_search_value = bool(prompt_llm[6]) if prompt_llm else False
-            if forced_llm_id_value:
-                llm_id = forced_llm_id_value
-                logger.info(f"[FORCED_LLM] Prompt {prompt_id} has forced_llm_id={llm_id}, overriding user default")
-            elif allowed_llms_value:
-                allowed_ids = orjson.loads(allowed_llms_value)
-                if allowed_ids and int(llm_id) not in allowed_ids:
-                    llm_id = allowed_ids[0]
-                    logger.info(f"[ALLOWED_LLMS] User default LLM not in allowed list for prompt {prompt_id}, using first allowed: {llm_id}")
 
         # Validate folder_id if provided
         if request.folder_id is not None:
@@ -10616,85 +10491,98 @@ async def start_new_conversation(
             )
             if not await cursor.fetchone():
                 raise HTTPException(status_code=400, detail="Invalid folder_id or folder does not belong to user")
-        
-        # If extensions enabled, find the default extension
-        default_extension_id = None
-        if extensions_enabled_value and prompt_id:
-            await cursor.execute('''
-                SELECT id FROM PROMPT_EXTENSIONS
-                WHERE prompt_id = ? AND is_default = 1
-                LIMIT 1
-            ''', (prompt_id,))
-            default_ext = await cursor.fetchone()
-            if not default_ext:
-                # No explicit default, use first by display_order
-                await cursor.execute('''
-                    SELECT id FROM PROMPT_EXTENSIONS
-                    WHERE prompt_id = ?
-                    ORDER BY display_order
-                    LIMIT 1
-                ''', (prompt_id,))
-                default_ext = await cursor.fetchone()
-            if default_ext:
-                default_extension_id = default_ext[0]
 
-        # Insert new conversation
-        await cursor.execute('''
-            INSERT INTO CONVERSATIONS (user_id, llm_id, role_id, folder_id, active_extension_id, last_activity)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            RETURNING id, last_activity
-        ''', (current_user.id, llm_id, prompt_id, request.folder_id, default_extension_id))
+        try:
+            conversation_id = await _create_conversation_core(
+                current_user.id,
+                cursor,
+                current_user,
+                prompt_id=request.prompt_id,
+                folder_id=request.folder_id,
+                strict_prompt_access=True,
+            )
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Access denied to this prompt")
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
 
-        new_conv_row = await cursor.fetchone()
-
-        if not new_conv_row:
-            raise HTTPException(status_code=500, detail='Failed to create conversation')
-
-        conversation_id = new_conv_row[0]
-        conversation_last_activity = new_conv_row[1]
         logger.info(f"[SUCCESS] NEW CONVERSATION CREATED - ID: {conversation_id}, folder_id: {request.folder_id}")
-        
-        # Get additional information
-        await cursor.execute('''
-            SELECT
-                (SELECT l.machine FROM LLM l WHERE l.id = ?) AS machine,
-                (SELECT l.model FROM LLM l WHERE l.id = ?) AS llm_model,
-                (SELECT p.name FROM PROMPTS p WHERE p.id = ?) AS prompt_name
-        ''', (llm_id, llm_id, prompt_id))
 
-        machine, llm_model, prompt_name = await cursor.fetchone()
+        await cursor.execute(
+            """
+            SELECT c.last_activity, c.llm_id, c.role_id, c.active_extension_id,
+                   l.machine, l.model,
+                   p.name, p.forced_llm_id, p.allowed_llms, p.hide_llm_name,
+                   COALESCE(p.extensions_enabled, 0), COALESCE(p.is_paid, 0),
+                   COALESCE(p.disable_web_search, 0), COALESCE(p.force_web_search, 0),
+                   COALESCE(p.extensions_free_selection, 1)
+            FROM CONVERSATIONS c
+            LEFT JOIN LLM l ON l.id = c.llm_id
+            LEFT JOIN PROMPTS p ON p.id = c.role_id
+            WHERE c.id = ? AND c.user_id = ?
+            """,
+            (conversation_id, current_user.id),
+        )
+        conversation_row = await cursor.fetchone()
+        if not conversation_row:
+            raise HTTPException(status_code=500, detail="Failed to load new conversation")
 
-        # Fetch extension data if extensions enabled
+        conversation_last_activity = conversation_row[0]
+        llm_id = conversation_row[1]
+        prompt_id = conversation_row[2]
+        active_extension_id = conversation_row[3]
+        machine = conversation_row[4]
+        llm_model = conversation_row[5]
+        prompt_name = conversation_row[6]
+        forced_llm_id_value = conversation_row[7]
+        allowed_llms_value = conversation_row[8]
+        hide_llm_name_value = conversation_row[9]
+        extensions_enabled_value = bool(conversation_row[10])
+        is_paid_value = bool(conversation_row[11])
+        disable_web_search_value = bool(conversation_row[12])
+        force_web_search_value = bool(conversation_row[13])
+        extensions_free_selection = bool(conversation_row[14])
+
         active_extension_data = None
         extensions_list = []
-        extensions_free_selection = True
         if extensions_enabled_value and prompt_id:
-            if default_extension_id:
-                await cursor.execute('''
-                    SELECT id, name, slug, description FROM PROMPT_EXTENSIONS WHERE id = ?
-                ''', (default_extension_id,))
+            if active_extension_id:
+                await cursor.execute(
+                    """
+                    SELECT id, name, slug, description
+                    FROM PROMPT_EXTENSIONS
+                    WHERE id = ?
+                    """,
+                    (active_extension_id,),
+                )
                 ext_row = await cursor.fetchone()
                 if ext_row:
                     active_extension_data = {
-                        "id": ext_row[0], "name": ext_row[1],
-                        "slug": ext_row[2], "description": ext_row[3] or ""
+                        "id": ext_row[0],
+                        "name": ext_row[1],
+                        "slug": ext_row[2],
+                        "description": ext_row[3] or "",
                     }
 
-            await cursor.execute('''
-                SELECT id, name, slug, description FROM PROMPT_EXTENSIONS
-                WHERE prompt_id = ? ORDER BY display_order
-            ''', (prompt_id,))
+            await cursor.execute(
+                """
+                SELECT id, name, slug, description
+                FROM PROMPT_EXTENSIONS
+                WHERE prompt_id = ?
+                ORDER BY display_order
+                """,
+                (prompt_id,),
+            )
             ext_rows = await cursor.fetchall()
             extensions_list = [
-                {"id": r[0], "name": r[1], "slug": r[2], "description": r[3] or ""}
-                for r in ext_rows
+                {
+                    "id": row[0],
+                    "name": row[1],
+                    "slug": row[2],
+                    "description": row[3] or "",
+                }
+                for row in ext_rows
             ]
-
-            await cursor.execute(
-                "SELECT extensions_free_selection FROM PROMPTS WHERE id = ?", (prompt_id,)
-            )
-            fs_row = await cursor.fetchone()
-            extensions_free_selection = bool(fs_row[0]) if fs_row else True
 
         await conn.commit()
 
@@ -11700,19 +11588,7 @@ async def branch_conversation(
         if source_role_id and not await can_user_access_prompt(current_user, source_role_id, cursor):
             raise HTTPException(status_code=403, detail="Access denied to this prompt")
 
-        # 2. Block branching for external platform conversations
-        await cursor.execute(
-            "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
-            (current_user.id,)
-        )
-        ud_row = await cursor.fetchone()
-        if ud_row and ud_row[0]:
-            ext_platforms = orjson.loads(ud_row[0])
-            for platform_data in ext_platforms.values():
-                if isinstance(platform_data, dict) and platform_data.get('conversation_id') == conversation_id:
-                    raise HTTPException(status_code=400, detail="Cannot branch external platform conversations")
-
-        # 3. Verify message_id belongs to this conversation
+        # 2. Verify message_id belongs to this conversation
         await cursor.execute(
             "SELECT id FROM MESSAGES WHERE id = ? AND conversation_id = ?",
             (request.message_id, conversation_id)
@@ -15442,302 +15318,395 @@ async def whatsapp_webhook(request: Request):
             return {"status": "success", "message": "User not found"}
         logger.debug(f"WhatsApp message from user: {current_user.username}")
 
-        # Check if phone verification is required for WhatsApp
-        try:
-            async with get_db_connection(readonly=True) as config_conn:
-                cfg_cursor = await config_conn.execute(
-                    "SELECT value FROM SYSTEM_CONFIG WHERE key = 'whatsapp_require_phone_verification'"
-                )
-                cfg_row = await cfg_cursor.fetchone()
-            if cfg_row and cfg_row[0] == '1':
-                # Check if user's phone is verified
-                async with get_db_connection(readonly=True) as verify_conn:
-                    v_cursor = await verify_conn.execute(
-                        "SELECT phone_verified FROM USERS WHERE id = ?",
-                        (current_user.id,)
-                    )
-                    v_row = await v_cursor.fetchone()
-                if not v_row or not v_row[0]:
-                    await async_twilio.send_message(
-                        body="Your phone number must be verified before using WhatsApp. Please verify it in your account settings.",
-                        from_=to_number,
-                        to=from_number
-                    )
-                    return {"status": "success", "message": "Phone not verified"}
-        except Exception:
-            pass  # If check fails, allow through (fail open for backward compatibility)
+        if not current_user.is_enabled:
+            return {"status": "success"}
 
-        async with get_db_connection() as conn:
+        message_lower = message_body.lower()
+
+        if message_lower == "!help":
+            help_text = (
+                "*Available commands:*\n\n"
+                "!help - Show this help message\n"
+                "!text - Switch to text response mode\n"
+                "!voice - Switch to voice response mode\n"
+                "!chats - List your recent conversations\n"
+                "!set <id> [platform] - Switch to a conversation\n"
+                "!prompt list - List available prompts\n"
+                "!prompt <name or id> - Switch to a different prompt\n"
+                "!new - Start a new conversation\n"
+            )
+            await async_twilio.send_message(body=help_text, from_=to_number, to=from_number)
+            return {"status": "success", "message": "Help sent"}
+
+        async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
-            await cursor.execute('SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?', (current_user.id,))
+            await cursor.execute(
+                "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
+                (current_user.id,),
+            )
             result = await cursor.fetchone()
-            external_platforms = result[0] if result else None
-            if external_platforms:
-                platforms = orjson.loads(external_platforms)
-                whatsapp_data = platforms.get('whatsapp', {})
-            else:
-                platforms = {}
+            platforms = orjson.loads(result[0]) if result and result[0] else {}
+            whatsapp_data = platforms.get("whatsapp") or {}
+            if not isinstance(whatsapp_data, dict):
                 whatsapp_data = {}
+            is_first_whatsapp = not whatsapp_data
 
-            if not whatsapp_data:
-                logger.info("Creating new WhatsApp conversation for user")
-                conversation_response = await start_new_conversation(NewConversationRequest(),current_user=current_user)
-                
-                conversation_content = orjson.loads(conversation_response.body.decode('utf-8'))
-                whatsapp_data = {
-                    "conversation_id": conversation_content['id'],
-                    "answer": "text"
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            ok, _, err_msg = await can_use_platform(current_user.id, "whatsapp", cursor)
+            if not ok:
+                await async_twilio.send_message(
+                    body=err_msg,
+                    from_=to_number,
+                    to=from_number,
+                )
+                return {"status": "success"}
+
+        if message_lower == "!chats":
+            async with get_db_connection(readonly=True) as conn:
+                chats_message = await get_chats_list(
+                    current_user.id,
+                    "whatsapp",
+                    conn,
+                    markdown=True,
+                )
+            await async_twilio.send_message(body=chats_message, from_=to_number, to=from_number)
+            return {"status": "success"}
+
+        if message_lower == "!set" or message_lower.startswith("!set "):
+            parts = message_body[4:].strip().split() if len(message_body) > 4 else []
+            if not parts or len(parts) > 2:
+                await async_twilio.send_message(
+                    body="Usage: !set <conversation_id> [whatsapp|telegram]",
+                    from_=to_number,
+                    to=from_number,
+                )
+                return {"status": "success"}
+
+            raw_id = parts[0]
+            clean_id = raw_id[1:] if raw_id.startswith("#") else raw_id
+            if not clean_id.isdigit() or int(clean_id) <= 0:
+                await async_twilio.send_message(
+                    body="Usage: !set <conversation_id> [whatsapp|telegram]",
+                    from_=to_number,
+                    to=from_number,
+                )
+                return {"status": "success"}
+
+            target_platform = "whatsapp"
+            if len(parts) == 2:
+                platform_map = {
+                    "whatsapp": "whatsapp",
+                    "wa": "whatsapp",
+                    "telegram": "telegram",
+                    "tg": "telegram",
                 }
-                platforms['whatsapp'] = whatsapp_data
-                await cursor.execute('UPDATE USER_DETAILS SET external_platforms = ? WHERE user_id = ?',
-                                     (orjson.dumps(platforms).decode('utf-8'), current_user.id))
-                await conn.commit()
+                target_platform = platform_map.get(parts[1].lower())
+                if target_platform is None:
+                    await async_twilio.send_message(
+                        body="Invalid platform. Use: whatsapp (wa) or telegram (tg).",
+                        from_=to_number,
+                        to=from_number,
+                    )
+                    return {"status": "success"}
 
-                # Send welcome message for new WhatsApp conversations
-                try:
-                    async with get_db_connection(readonly=True) as config_conn:
-                        config_cursor = await config_conn.execute(
-                            "SELECT value FROM SYSTEM_CONFIG WHERE key = 'whatsapp_welcome_message'"
-                        )
-                        row = await config_cursor.fetchone()
-                    welcome_template = row[0] if row else None
-                    if not welcome_template:
-                        welcome_template = os.getenv("WHATSAPP_WELCOME_MESSAGE", "")
-                    if welcome_template:
-                        welcome_msg = welcome_template.replace("{username}", current_user.username)
-                        await async_twilio.send_message(
-                            body=welcome_msg,
-                            from_=to_number,
-                            to=from_number
-                        )
-                except Exception as welcome_err:
-                    logger.error(f"Failed to send WhatsApp welcome message: {welcome_err}")
+            result = await set_external_conversation(
+                current_user.id,
+                int(clean_id),
+                target_platform,
+                "whatsapp",
+            )
+            await async_twilio.send_message(
+                body=result["message"],
+                from_=to_number,
+                to=from_number,
+            )
+            return {"status": "success"}
 
-            conversation_id = whatsapp_data["conversation_id"]
-            answer_mode = whatsapp_data.get("answer","text")
-
-            logger.debug(f"WhatsApp response mode: {answer_mode}")
-            logger.debug("WhatsApp message body received")
-
-            # --- WhatsApp command handling ---
-
-            if message_body.lower() == "!help":
-                help_text = (
-                    "*Available commands:*\n\n"
-                    "!help - Show this help message\n"
-                    "!text - Switch to text response mode\n"
-                    "!voice - Switch to voice response mode\n"
-                    "!prompt list - List available prompts\n"
-                    "!prompt <name or id> - Switch to a different prompt\n"
-                    "!new - Start a new conversation\n"
-                )
-                await async_twilio.send_message(body=help_text, from_=to_number, to=from_number)
-                return {"status": "success", "message": "Help sent"}
-
-            if message_body.lower() in ["text_mode", "text mode", "!text"]:
+        if message_lower in ["text_mode", "text mode", "!text"]:
+            async with get_db_connection() as conn:
                 confirmation_message = await change_response_mode(current_user.id, "text", conn)
-                message = await async_twilio.send_message(
-                    body=confirmation_message,
-                    from_=to_number,
-                    to=from_number
-                )
-                return {"status": "success", "message": confirmation_message}
+            await async_twilio.send_message(
+                body=confirmation_message,
+                from_=to_number,
+                to=from_number,
+            )
+            return {"status": "success", "message": confirmation_message}
 
-            if message_body.lower() in ["voice_mode", "voice mode", "!voice"]:
+        if message_lower in ["voice_mode", "voice mode", "!voice"]:
+            async with get_db_connection() as conn:
                 confirmation_message = await change_response_mode(current_user.id, "voice", conn)
-                message = await async_twilio.send_message(
-                    body=confirmation_message,
-                    from_=to_number,
-                    to=from_number
-                )
-                return {"status": "success", "message": confirmation_message}
+            await async_twilio.send_message(
+                body=confirmation_message,
+                from_=to_number,
+                to=from_number,
+            )
+            return {"status": "success", "message": confirmation_message}
 
-            # !prompt list - Show available prompts
-            if message_body.lower() == "!prompt list":
+        if message_lower == "!prompt list":
+            async with get_db_connection(readonly=True) as conn:
+                cursor = await conn.cursor()
                 ud_cursor = await conn.execute(
                     "SELECT all_prompts_access, public_prompts_access, category_access FROM USER_DETAILS WHERE user_id = ?",
-                    (current_user.id,)
+                    (current_user.id,),
                 )
                 ud_row = await ud_cursor.fetchone()
                 prompts_list = await get_user_accessible_prompts(
-                    current_user, cursor,
+                    current_user,
+                    cursor,
                     all_prompts_access=ud_row[0] if ud_row else False,
                     public_prompts_access=ud_row[1] if ud_row else False,
-                    category_access=ud_row[2] if ud_row else None
+                    category_access=ud_row[2] if ud_row else None,
                 )
 
-                if not prompts_list:
-                    await async_twilio.send_message(body="No prompts available.", from_=to_number, to=from_number)
-                    return {"status": "success"}
-
-                # Build prompt list message (max 20 to fit WhatsApp message limit)
-                prompt_lines = []
-                for p in prompts_list[:20]:
-                    prompt_lines.append(f"*{p['id']}* - {p['name']}")
-
-                msg = "*Available prompts:*\n\n" + "\n".join(prompt_lines)
-                if len(prompts_list) > 20:
-                    msg += f"\n\n_...and {len(prompts_list) - 20} more_"
-                msg += "\n\nUse *!prompt <id or name>* to switch."
-
-                await async_twilio.send_message(body=msg, from_=to_number, to=from_number)
+            if not prompts_list:
+                await async_twilio.send_message(body="No prompts available.", from_=to_number, to=from_number)
                 return {"status": "success"}
 
-            # !prompt <name or id> - Switch to a different prompt
-            if message_body.lower().startswith("!prompt ") and message_body.lower() != "!prompt list":
-                prompt_query = message_body[8:].strip()
+            prompt_lines = [f"*{p['id']}* - {p['name']}" for p in prompts_list[:20]]
+            msg = "*Available prompts:*\n\n" + "\n".join(prompt_lines)
+            if len(prompts_list) > 20:
+                msg += f"\n\n_...and {len(prompts_list) - 20} more_"
+            msg += "\n\nUse *!prompt <id or name>* to switch."
 
+            await async_twilio.send_message(body=msg, from_=to_number, to=from_number)
+            return {"status": "success"}
+
+        if message_lower == "!new":
+            await create_new_platform_conversation(current_user.id, "whatsapp", current_user)
+            await async_twilio.send_message(
+                body="New conversation started. Previous conversation saved and accessible from the web.",
+                from_=to_number,
+                to=from_number,
+            )
+            return {"status": "success"}
+
+        whatsapp_data, created_binding = await ensure_platform_conversation(
+            current_user.id,
+            "whatsapp",
+            current_user,
+        )
+        if created_binding and is_first_whatsapp:
+            try:
+                async with get_db_connection(readonly=True) as config_conn:
+                    config_cursor = await config_conn.execute(
+                        "SELECT value FROM SYSTEM_CONFIG WHERE key = 'whatsapp_welcome_message'"
+                    )
+                    row = await config_cursor.fetchone()
+                welcome_template = row[0] if row else None
+                if not welcome_template:
+                    welcome_template = os.getenv("WHATSAPP_WELCOME_MESSAGE", "")
+                if welcome_template:
+                    welcome_msg = welcome_template.replace("{username}", current_user.username)
+                    await async_twilio.send_message(
+                        body=welcome_msg,
+                        from_=to_number,
+                        to=from_number,
+                    )
+            except Exception as welcome_err:
+                logger.error(f"Failed to send WhatsApp welcome message: {welcome_err}")
+
+        conversation_id = whatsapp_data["conversation_id"]
+        answer_mode = whatsapp_data.get("answer", "text")
+
+        logger.debug(f"WhatsApp response mode: {answer_mode}")
+        logger.debug("WhatsApp message body received")
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            await cursor.execute(
+                "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
+                (conversation_id, current_user.id),
+            )
+            lock_row = await cursor.fetchone()
+            if not lock_row:
+                await async_twilio.send_message(
+                    body="Conversation not found. Send !new to start a fresh one.",
+                    from_=to_number,
+                    to=from_number,
+                )
+                return {"status": "success", "message": "Conversation not found"}
+            if lock_row[0]:
+                async with get_db_connection() as log_conn:
+                    await log_conn.execute(
+                        "INSERT INTO WHATSAPP_LOG (user_id, phone_number, direction, message_type, response_mode) VALUES (?, ?, 'in', 'text', ?)",
+                        (current_user.id, from_number, answer_mode),
+                    )
+                    await log_conn.commit()
+                logger.info(
+                    f"WhatsApp message blocked: conversation {conversation_id} locked for user {current_user.id}"
+                )
+                await async_twilio.send_message(
+                    body="This conversation is locked. Send !new to start a new one.",
+                    from_=to_number,
+                    to=from_number,
+                )
+                return {"status": "success", "message": "Conversation locked"}
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            await cursor.execute(
+                "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
+                (current_user.id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                fresh_platforms = orjson.loads(row[0])
+                fresh_conv_id = (fresh_platforms.get("whatsapp", {}) or {}).get("conversation_id")
+                if fresh_conv_id and fresh_conv_id != conversation_id:
+                    conversation_id = fresh_conv_id
+                    await cursor.execute(
+                        "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
+                        (conversation_id, current_user.id),
+                    )
+                    lock_row = await cursor.fetchone()
+                    if not lock_row:
+                        await async_twilio.send_message(
+                            body="Conversation not found. Send !new to start a fresh one.",
+                            from_=to_number,
+                            to=from_number,
+                        )
+                        return {"status": "success", "message": "Conversation not found"}
+                    if lock_row[0]:
+                        await async_twilio.send_message(
+                            body="This conversation is locked. Send !new to start a new one.",
+                            from_=to_number,
+                            to=from_number,
+                        )
+                        return {"status": "success", "message": "Conversation locked"}
+
+        if message_lower.startswith("!prompt ") and message_lower != "!prompt list":
+            prompt_query = message_body[8:].strip()
+
+            async with get_db_connection() as conn:
+                cursor = await conn.cursor()
                 target_prompt = None
-                # Try by ID first
                 if prompt_query.isdigit():
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE id = ?", (int(prompt_query),))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE id = ?",
+                        (int(prompt_query),),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
-                # Try by exact name (case-insensitive)
                 if not target_prompt:
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE LOWER(name) = LOWER(?)", (prompt_query,))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE LOWER(name) = LOWER(?)",
+                        (prompt_query,),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
-                # Try partial name match
                 if not target_prompt:
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE LOWER(name) LIKE LOWER(?)", (f"%{prompt_query}%",))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE LOWER(name) LIKE LOWER(?)",
+                        (f"%{prompt_query}%",),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
                 if not target_prompt:
                     await async_twilio.send_message(
                         body=f"Prompt not found: '{prompt_query}'. Use *!prompt list* to see available prompts.",
-                        from_=to_number, to=from_number
+                        from_=to_number,
+                        to=from_number,
                     )
                     return {"status": "success"}
 
-                # Verify user has access to this prompt
                 if not await can_user_access_prompt(current_user, target_prompt[0], cursor):
                     await async_twilio.send_message(
                         body="You don't have access to this prompt.",
-                        from_=to_number, to=from_number
+                        from_=to_number,
+                        to=from_number,
                     )
                     return {"status": "success"}
 
-                # Update conversation's prompt (role_id)
-                await cursor.execute(
-                    "UPDATE CONVERSATIONS SET role_id = ? WHERE id = ?",
-                    (target_prompt[0], conversation_id)
+                update_cursor = await cursor.execute(
+                    """
+                    UPDATE CONVERSATIONS
+                    SET role_id = ?
+                    WHERE id = ? AND user_id = ? AND COALESCE(locked, 0) = 0
+                    """,
+                    (target_prompt[0], conversation_id, current_user.id),
                 )
+                if update_cursor.rowcount == 0:
+                    await conn.rollback()
+                    await async_twilio.send_message(
+                        body="This conversation is locked. Send !new to start a new one.",
+                        from_=to_number,
+                        to=from_number,
+                    )
+                    return {"status": "success"}
+
                 await conn.commit()
 
                 await async_twilio.send_message(
                     body=f"Switched to prompt: *{target_prompt[1]}*",
-                    from_=to_number, to=from_number
-                )
-                return {"status": "success"}
-
-            # !new - Start a new conversation
-            if message_body.lower() == "!new":
-                conversation_response = await start_new_conversation(NewConversationRequest(), current_user=current_user)
-                conversation_content = orjson.loads(conversation_response.body.decode('utf-8'))
-
-                whatsapp_data["conversation_id"] = conversation_content['id']
-                platforms['whatsapp'] = whatsapp_data
-                await cursor.execute(
-                    'UPDATE USER_DETAILS SET external_platforms = ? WHERE user_id = ?',
-                    (orjson.dumps(platforms).decode('utf-8'), current_user.id)
-                )
-                await conn.commit()
-
-                await async_twilio.send_message(
-                    body="New conversation started. Previous conversation saved and accessible from the web.",
-                    from_=to_number, to=from_number
-                )
-                return {"status": "success"}
-
-            # Early check: locked or deleted conversation (before expensive media/transcription)
-            lock_cursor = await conn.execute(
-                "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
-                (conversation_id, current_user.id)
-            )
-            lock_row = await lock_cursor.fetchone()
-            if not lock_row or lock_row[0]:
-                # Log the blocked attempt for observability
-                async with get_db_connection() as log_conn:
-                    await log_conn.execute(
-                        "INSERT INTO WHATSAPP_LOG (user_id, phone_number, direction, message_type, response_mode) VALUES (?, ?, 'in', 'text', ?)",
-                        (current_user.id, from_number, answer_mode)
-                    )
-                    await log_conn.commit()
-                reason = "locked" if lock_row else "not found"
-                logger.info(f"WhatsApp message blocked: conversation {conversation_id} {reason} for user {current_user.id}")
-                await async_twilio.send_message(
-                    body="This conversation is locked and cannot receive new messages. Send !new to start a fresh conversation.",
                     from_=to_number,
-                    to=from_number
+                    to=from_number,
                 )
-                return {"status": "success", "message": f"Conversation {reason}"}
+                return {"status": "success"}
 
-            transcribed_text = ""
-            file_dict = None
-            files_list = []  # Support for multiple files
+        transcribed_text = ""
+        file_dict = None
+        files_list = []  # Support for multiple files
 
-            if media_items:
-                for media_item in media_items:
-                    m_url = media_item["url"]
-                    m_type = media_item["type"]
+        if media_items:
+            for media_item in media_items:
+                m_url = media_item["url"]
+                m_type = media_item["type"]
 
-                    if "audio" in m_type:
-                        try:
-                            transcribed_text = await transcribe(request=request, audio=None, user_id=current_user.id, media_url=m_url)
-                        except Exception as e:
-                            logger.error(f"Error transcribing audio: {e}")
-                            await async_twilio.send_message(
-                                body="Sorry, there was a problem processing the audio. Please try sending your message as text.",
-                                from_=to_number,
-                                to=from_number
-                            )
-                            return {"status": "error", "message": "Error transcribing audio"}
-                    elif "image" in m_type:
-                        try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(m_url) as resp:
-                                    if resp.status == 200:
-                                        img_data = await resp.read()
-                                        files_list.append({
-                                            'data': img_data,
-                                            'content_type': m_type,
-                                            'filename': f"image_{len(files_list)}.jpg"
-                                        })
-                        except Exception as e:
-                            logger.error(f"Error downloading image: {e}")
-                    elif "pdf" in m_type or "document" in m_type:
-                        # Notify user about unsupported document types
+                if "audio" in m_type:
+                    try:
+                        transcribed_text = await transcribe(request=request, audio=None, user_id=current_user.id, media_url=m_url)
+                    except Exception as e:
+                        logger.error(f"Error transcribing audio: {e}")
                         await async_twilio.send_message(
-                            body="Sorry, document attachments are not supported yet. Please send text or images.",
+                            body="Sorry, there was a problem processing the audio. Please try sending your message as text.",
                             from_=to_number,
                             to=from_number
                         )
-                        return {"status": "success", "message": "Unsupported media type"}
-                    else:
-                        logger.warning(f"Unsupported WhatsApp media type: {m_type}")
-                        await async_twilio.send_message(
-                            body=f"Sorry, this media type ({m_type}) is not supported. Please send text, images, or audio.",
-                            from_=to_number,
-                            to=from_number
-                        )
-                        return {"status": "success", "message": "Unsupported media type"}
+                        return {"status": "error", "message": "Error transcribing audio"}
+                elif "image" in m_type:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(m_url) as resp:
+                                if resp.status == 200:
+                                    img_data = await resp.read()
+                                    files_list.append({
+                                        'data': img_data,
+                                        'content_type': m_type,
+                                        'filename': f"image_{len(files_list)}.jpg"
+                                    })
+                    except Exception as e:
+                        logger.error(f"Error downloading image: {e}")
+                elif "pdf" in m_type or "document" in m_type:
+                    await async_twilio.send_message(
+                        body="Sorry, document attachments are not supported yet. Please send text or images.",
+                        from_=to_number,
+                        to=from_number
+                    )
+                    return {"status": "success", "message": "Unsupported media type"}
+                else:
+                    logger.warning(f"Unsupported WhatsApp media type: {m_type}")
+                    await async_twilio.send_message(
+                        body=f"Sorry, this media type ({m_type}) is not supported. Please send text, images, or audio.",
+                        from_=to_number,
+                        to=from_number
+                    )
+                    return {"status": "success", "message": "Unsupported media type"}
 
-                # Use first image as file_dict for backward compatibility
-                file_dict = files_list[0] if files_list else None
+            file_dict = files_list[0] if files_list else None
 
-            user_message = transcribed_text if transcribed_text else message_body
-            if not user_message and not file_dict:
-                return {"status": "success", "message": "Empty message ignored"}
+        user_message = transcribed_text if transcribed_text else message_body
+        if not user_message and not file_dict:
+            return {"status": "success", "message": "Empty message ignored"}
 
-            # Log incoming WhatsApp message
-            msg_type = "audio" if transcribed_text else ("image" if file_dict else "text")
-            async with get_db_connection() as log_conn:
-                await log_conn.execute(
-                    "INSERT INTO WHATSAPP_LOG (user_id, phone_number, direction, message_type, response_mode) VALUES (?, ?, 'in', ?, ?)",
-                    (current_user.id, from_number, msg_type, answer_mode)
-                )
-                await log_conn.commit()
+        # Log incoming WhatsApp message
+        msg_type = "audio" if transcribed_text else ("image" if file_dict else "text")
+        async with get_db_connection() as log_conn:
+            await log_conn.execute(
+                "INSERT INTO WHATSAPP_LOG (user_id, phone_number, direction, message_type, response_mode) VALUES (?, ?, 'in', ?, ?)",
+                (current_user.id, from_number, msg_type, answer_mode)
+            )
+            await log_conn.commit()
 
         async def send_chunks(chunks):
             for chunk in chunks:
@@ -16232,92 +16201,28 @@ async def telegram_webhook(request: Request):
                 )
                 return JSONResponse(content={"ok": True})
 
-        # --- Phone verification check (if enabled) ---
-        try:
-            async with get_db_connection(readonly=True) as conn:
-                cfg_cursor = await conn.execute(
-                    "SELECT value FROM SYSTEM_CONFIG WHERE key = 'telegram_require_phone_verification'"
-                )
-                cfg_row = await cfg_cursor.fetchone()
-            if cfg_row and cfg_row[0] == '1':
-                async with get_db_connection(readonly=True) as conn:
-                    v_cursor = await conn.execute(
-                        "SELECT phone_verified FROM USERS WHERE id = ?",
-                        (current_user.id,),
-                    )
-                    v_row = await v_cursor.fetchone()
-                if not v_row or not v_row[0]:
-                    await async_telegram.send_message(
-                        chat_id,
-                        "Your phone number must be verified before using Telegram. "
-                        "Please verify it in your account settings.",
-                    )
-                    return JSONResponse(content={"ok": True})
-        except Exception:
-            pass  # Fail open for backward compatibility
+        if not current_user.is_enabled:
+            return JSONResponse(content={"ok": True})
 
-        # --- Get or create conversation ---
-        async with get_db_connection() as conn:
-            cursor = await conn.cursor()
-            await cursor.execute(
-                'SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?',
-                (current_user.id,),
-            )
-            result = await cursor.fetchone()
-            platforms = orjson.loads(result[0]) if result and result[0] else {}
-            telegram_data = platforms.get('telegram', {})
+        text_lower = text.lower()
 
-            if not telegram_data or not telegram_data.get('conversation_id'):
-                conversation_response = await start_new_conversation(
-                    NewConversationRequest(), current_user=current_user
-                )
-                conversation_content = orjson.loads(
-                    conversation_response.body.decode('utf-8')
-                )
-                new_conv_id = conversation_content['id']
-
-                await cursor.execute(
-                    """UPDATE USER_DETAILS SET external_platforms =
-                       json_set(COALESCE(NULLIF(external_platforms, ''), '{}'),
-                                '$.telegram.conversation_id', ?,
-                                '$.telegram.answer', 'text')
-                       WHERE user_id = ?""",
-                    (new_conv_id, current_user.id),
-                )
-                await conn.commit()
-                telegram_data = {"conversation_id": new_conv_id, "answer": "text"}
-
-            conversation_id = telegram_data["conversation_id"]
-            answer_mode = telegram_data.get("answer", "text")
-
-        # --- Command handling ---
-        if text.lower() == "!help":
+        if text_lower == "!help":
             help_text = (
                 "*Available commands:*\n\n"
-                "!help - Show this help message\n"
-                "!text - Switch to text responses\n"
-                "!voice - Switch to voice responses\n"
-                "!prompt list - List available prompts\n"
-                "!prompt <name|id> - Switch prompt\n"
-                "!new - Start a new conversation\n"
-                "!unlink - Unlink Telegram from your account"
+                "`!help` - Show this help message\n"
+                "`!text` - Switch to text responses\n"
+                "`!voice` - Switch to voice responses\n"
+                "`!chats` - List your recent conversations\n"
+                "`!set <id> [platform]` - Switch to a conversation\n"
+                "`!prompt list` - List available prompts\n"
+                "`!prompt <name|id>` - Switch prompt\n"
+                "`!new` - Start a new conversation\n"
+                "`!unlink` - Unlink Telegram from your account"
             )
             await async_telegram.send_message(chat_id, help_text, parse_mode="Markdown")
             return JSONResponse(content={"ok": True})
 
-        if text.lower() in ("!text", "text_mode"):
-            async with get_db_connection() as conn:
-                await change_response_mode(current_user.id, "text", conn, platform="telegram")
-            await async_telegram.send_message(chat_id, "Switched to text mode.")
-            return JSONResponse(content={"ok": True})
-
-        if text.lower() in ("!voice", "voice_mode"):
-            async with get_db_connection() as conn:
-                await change_response_mode(current_user.id, "voice", conn, platform="telegram")
-            await async_telegram.send_message(chat_id, "Switched to voice mode.")
-            return JSONResponse(content={"ok": True})
-
-        if text.lower() == "!unlink":
+        if text_lower == "!unlink":
             async with get_db_connection() as conn:
                 await conn.execute(
                     "UPDATE USERS SET telegram_chat_id = NULL WHERE id = ?",
@@ -16329,66 +16234,258 @@ async def telegram_webhook(request: Request):
                 )
                 await conn.commit()
             await async_telegram.send_message(
-                chat_id, "Your Telegram has been unlinked from your account."
+                chat_id,
+                "Your Telegram has been unlinked from your account.",
             )
             return JSONResponse(content={"ok": True})
 
-        # !prompt list
-        if text.lower() == "!prompt list":
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            await cursor.execute(
+                "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
+                (current_user.id,),
+            )
+            result = await cursor.fetchone()
+            platforms = orjson.loads(result[0]) if result and result[0] else {}
+            telegram_data = platforms.get("telegram") or {}
+            if not isinstance(telegram_data, dict):
+                telegram_data = {}
+            is_first_telegram = not telegram_data
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            ok, _, err_msg = await can_use_platform(current_user.id, "telegram", cursor)
+            if not ok:
+                await async_telegram.send_message(chat_id, err_msg)
+                return JSONResponse(content={"ok": True})
+
+        if text_lower == "!chats":
+            async with get_db_connection(readonly=True) as conn:
+                chats_message = await get_chats_list(
+                    current_user.id,
+                    "telegram",
+                    conn,
+                    markdown=False,
+                )
+            await async_telegram.send_message(chat_id, chats_message)
+            return JSONResponse(content={"ok": True})
+
+        if text_lower == "!set" or text_lower.startswith("!set "):
+            parts = text[4:].strip().split() if len(text) > 4 else []
+            if not parts or len(parts) > 2:
+                await async_telegram.send_message(
+                    chat_id,
+                    "Usage: !set <conversation_id> [whatsapp|telegram]",
+                )
+                return JSONResponse(content={"ok": True})
+
+            raw_id = parts[0]
+            clean_id = raw_id[1:] if raw_id.startswith("#") else raw_id
+            if not clean_id.isdigit() or int(clean_id) <= 0:
+                await async_telegram.send_message(
+                    chat_id,
+                    "Usage: !set <conversation_id> [whatsapp|telegram]",
+                )
+                return JSONResponse(content={"ok": True})
+
+            target_platform = "telegram"
+            if len(parts) == 2:
+                platform_map = {
+                    "whatsapp": "whatsapp",
+                    "wa": "whatsapp",
+                    "telegram": "telegram",
+                    "tg": "telegram",
+                }
+                target_platform = platform_map.get(parts[1].lower())
+                if target_platform is None:
+                    await async_telegram.send_message(
+                        chat_id,
+                        "Invalid platform. Use: whatsapp (wa) or telegram (tg).",
+                    )
+                    return JSONResponse(content={"ok": True})
+
+            result = await set_external_conversation(
+                current_user.id,
+                int(clean_id),
+                target_platform,
+                "telegram",
+            )
+            await async_telegram.send_message(chat_id, result["message"])
+            return JSONResponse(content={"ok": True})
+
+        if text_lower in ("!text", "text_mode"):
             async with get_db_connection() as conn:
+                confirmation = await change_response_mode(
+                    current_user.id,
+                    "text",
+                    conn,
+                    platform="telegram",
+                )
+            await async_telegram.send_message(chat_id, confirmation)
+            return JSONResponse(content={"ok": True})
+
+        if text_lower in ("!voice", "voice_mode"):
+            async with get_db_connection() as conn:
+                confirmation = await change_response_mode(
+                    current_user.id,
+                    "voice",
+                    conn,
+                    platform="telegram",
+                )
+            await async_telegram.send_message(chat_id, confirmation)
+            return JSONResponse(content={"ok": True})
+
+        if text_lower == "!prompt list":
+            async with get_db_connection(readonly=True) as conn:
                 cursor = await conn.cursor()
                 ud_cursor = await conn.execute(
                     "SELECT all_prompts_access, public_prompts_access, category_access FROM USER_DETAILS WHERE user_id = ?",
-                    (current_user.id,)
+                    (current_user.id,),
                 )
                 ud_row = await ud_cursor.fetchone()
                 prompts_list = await get_user_accessible_prompts(
-                    current_user, cursor,
+                    current_user,
+                    cursor,
                     all_prompts_access=ud_row[0] if ud_row else False,
                     public_prompts_access=ud_row[1] if ud_row else False,
-                    category_access=ud_row[2] if ud_row else None
+                    category_access=ud_row[2] if ud_row else None,
                 )
 
-                if not prompts_list:
-                    await async_telegram.send_message(chat_id, "No prompts available.")
-                    return JSONResponse(content={"ok": True})
+            if not prompts_list:
+                await async_telegram.send_message(chat_id, "No prompts available.")
+                return JSONResponse(content={"ok": True})
 
-                prompt_lines = []
-                for p in prompts_list[:20]:
-                    prompt_lines.append(f"*{p['id']}* - {p['name']}")
+            prompt_lines = [f"*{p['id']}* - {p['name']}" for p in prompts_list[:20]]
+            msg = "*Available prompts:*\n\n" + "\n".join(prompt_lines)
+            if len(prompts_list) > 20:
+                msg += f"\n\n_...and {len(prompts_list) - 20} more_"
+            msg += "\n\nUse *!prompt <id or name>* to switch."
 
-                msg = "*Available prompts:*\n\n" + "\n".join(prompt_lines)
-                if len(prompts_list) > 20:
-                    msg += f"\n\n_...and {len(prompts_list) - 20} more_"
-                msg += "\n\nUse *!prompt <id or name>* to switch."
-
-                await async_telegram.send_message(chat_id, msg, parse_mode="Markdown")
+            await async_telegram.send_message(chat_id, msg, parse_mode="Markdown")
             return JSONResponse(content={"ok": True})
 
-        # !prompt <name or id>
-        if text.lower().startswith("!prompt ") and text.lower() != "!prompt list":
+        if text_lower == "!new":
+            await create_new_platform_conversation(current_user.id, "telegram", current_user)
+            await async_telegram.send_message(
+                chat_id,
+                "New conversation started. Previous conversation saved and accessible from the web.",
+            )
+            return JSONResponse(content={"ok": True})
+
+        telegram_data, created_binding = await ensure_platform_conversation(
+            current_user.id,
+            "telegram",
+            current_user,
+        )
+        if created_binding and is_first_telegram:
+            try:
+                async with get_db_connection(readonly=True) as conn:
+                    cursor = await conn.execute(
+                        "SELECT value FROM SYSTEM_CONFIG WHERE key = 'telegram_welcome_message'"
+                    )
+                    row = await cursor.fetchone()
+                welcome = (row[0] if row and row[0] else "").replace(
+                    "{username}",
+                    current_user.username,
+                )
+                if welcome:
+                    await async_telegram.send_message(chat_id, welcome)
+            except Exception as welcome_err:
+                logger.error(f"Failed to send Telegram welcome: {welcome_err}")
+
+        conversation_id = telegram_data["conversation_id"]
+        answer_mode = telegram_data.get("answer", "text")
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            await cursor.execute(
+                "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
+                (conversation_id, current_user.id),
+            )
+            lock_row = await cursor.fetchone()
+            if not lock_row:
+                await async_telegram.send_message(
+                    chat_id,
+                    "Conversation not found. Send !new to start a fresh one.",
+                )
+                return JSONResponse(content={"ok": True})
+            if lock_row[0]:
+                await _log_telegram('in', current_user.id, chat_id, 'text', answer_mode)
+                logger.info(
+                    f"Telegram message blocked: conversation {conversation_id} locked for user {current_user.id}"
+                )
+                await async_telegram.send_message(
+                    chat_id,
+                    "This conversation is locked. Send !new to start a new one.",
+                )
+                return JSONResponse(content={"ok": True})
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.cursor()
+            await cursor.execute(
+                "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
+                (current_user.id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                fresh_platforms = orjson.loads(row[0])
+                fresh_conv_id = (fresh_platforms.get("telegram", {}) or {}).get("conversation_id")
+                if fresh_conv_id and fresh_conv_id != conversation_id:
+                    conversation_id = fresh_conv_id
+                    await cursor.execute(
+                        "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
+                        (conversation_id, current_user.id),
+                    )
+                    lock_row = await cursor.fetchone()
+                    if not lock_row:
+                        await async_telegram.send_message(
+                            chat_id,
+                            "Conversation not found. Send !new to start a fresh one.",
+                        )
+                        return JSONResponse(content={"ok": True})
+                    if lock_row[0]:
+                        await _log_telegram('in', current_user.id, chat_id, 'text', answer_mode)
+                        logger.info(
+                            f"Telegram message blocked: conversation {conversation_id} locked for user {current_user.id}"
+                        )
+                        await async_telegram.send_message(
+                            chat_id,
+                            "This conversation is locked. Send !new to start a new one.",
+                        )
+                        return JSONResponse(content={"ok": True})
+
+        if text_lower.startswith("!prompt ") and text_lower != "!prompt list":
             prompt_query = text[8:].strip()
 
             async with get_db_connection() as conn:
                 cursor = await conn.cursor()
                 target_prompt = None
                 if prompt_query.isdigit():
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE id = ?", (int(prompt_query),))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE id = ?",
+                        (int(prompt_query),),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
                 if not target_prompt:
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE LOWER(name) = LOWER(?)", (prompt_query,))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE LOWER(name) = LOWER(?)",
+                        (prompt_query,),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
                 if not target_prompt:
-                    p_cursor = await conn.execute("SELECT id, name FROM PROMPTS WHERE LOWER(name) LIKE LOWER(?)", (f"%{prompt_query}%",))
+                    p_cursor = await conn.execute(
+                        "SELECT id, name FROM PROMPTS WHERE LOWER(name) LIKE LOWER(?)",
+                        (f"%{prompt_query}%",),
+                    )
                     target_prompt = await p_cursor.fetchone()
 
                 if not target_prompt:
                     await async_telegram.send_message(
                         chat_id,
                         f"Prompt not found: '{prompt_query}'. Use *!prompt list* to see available prompts.",
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
                     )
                     return JSONResponse(content={"ok": True})
 
@@ -16396,55 +16493,30 @@ async def telegram_webhook(request: Request):
                     await async_telegram.send_message(chat_id, "You don't have access to this prompt.")
                     return JSONResponse(content={"ok": True})
 
-                await cursor.execute(
-                    "UPDATE CONVERSATIONS SET role_id = ? WHERE id = ?",
-                    (target_prompt[0], conversation_id)
+                update_cursor = await cursor.execute(
+                    """
+                    UPDATE CONVERSATIONS
+                    SET role_id = ?
+                    WHERE id = ? AND user_id = ? AND COALESCE(locked, 0) = 0
+                    """,
+                    (target_prompt[0], conversation_id, current_user.id),
                 )
+                if update_cursor.rowcount == 0:
+                    await conn.rollback()
+                    await async_telegram.send_message(
+                        chat_id,
+                        "This conversation is locked. Send !new to start a new one.",
+                    )
+                    return JSONResponse(content={"ok": True})
+
                 await conn.commit()
 
                 await async_telegram.send_message(
                     chat_id,
                     f"Switched to prompt: *{target_prompt[1]}*",
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
                 )
             return JSONResponse(content={"ok": True})
-
-        # !new - Start a new conversation
-        if text.lower() == "!new":
-            conversation_response = await start_new_conversation(NewConversationRequest(), current_user=current_user)
-            conversation_content = orjson.loads(conversation_response.body.decode('utf-8'))
-            new_conv_id = conversation_content['id']
-
-            async with get_db_connection() as conn:
-                await conn.execute(
-                    """UPDATE USER_DETAILS SET external_platforms =
-                       json_set(COALESCE(NULLIF(external_platforms, ''), '{}'),
-                                '$.telegram.conversation_id', ?)
-                       WHERE user_id = ?""",
-                    (new_conv_id, current_user.id),
-                )
-                await conn.commit()
-
-            await async_telegram.send_message(
-                chat_id,
-                "New conversation started. Previous conversation saved and accessible from the web."
-            )
-            return JSONResponse(content={"ok": True})
-
-        # --- Check conversation lock ---
-        async with get_db_connection(readonly=True) as conn:
-            cursor = await conn.cursor()
-            await cursor.execute(
-                'SELECT locked FROM CONVERSATIONS WHERE id = ?', (conversation_id,)
-            )
-            lock_row = await cursor.fetchone()
-            if lock_row and lock_row[0]:
-                await async_telegram.send_message(
-                    chat_id,
-                    "This conversation is locked. Send !new to start a fresh one.",
-                )
-                await _log_telegram('in', current_user.id, chat_id, 'text', answer_mode)
-                return JSONResponse(content={"ok": True})
 
         # --- Media processing ---
         transcribed_text = ""
