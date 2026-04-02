@@ -344,6 +344,9 @@ def build_content_request(
                             parts.append("[Image attachment]")
                         elif block.get("type") == "document_url":
                             parts.append("[PDF attachment]")
+                        elif block.get("type") == "text_file":
+                            fn = block.get("text_file", {}).get("filename", "file")
+                            parts.append(f"[Text file: {fn}]")
                         else:
                             parts.append(f"[{block.get('type', 'unknown')} attachment]")
                 line = f"{role_label}: {' '.join(parts)}" if parts else f"{role_label}: [Non-text content]"

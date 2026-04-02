@@ -20,6 +20,7 @@ document.addEventListener('DOMContentLoaded', function() {
     var insufficientBalanceMessage = document.getElementById("insufficient-balance-message");
     var chatContent = document.querySelector('.chat-window');
     attachedFiles = []
+    initFileHandling();
     const manager = new TextareaImagePreviewManager();
 
     // Save instance to window in case we need to access it later
@@ -307,7 +308,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 stopReceivingStream();
             } else {
                 const imagePreviews = document.getElementById('image-previews');
-                const previewItems = imagePreviews.querySelectorAll('img, .pdf-preview-item');
+                const previewItems = imagePreviews.querySelectorAll('img, .pdf-preview-item, .text-preview-item');
                 if (previewItems.length > 0) {
                     const lastItem = previewItems[previewItems.length - 1];
                     imagePreviews.removeChild(lastItem);
@@ -353,7 +354,8 @@ document.addEventListener('DOMContentLoaded', function() {
             clearTimeout(dragTimeout);
             dropZoneOverlay.classList.add('d-none');
             dropZoneOverlay.classList.remove('d-flex');
-    
+            if (!Config.can_send_files) return;
+
             const files = e.dataTransfer.files;
             handleDroppedFiles(files);
             setTimeout(() => {
@@ -379,6 +381,18 @@ document.addEventListener('DOMContentLoaded', function() {
                 pdfPreview.appendChild(iconSpan);
                 pdfPreview.appendChild(nameSpan);
                 imagePreviews.appendChild(pdfPreview);
+            } else if (isTextFile(file)) {
+                const previewItem = document.createElement('div');
+                previewItem.className = 'text-preview-item';
+                const icon = document.createElement('span');
+                icon.className = 'text-icon';
+                icon.textContent = 'TXT';
+                const name = document.createElement('span');
+                name.className = 'text-name';
+                name.textContent = file.name;
+                previewItem.appendChild(icon);
+                previewItem.appendChild(name);
+                imagePreviews.appendChild(previewItem);
             } else if (file.type.startsWith('image/')) {
                 const reader = new FileReader();
                 reader.onload = function(e) {

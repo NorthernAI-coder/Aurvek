@@ -605,6 +605,17 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
             pdfEl.appendChild(badge);
             pdfEl.appendChild(label);
             messageContent.appendChild(pdfEl);
+        } else if (messageObj && messageObj.type === 'text_file') {
+            var textAttachment = document.createElement('div');
+            textAttachment.className = 'chat-text-attachment';
+            var badge = document.createElement('span');
+            badge.className = 'text-badge';
+            badge.textContent = 'TXT';
+            var label = document.createElement('span');
+            label.textContent = messageObj.filename + ' (' + messageObj.lines + ' lines)';
+            textAttachment.appendChild(badge);
+            textAttachment.appendChild(label);
+            messageContent.appendChild(textAttachment);
         }
     } else {
         messageText = String(message);
@@ -1003,7 +1014,7 @@ function sendMessage(messageText) {
         console.error('No conversation selected');
         return;
     }
-    if (!messageText.trim()) {
+    if (!messageText.trim() && (!attachedFiles || attachedFiles.length === 0)) {
         return;
     }
 
@@ -1020,13 +1031,16 @@ function sendMessage(messageText) {
 
     let timestamp = new Date().toISOString();
 
-    let userMessageElement = addMessage(
-        'user',
-        messageText_raw,
-        { timestamp: convertToLocalTime(timestamp), isNewMessage: true },
-        false,
-        { type: 'text', text: messageText_raw }
-    );
+    let userMessageElement = null;
+    if (messageText.trim()) {
+        userMessageElement = addMessage(
+            'user',
+            messageText_raw,
+            { timestamp: convertToLocalTime(timestamp), isNewMessage: true },
+            false,
+            { type: 'text', text: messageText_raw }
+        );
+    }
 
     // Get the user message ID
     //getLastMessageId(userMessageElement)
@@ -2956,6 +2970,14 @@ function processMessage(message, container, prepend = false) {
                         is_bookmarked: message.is_bookmarked,
                         conversation_id: message.conversation_id
                     };
+                } else if (item.type === 'text_file') {
+                    messageObj = {
+                        type: 'text_file',
+                        filename: item.text_file.filename,
+                        lines: item.text_file.lines,
+                        is_bookmarked: message.is_bookmarked,
+                        conversation_id: message.conversation_id
+                    };
                 } else if (item.type === 'image' && item.source.type === 'base64') {
                     messageObj = {
                         type: 'image_url',
@@ -3203,7 +3225,9 @@ function enableInputControls() {
 
     document.getElementById('message-text').disabled = false;
     document.querySelector('#form-message button[type="submit"]').disabled = false;
-    document.getElementById('chat-files').disabled = false;
+    if (Config.can_send_files) {
+        document.getElementById('chat-files').disabled = false;
+    }
     const plusBtn = document.getElementById('plus-menu-btn');
     if (plusBtn) plusBtn.disabled = false;
     document.getElementById('loading-indicator').style.display = 'none';

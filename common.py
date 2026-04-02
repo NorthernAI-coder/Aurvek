@@ -160,6 +160,10 @@ MAX_PDF_SIZE_MB = int(os.getenv('MAX_PDF_SIZE_MB', 25))        # Under Claude's 
 MAX_PDF_PAGES = int(os.getenv('MAX_PDF_PAGES', 100))           # Claude's limit; Gemini supports 1000
 MAX_PDFS_PER_MESSAGE = int(os.getenv('MAX_PDFS_PER_MESSAGE', 3))
 
+# Text file upload limits
+MAX_TEXT_FILE_SIZE_MB = int(os.getenv('MAX_TEXT_FILE_SIZE_MB', 2))
+MAX_TEXT_FILES_PER_MESSAGE = int(os.getenv('MAX_TEXT_FILES_PER_MESSAGE', 3))
+
 # OpenRouter model ID mapping for GPT/xAI redirect (used when PDF files are present)
 OPENROUTER_MODEL_MAP = {
     # GPT models
@@ -799,6 +803,23 @@ async def load_service_costs():
             return {}
         finally:
             await conn.close()
+
+def text_file_block_to_text(block: dict) -> str:
+    """Read a stored text_file block from disk and convert to text string for providers."""
+    tf = block.get('text_file', {})
+    filename = tf.get('filename', 'file.txt')
+    lines = tf.get('lines', 0)
+    url = tf.get('url', '')
+
+    file_path = os.path.join('data', url.lstrip('/'))
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except (FileNotFoundError, IOError):
+        return f"[Attached file: {filename} -- content unavailable]"
+
+    return f"[Content of uploaded file: {filename} ({lines} lines)]\n\n{content}"
+
 
 def estimate_message_tokens(text: str, token_ratio: float = 4.0, margin: float = 1.1) -> int:
     total_chars = len(text)

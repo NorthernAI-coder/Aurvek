@@ -19,13 +19,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _NGINX_BASE = (os.getenv("NGINX_BASE_PATH", "") or "").strip()
 NGINX_EXE = (os.getenv("NGINX_BLOCKLIST_EXE", "") or "").strip()
-NGINX_PREFIX = (os.getenv("NGINX_BLOCKLIST_PREFIX", _NGINX_BASE) or "").strip()
 NGINX_CONF = (os.getenv("NGINX_BLOCKLIST_CONF", "") or "").strip()
 
+# Prefix (-p flag) is a Laragon/Windows concept; Linux/macOS nginx
+# uses its compiled-in prefix, so only default on Windows.
+if os.name == "nt":
+    NGINX_PREFIX = (os.getenv("NGINX_BLOCKLIST_PREFIX", _NGINX_BASE) or "").strip()
+else:
+    NGINX_PREFIX = (os.getenv("NGINX_BLOCKLIST_PREFIX", "") or "").strip()
+
 if not NGINX_EXE:
-    NGINX_EXE = os.path.join(_NGINX_BASE, "nginx.exe") if _NGINX_BASE else "nginx"
+    if _NGINX_BASE and os.name == "nt":
+        NGINX_EXE = os.path.join(_NGINX_BASE, "nginx.exe")
+    else:
+        # Linux/macOS: nginx is on PATH via package manager
+        NGINX_EXE = "nginx"
+
 if not NGINX_CONF and _NGINX_BASE:
-    NGINX_CONF = os.path.join(_NGINX_BASE, "conf", "nginx.conf")
+    if os.name == "nt":
+        # Laragon layout: {base}/conf/nginx.conf
+        NGINX_CONF = os.path.join(_NGINX_BASE, "conf", "nginx.conf")
+    else:
+        # Linux/macOS layout: {base}/nginx.conf
+        NGINX_CONF = os.path.join(_NGINX_BASE, "nginx.conf")
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BLOCKLIST_PATH = os.getenv("NGINX_BLOCKLIST_PATH", os.path.join(_PROJECT_ROOT, "data", "nginx_blocklist.conf"))

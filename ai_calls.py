@@ -38,6 +38,7 @@ from rediscfg import check_rate_limit, get_rate_limit_status, increment_metric, 
 from common import (
     custom_unescape,
     estimate_message_tokens,
+    text_file_block_to_text,
     Cost,
     generate_user_hash,
     has_sufficient_balance,
@@ -76,6 +77,8 @@ from common import (
     MAX_PDF_SIZE_MB,
     MAX_PDF_PAGES,
     MAX_PDFS_PER_MESSAGE,
+    MAX_TEXT_FILE_SIZE_MB,
+    MAX_TEXT_FILES_PER_MESSAGE,
     OPENROUTER_MODEL_MAP,
 )
 from models import User, ConnectionManager
@@ -153,6 +156,76 @@ from system_prompt_defaults import (
 )
 
 _BLOCK_VAR_PATTERN = re.compile(r'\{(user_level)\}')
+
+
+TEXT_FILE_EXTENSIONS = {
+    '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm',
+    '.py', '.js', '.ts', '.css', '.sql', '.yaml', '.yml', '.toml',
+    '.ini', '.cfg', '.conf', '.log', '.sh', '.bash',
+    '.java', '.c', '.cpp', '.h', '.hpp', '.go', '.rs', '.rb',
+    '.php', '.r', '.swift', '.kt', '.lua',
+}
+
+
+def is_text_file(content_type: str, filename: str) -> bool:
+    """Check if a file is a recognized text file. Extension is the PRIMARY gate."""
+    if not filename:
+        return False
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in TEXT_FILE_EXTENSIONS:
+        return False
+    ct = (content_type or '').lower()
+    MIME_EXCEPTIONS = {'video/mp2t'}
+    if ct in MIME_EXCEPTIONS:
+        return True
+    if ct.startswith('image/') or ct == 'application/pdf' or ct.startswith('audio/') or ct.startswith('video/'):
+        return False
+    return True
+
+
+def decode_text_file(data: bytes, filename: str) -> str:
+    """Decode text file bytes to UTF-8 string, handling common encodings."""
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        try:
+            return data.decode('utf-16')
+        except (UnicodeDecodeError, UnicodeError):
+            raise ValueError(f"File '{filename}' has a UTF-16 BOM but could not be decoded")
+
+    if b'\x00' in data[:8192]:
+        raise ValueError(f"File '{filename}' appears to be a binary file")
+
+    if data[:3] == b'\xef\xbb\xbf':
+        data = data[3:]
+
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+
+    try:
+        return data.decode('windows-1252')
+    except UnicodeDecodeError:
+        raise ValueError(f"File '{filename}' could not be decoded (unsupported encoding)")
+
+
+def save_text_file_locally(current_user, conversation_id: int, content: str, filename: str) -> str:
+    """Save decoded text content to disk. Returns the URL path for storage in DB."""
+    import hashlib
+    content_hash = hashlib.sha1(content.encode('utf-8')).hexdigest()
+
+    h1, h2, user_hash = generate_user_hash(current_user.username)
+    conv_id_str = f"{conversation_id:07d}"
+    c1, c2 = conv_id_str[:3], conv_id_str[3:]
+
+    dir_path = os.path.join('data', 'users', h1, h2, user_hash, 'files', c1, c2, 'txt')
+    os.makedirs(dir_path, exist_ok=True)
+
+    file_path = os.path.join(dir_path, f'{content_hash}.txt')
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    return f'users/{h1}/{h2}/{user_hash}/files/{c1}/{c2}/txt/{content_hash}.txt'
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +699,8 @@ async def _format_messages_for_provider(
                                 data=base64.b64decode(hydrated_block["data"]),
                                 mime_type="application/pdf"
                             ))
+                    elif block.get("type") == "text_file":
+                        parts.append(genai_types.Part.from_text(text=text_file_block_to_text(block)))
                 if parts:
                     contents.append(genai_types.Content(role=role, parts=parts))
             else:
@@ -676,6 +751,8 @@ async def _format_messages_for_provider(
                             hydrated = hydrate_pdf_for_context(block, "O1")
                             if hydrated is not None:
                                 text_parts.append(hydrated["text"])
+                        elif block.get("type") == "text_file":
+                            text_parts.append(text_file_block_to_text(block))
                         elif block.get("type") == "image_url":
                             text_parts.append("[An image was shared]")
                 msg_content = "\n".join(text_parts) if text_parts else str(msg_content)
@@ -701,6 +778,8 @@ async def _format_messages_for_provider(
                         result = hydrate_pdf_for_context(block, machine)
                         if result is not None:
                             hydrated.append(result)
+                    elif block.get("type") == "text_file":
+                        hydrated.append({"type": "text", "text": text_file_block_to_text(block)})
                     else:
                         hydrated.append(block)
                 api_messages.append({
@@ -1480,6 +1559,12 @@ async def process_save_message(
     """
     logger.debug("enters into process_save_message")
 
+    if files and not current_user.can_send_files:
+        return JSONResponse(
+            content={'success': False, 'message': 'File uploads are not enabled for your account'},
+            status_code=403
+        )
+
     if not prevalidated:
         guard_response = await _validate_message_request(
             request=request,
@@ -1578,6 +1663,12 @@ async def process_save_message(
         logger.debug(f"text en process_save_message: {user_message}")
 
         input_tokens = estimate_message_tokens(user_message)
+
+        if files:
+            for f in files:
+                if is_text_file(f['content_type'], f['filename']):
+                    input_tokens += int(len(f['data']) / 4 * 1.1 + 0.5)
+
         current_balance = await get_balance(current_user.id)
 
         # GranSabio early detection
@@ -1699,11 +1790,14 @@ async def process_save_message(
         # Classify files by type
         images = []
         pdfs = []
+        text_files = []
         for f in files:
             if f['content_type'] == 'application/pdf':
                 pdfs.append(f)
             elif f['content_type'].startswith('image/'):
                 images.append(f)
+            elif is_text_file(f['content_type'], f['filename']):
+                text_files.append(f)
             else:
                 return JSONResponse(
                     content={'success': False, 'message': f"Unsupported file type: {f['content_type']}"},
@@ -1737,6 +1831,51 @@ async def process_save_message(
             )
             message_list_to_save.append(content_to_save)
             message_list_to_send.append(content_to_send)
+
+        # Validate and process text files
+        if text_files:
+            if len(text_files) > MAX_TEXT_FILES_PER_MESSAGE:
+                return JSONResponse(
+                    content={'success': False, 'message': f'Maximum {MAX_TEXT_FILES_PER_MESSAGE} text files per message'},
+                    status_code=400
+                )
+
+            for tf in text_files:
+                size_mb = len(tf['data']) / (1024 * 1024)
+                if size_mb > MAX_TEXT_FILE_SIZE_MB:
+                    return JSONResponse(
+                        content={'success': False, 'message': f"Text file '{tf['filename']}' exceeds {MAX_TEXT_FILE_SIZE_MB}MB limit"},
+                        status_code=400
+                    )
+
+                try:
+                    text_content = decode_text_file(tf['data'], tf['filename'])
+                except ValueError as e:
+                    return JSONResponse(
+                        content={'success': False, 'message': str(e)},
+                        status_code=400
+                    )
+
+                filename = tf['filename'] or 'unnamed.txt'
+                line_count = text_content.count('\n') + 1
+
+                text_file_url = save_text_file_locally(current_user, conversation_id, text_content, filename)
+
+                content_to_save = {
+                    "type": "text_file",
+                    "text_file": {
+                        "url": text_file_url,
+                        "filename": filename,
+                        "lines": line_count
+                    }
+                }
+                message_list_to_save.append(content_to_save)
+
+                content_to_send = {
+                    "type": "text",
+                    "text": f"[Content of uploaded file: {filename} ({line_count} lines)]\n\n{text_content}"
+                }
+                message_list_to_send.append(content_to_send)
 
         # Validate and process images
         if len(images) > MAX_IMAGES_PER_MESSAGE:
@@ -1906,6 +2045,19 @@ async def process_save_message(
         message_text = message_text[:25]
 
         updated_chat_name = message_text
+
+        if not updated_chat_name and message_list_to_save:
+            for block in message_list_to_save:
+                btype = block.get('type', '')
+                if btype == 'text_file':
+                    updated_chat_name = block.get('text_file', {}).get('filename', '')[:25]
+                    break
+                elif btype == 'document_url':
+                    updated_chat_name = block.get('document_url', {}).get('filename', '')[:25]
+                    break
+                elif btype == 'image_url':
+                    updated_chat_name = 'Image'
+                    break
 
         # Update conversation name in database
         async with conversation_write_lock(conversation_id):
@@ -2200,10 +2352,16 @@ async def save_message(
     # Convert UploadFile to dict format if files exist
     files = None
     if file:
-        # Reject early if too many files (before reading any data into memory)
-        # 13 = 10 images + 3 PDFs (MAX_IMAGES_PER_MESSAGE + MAX_PDFS_PER_MESSAGE)
-        MAX_FILES_PER_MESSAGE = 13
         valid_files = [f for f in file if f]
+        if valid_files and not current_user.can_send_files:
+            return JSONResponse(
+                content={'success': False, 'message': 'File uploads are not enabled for your account'},
+                status_code=403
+            )
+
+        # Reject early if too many files (before reading any data into memory)
+        # 16 = 10 images + 3 PDFs + 3 text files
+        MAX_FILES_PER_MESSAGE = 16
         if len(valid_files) > MAX_FILES_PER_MESSAGE:
             return JSONResponse(
                 content={'success': False, 'message': f'Maximum {MAX_FILES_PER_MESSAGE} files per message.'},
@@ -2212,18 +2370,24 @@ async def save_message(
 
         files = []
         for f in valid_files:
-            # Bounded read: use the larger of image/PDF limits to not truncate valid files
-            max_bytes = max(MAX_RAW_UPLOAD_SIZE_MB, MAX_PDF_SIZE_MB) * 1024 * 1024
+            if f.content_type == 'application/pdf':
+                max_bytes = MAX_PDF_SIZE_MB * 1024 * 1024
+            elif is_text_file(f.content_type, f.filename):
+                max_bytes = MAX_TEXT_FILE_SIZE_MB * 1024 * 1024
+            elif f.content_type and f.content_type.startswith('image/'):
+                max_bytes = MAX_RAW_UPLOAD_SIZE_MB * 1024 * 1024
+            else:
+                max_bytes = MAX_TEXT_FILE_SIZE_MB * 1024 * 1024
+
             data = await f.read(max_bytes + 1)
             if len(data) > max_bytes:
-                limit_mb = max(MAX_RAW_UPLOAD_SIZE_MB, MAX_PDF_SIZE_MB)
                 return JSONResponse(
-                    content={'success': False, 'message': f'File "{f.filename}" exceeds {limit_mb} MB limit.'},
+                    content={'success': False, 'message': f"File '{f.filename}' exceeds the {max_bytes // (1024*1024)}MB size limit"},
                     status_code=400
                 )
             files.append({
                 'data': data,
-                'content_type': f.content_type,
+                'content_type': (f.content_type or '').lower(),
                 'filename': f.filename
             })
 
@@ -2993,6 +3157,8 @@ async def get_ai_response(
                                             data=base64.b64decode(hydrated["data"]),
                                             mime_type="application/pdf"
                                         ))
+                                elif block.get("type") == "text_file":
+                                    parts.append(genai_types.Part.from_text(text=text_file_block_to_text(block)))
                             if parts:
                                 gemini_contents.append(genai_types.Content(role=role, parts=parts))
                         else:
@@ -3044,6 +3210,8 @@ async def get_ai_response(
                                         hydrated = hydrate_pdf_for_context(block, "O1")
                                         if hydrated is not None:
                                             text_parts.append(hydrated["text"])
+                                    elif block.get("type") == "text_file":
+                                        text_parts.append(text_file_block_to_text(block))
                                     elif block.get("type") == "image_url":
                                         text_parts.append("[An image was shared]")
                             msg_content = "\n".join(text_parts) if text_parts else str(msg_content)
@@ -3066,6 +3234,8 @@ async def get_ai_response(
                                     result = hydrate_pdf_for_context(block, machine)
                                     if result is not None:
                                         hydrated.append(result)
+                                elif block.get("type") == "text_file":
+                                    hydrated.append({"type": "text", "text": text_file_block_to_text(block)})
                                 else:
                                     hydrated.append(block)
                             api_messages.append({"role": "user" if msg['type'] == 'user' else "assistant", "content": hydrated})
@@ -4489,6 +4659,11 @@ def _convert_messages_for_responses_api(messages: list) -> list:
                     new_content.append({
                         "type": "input_text",
                         "text": f"[PDF document: {fn} -- content unavailable in this format]"
+                    })
+                elif btype == "text_file":
+                    new_content.append({
+                        "type": "input_text",
+                        "text": text_file_block_to_text(block)
                     })
                 else:
                     # Unknown block type, pass through

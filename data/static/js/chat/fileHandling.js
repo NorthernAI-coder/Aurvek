@@ -1,16 +1,41 @@
 const MAX_PDF_SIZE_MB = 25;
 const MAX_IMAGE_SIZE_MB = 20;
+const MAX_TEXT_SIZE_MB = 2;
+
+const TEXT_FILE_EXTENSIONS = new Set([
+    '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm',
+    '.py', '.js', '.ts', '.css', '.sql', '.yaml', '.yml', '.toml',
+    '.ini', '.cfg', '.conf', '.log', '.sh', '.bash',
+    '.java', '.c', '.cpp', '.h', '.hpp', '.go', '.rs', '.rb',
+    '.php', '.r', '.swift', '.kt', '.lua'
+]);
+
+function isTextFile(file) {
+    if (!file.name) return false;
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    if (!TEXT_FILE_EXTENSIONS.has(ext)) return false;
+    const MIME_EXCEPTIONS = new Set(['video/mp2t']);
+    if (file.type && !MIME_EXCEPTIONS.has(file.type)
+        && (file.type.startsWith('image/') || file.type === 'application/pdf'
+        || file.type.startsWith('audio/') || file.type.startsWith('video/'))) return false;
+    return true;
+}
 
 function isAcceptedFileType(file) {
-    return file.type.startsWith('image/') || file.type === 'application/pdf';
+    return file.type.startsWith('image/') || file.type === 'application/pdf' || isTextFile(file);
 }
 
 function validateFileSize(file) {
-    if (file.type === 'application/pdf' && file.size > MAX_PDF_SIZE_MB * 1024 * 1024) {
+    const sizeMB = file.size / (1024 * 1024);
+    if (file.type === 'application/pdf' && sizeMB > MAX_PDF_SIZE_MB) {
         NotificationModal.warning('File too large', `PDF files must be under ${MAX_PDF_SIZE_MB}MB`);
         return false;
-    }
-    if (file.type.startsWith('image/') && file.size > MAX_IMAGE_SIZE_MB * 1024 * 1024) {
+    } else if (isTextFile(file)) {
+        if (sizeMB > MAX_TEXT_SIZE_MB) {
+            NotificationModal.warning('File too large', `Text files must be under ${MAX_TEXT_SIZE_MB}MB`);
+            return false;
+        }
+    } else if (file.type.startsWith('image/') && sizeMB > MAX_IMAGE_SIZE_MB) {
         NotificationModal.warning('File too large', `Images must be under ${MAX_IMAGE_SIZE_MB}MB`);
         return false;
     }
@@ -19,7 +44,7 @@ function validateFileSize(file) {
 
 function handlePasteEvent(event) {
 
-    if (!Config.have_vision) return;
+    if (!Config.can_send_files) return;
     var items = (event.clipboardData || event.originalEvent.clipboardData).items;
     for (var index in items) {
         var item = items[index];
@@ -47,7 +72,7 @@ function processFiles(files, formData, imagePreviews) {
     for (var i = 0; i < files.length; i++) {
         if (!isAcceptedFileType(files[i]) || !validateFileSize(files[i])) {
             if (!isAcceptedFileType(files[i])) {
-                NotificationModal.warning('Invalid File', 'Only image and PDF files are allowed.');
+                NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
             }
             continue;
         }
@@ -77,6 +102,27 @@ function processFiles(files, formData, imagePreviews) {
             imagePreviews.innerHTML = '';
             imagePreviews.classList.add('hidden');
             document.getElementById('chat-files').value = '';
+        } else if (isTextFile(files[i])) {
+            imagePreviews.innerHTML = '';
+            imagePreviews.classList.add('hidden');
+            document.getElementById('chat-files').value = '';
+
+            var msgDiv = document.createElement('div');
+            msgDiv.className = 'message user';
+            var textAttachment = document.createElement('div');
+            textAttachment.className = 'chat-text-attachment';
+            var badge = document.createElement('span');
+            badge.className = 'text-badge';
+            badge.textContent = 'TXT';
+            var label = document.createElement('span');
+            label.textContent = files[i].name;
+            textAttachment.appendChild(badge);
+            textAttachment.appendChild(label);
+            msgDiv.appendChild(textAttachment);
+            var chatMessagesContainer = document.getElementById('chat-messages-container');
+            chatMessagesContainer.appendChild(msgDiv);
+            var chatWindow = document.getElementById('chat-window');
+            chatWindow.scrollTop = chatWindow.scrollHeight;
         } else {
             // Existing image preview logic
             var reader = new FileReader();
@@ -120,9 +166,11 @@ function processFiles(files, formData, imagePreviews) {
 }
 
 
-if (Config.have_vision) {
+function initFileHandling() {
+    if (!Config.can_send_files) return;
     document.addEventListener('paste', handlePasteEvent);
-    document.getElementById('chat-files').addEventListener('change', handleFileSelect);
+    const fileInput = document.getElementById('chat-files');
+    if (fileInput) fileInput.addEventListener('change', handleFileSelect);
 }
 
 function handleFileSelect(event) {
@@ -132,7 +180,7 @@ function handleFileSelect(event) {
     for (const file of files) {
         if (!isAcceptedFileType(file) || !validateFileSize(file)) {
             if (!isAcceptedFileType(file)) {
-                NotificationModal.warning('Invalid File', 'Only image and PDF files are allowed.');
+                NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
             }
             continue;
         }
@@ -150,6 +198,18 @@ function handleFileSelect(event) {
             pdfPreview.appendChild(iconSpan);
             pdfPreview.appendChild(nameSpan);
             imagePreviews.appendChild(pdfPreview);
+        } else if (isTextFile(file)) {
+            const previewItem = document.createElement('div');
+            previewItem.className = 'text-preview-item';
+            const icon = document.createElement('span');
+            icon.className = 'text-icon';
+            icon.textContent = 'TXT';
+            const name = document.createElement('span');
+            name.className = 'text-name';
+            name.textContent = file.name;
+            previewItem.appendChild(icon);
+            previewItem.appendChild(name);
+            imagePreviews.appendChild(previewItem);
         } else {
             // Existing image preview logic
             const reader = new FileReader();

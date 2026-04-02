@@ -7,6 +7,7 @@ const Config = {
     currentStopIcon: null,
     attachedFiles: [],
     have_vision: true,
+    can_send_files: false,
     mediaRecorder: null,
     audioChunks: []
 };

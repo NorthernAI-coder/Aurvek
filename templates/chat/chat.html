@@ -488,7 +488,7 @@
                         </button>
                         <div class="plus-menu-dropdown" id="plus-menu-dropdown">
                             <div class="plus-menu-section">
-                                {% if have_vision %}
+                                {% if can_send_files %}
                                 <button type="button" class="plus-menu-item" id="plus-attach-files">
                                     <i class="fas fa-paperclip"></i>
                                     <span class="plus-menu-label">Attach files</span>
@@ -556,7 +556,7 @@
                         </button>
                     </div>
                 </div>
-                <input id="chat-files" type="file" class="hidden" accept="image/*,application/pdf" multiple disabled>
+                <input id="chat-files" type="file" class="hidden" accept="image/*,application/pdf,.txt,.md,.csv,.json,.xml,.html,.htm,.py,.js,.ts,.css,.sql,.yaml,.yml,.toml,.ini,.cfg,.conf,.log,.sh,.bash,.java,.c,.cpp,.h,.hpp,.go,.rs,.rb,.php,.r,.swift,.kt,.lua" multiple disabled>
                 <audio id="audioPlayer" style="display: none;"></audio>
             </form>
             <div id="audio-recording-controls" class="hidden">
@@ -574,7 +574,7 @@
                 Your current balance is 0, please <a href="/payment">recharge your balance</a> or <a href="/settings#api-keys">BYOK</a>.
             </div>
         </div>
-        {% if have_vision %}
+        {% if can_send_files %}
         <div id="drop-zone-overlay"
             class="drop-zone-overlay position-absolute d-none justify-content-center align-items-center"
             style="top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); z-index: 1050;">
@@ -732,6 +732,7 @@
         var startDate = {{ start_date_iso | tojson }};
         var currentConversationId = {{ conversation_id|tojson }};
         var have_vision = {{ have_vision | tojson }};
+        Config.can_send_files = {{ can_send_files | tojson }};
         var user_id = {{ user_id }};
         var username = "{{ username }}";
         var userProfilePicture = "{{ user_profile_picture | default('', true) }}";

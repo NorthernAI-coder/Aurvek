@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 
 # Own libraries
 from database import get_db_connection
-from common import generate_user_hash
+from common import generate_user_hash, text_file_block_to_text
 
 # =============================
 # Logging Configuration
@@ -267,7 +267,10 @@ def process_inline(element):
             return f"<sup>{content}</sup>"
         elif element.name == "a":
             href = element.get("href", "")
-            return f'<a href="{href}">{content}</a>'
+            if href.lower().startswith(("http://", "https://")):
+                safe_href = xml.sax.saxutils.escape(href, {'"': "&quot;"})
+                return f'<a href="{safe_href}">{content}</a>'
+            return content
         elif element.name == "br":
             return "<br/>"
         elif element.name == "code":
@@ -608,6 +611,13 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
                         continue
                     if element_json.get("type") == "text":
                         html_text = markdown_to_html(str(element_json.get("text", "")))
+                        message_elements = html_to_reportlab(html_text, styles, hash_prefixes)
+                        elements.extend(message_elements)
+                        elements.append(Spacer(1, 0.05 * inch))
+                        elements.append(Paragraph(date_str, styles["small_italic"]))
+                    elif element_json.get("type") == "text_file":
+                        file_text = text_file_block_to_text(element_json)
+                        html_text = markdown_to_html(file_text)
                         message_elements = html_to_reportlab(html_text, styles, hash_prefixes)
                         elements.extend(message_elements)
                         elements.append(Spacer(1, 0.05 * inch))
