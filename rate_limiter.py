@@ -117,6 +117,101 @@ class RateLimiter:
 
         return max(0, int(seconds_remaining))
 
+    def clear_for_identifier(self, identifier: str) -> int:
+        """Clear all identifier-scoped buckets for a username or email."""
+        suffix = f":{identifier.lower()}"
+        keys_to_delete = [key for key in self._attempts if key.lower().endswith(suffix)]
+        for key in keys_to_delete:
+            del self._attempts[key]
+        return len(keys_to_delete)
+
+    def clear_for_ip(self, ip: str) -> int:
+        """Clear all IP-scoped buckets for a specific IP."""
+        suffix = f":{ip}"
+        keys_to_delete = [key for key in self._attempts if key.endswith(suffix)]
+        for key in keys_to_delete:
+            del self._attempts[key]
+        return len(keys_to_delete)
+
+    def get_status_for_identifier(self, identifier: str, limits_config: dict = None) -> dict:
+        """
+        Return current rate-limit status for all buckets matching an identifier.
+        """
+        self._cleanup_old_entries()
+
+        suffix = f":{identifier.lower()}"
+        now = datetime.now()
+        status = {}
+
+        for key, timestamps in self._attempts.items():
+            if not key.lower().endswith(suffix):
+                continue
+
+            matched_limit = None
+            matched_window = 60
+            for prefix, (max_attempts, window_minutes) in (limits_config or {}).items():
+                if key.startswith(prefix):
+                    matched_limit = max_attempts
+                    matched_window = window_minutes
+                    break
+
+            window_start = now - timedelta(minutes=matched_window)
+            recent = [timestamp for timestamp in timestamps if timestamp > window_start]
+            if not recent and matched_limit is None:
+                continue
+
+            blocked = len(recent) >= matched_limit if matched_limit else False
+            retry_after = 0
+            if blocked and recent:
+                oldest = min(recent)
+                retry_after = max(
+                    0,
+                    int((oldest + timedelta(minutes=matched_window) - now).total_seconds())
+                )
+
+            status[key] = {
+                "attempts_in_window": len(recent),
+                "limit": matched_limit,
+                "window_minutes": matched_window,
+                "blocked": blocked,
+                "retry_after_seconds": retry_after,
+            }
+
+        return status
+
+    def get_blocked_ips_for_action(self, action: str, limits: dict) -> list:
+        """Return IPs currently blocked for a specific action across IP buckets."""
+        self._cleanup_old_entries()
+
+        now = datetime.now()
+        blocked = []
+        seen_ips = set()
+
+        for bucket_type, (max_attempts, window_minutes) in limits.items():
+            prefix = f"{bucket_type}:{action}:"
+            window_start = now - timedelta(minutes=window_minutes)
+
+            for key, timestamps in self._attempts.items():
+                if not key.startswith(prefix):
+                    continue
+
+                recent = [timestamp for timestamp in timestamps if timestamp > window_start]
+                if len(recent) < max_attempts:
+                    continue
+
+                ip = key[len(prefix):]
+                if ip in seen_ips:
+                    continue
+
+                blocked.append({
+                    "ip": ip,
+                    "bucket": bucket_type,
+                    "attempts": len(recent),
+                })
+                seen_ips.add(ip)
+
+        return blocked
+
 
 # Singleton instance
 rate_limiter = RateLimiter()

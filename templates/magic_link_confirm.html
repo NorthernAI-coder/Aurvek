@@ -1,0 +1,46 @@
+{% extends 'base.html' %}
+
+{% block title %}Confirm Login{% endblock %}
+
+{% block styles %}
+<style>
+    .main-container {
+        padding: 0;
+        max-width: none;
+    }
+</style>
+{% endblock %}
+
+{% block skeleton %}{% endblock %}
+{% block navbar %}{% endblock %}
+{% block header %}{% endblock %}
+{% block toolbar %}{% endblock %}
+{% block alerts %}{% endblock %}
+
+{% block content %}
+<div class="container d-flex align-items-center justify-content-center" style="min-height: 100vh;">
+    <div class="card shadow" style="width: 28rem;">
+        <div class="card-body p-4">
+            <h2 class="card-title text-center mb-3">Confirm Login</h2>
+            <p class="text-center text-muted mb-4">
+                Log in as <strong>{{ username }}</strong>
+            </p>
+
+            <form action="{{ login_url }}" method="POST">
+                <input type="hidden" name="magic_token" value="{{ token }}">
+                <input type="hidden" name="next" value="{{ next_url|default('', true) }}">
+                <input type="hidden" name="confirm_nonce" value="{{ confirm_nonce }}">
+
+                <div class="d-grid gap-2">
+                    <button type="submit" class="btn btn-primary">
+                        Continue
+                    </button>
+                    <a href="{{ login_url }}" class="btn btn-outline-secondary">
+                        Cancel
+                    </a>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

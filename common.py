@@ -48,6 +48,7 @@ openrouter_key = os.getenv('OPENROUTER_API_KEY')
 
 # Security: cookie secure flag (requires HTTPS in production)
 SECURE_COOKIES = os.getenv("SECURE_COOKIES", "false").lower() == "true"
+PRIMARY_APP_DOMAIN = os.getenv("PRIMARY_APP_DOMAIN", "").strip()
 
 # Failover read-only mode: blocks all write operations (POST/PUT/DELETE/PATCH)
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
@@ -108,6 +109,49 @@ def validate_twilio_media_url(url: str) -> bool:
     except Exception as e:
         logger.error(f"Error validating media URL: {e}")
         return False
+
+
+_auth_base_url_warning_emitted = False
+
+
+def get_request_base_url(request) -> str:
+    """
+    Build a base URL that reflects the current request host.
+    Use this for non-auth URLs that legitimately depend on the incoming domain.
+    """
+    if request.headers.get("cf-connecting-ip"):
+        scheme = "https"
+    else:
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+
+    host = request.headers.get("host", request.url.hostname)
+    if "x-forwarded-proto" in request.headers or "cf-connecting-ip" in request.headers:
+        return f"{scheme}://{host}"
+
+    port = request.url.port
+    if port and port not in (80, 443) and ":" not in host:
+        return f"{scheme}://{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def get_auth_base_url(request) -> str:
+    """
+    Build the canonical base URL for auth-sensitive links.
+    In production this should come from PRIMARY_APP_DOMAIN to avoid trusting
+    attacker-controlled Host headers for magic links and verification emails.
+    """
+    global _auth_base_url_warning_emitted
+
+    if PRIMARY_APP_DOMAIN:
+        return f"https://{PRIMARY_APP_DOMAIN}"
+
+    if not _auth_base_url_warning_emitted:
+        logger.warning(
+            "PRIMARY_APP_DOMAIN not set -- using request Host for auth URL (set this in production)"
+        )
+        _auth_base_url_warning_emitted = True
+
+    return get_request_base_url(request)
 
 # Telegram Bot API
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')

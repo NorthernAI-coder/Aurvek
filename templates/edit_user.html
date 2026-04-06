@@ -281,6 +281,30 @@
                 </div>
             </div>
 
+            {% if is_admin %}
+            <div class="section-container">
+                <div class="section-title"><i class="fas fa-tachometer-alt me-2"></i>Rate Limits</div>
+                <div id="rateLimitWarning" class="alert alert-warning" style="display: none;"></div>
+                <div id="rateLimitStatus" class="mb-3 text-muted">Loading rate limit status...</div>
+                <div class="mb-3">
+                    <button type="button" class="btn btn-outline-warning btn-sm" onclick="resetUserRateLimits()">
+                        <i class="fas fa-undo me-1"></i> Reset User Rate Limits
+                    </button>
+                </div>
+                <div class="mb-2">
+                    <label for="rateLimitIpInput" class="form-label">Reset IP Rate Limits</label>
+                    <div class="input-group" style="max-width: 420px;">
+                        <input type="text" class="form-control" id="rateLimitIpInput" placeholder="Enter blocked IP or IPv6 address">
+                        <button type="button" class="btn btn-outline-danger" onclick="resetIpRateLimits()">
+                            <i class="fas fa-ban me-1"></i> Reset IP
+                        </button>
+                    </div>
+                    <small class="form-text text-muted">IP-based login limits are global, not tied to a single user.</small>
+                </div>
+                <div id="blockedIpList" class="small text-muted"></div>
+            </div>
+            {% endif %}
+
             <!-- Section 6: Category Access (visible when public prompts enabled) -->
             <div class="section-container" id="categoryAccessSection" style="{% if not user_data.public_prompts_access %}display: none;{% endif %}">
                 <div class="section-title"><i class="fas fa-tags me-2"></i>Category Access</div>
@@ -601,5 +625,159 @@
     window.toggleBillingOptions = toggleBillingOptions;
     window.toggleLimitInput = toggleLimitInput;
     window.toggleAutoRefillSettings = toggleAutoRefillSettings;
+
+    {% if is_admin %}
+    const editedUsername = {{ user_data.username|tojson }};
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function formatBucketLabel(bucketKey) {
+        if (bucketKey.startsWith('id:login:')) return 'Login attempts';
+        if (bucketKey.startsWith('id_fail:login:')) return 'Login failures';
+        if (bucketKey.startsWith('id:recovery:')) return 'Recovery attempts';
+        if (bucketKey.startsWith('id_fail:recovery:')) return 'Recovery failures';
+        return bucketKey;
+    }
+
+    function renderRateLimitStatus(data) {
+        const statusEl = document.getElementById('rateLimitStatus');
+        const warningEl = document.getElementById('rateLimitWarning');
+        const blockedIpEl = document.getElementById('blockedIpList');
+        if (!statusEl || !warningEl || !blockedIpEl) return;
+
+        if (data.warning) {
+            warningEl.style.display = 'block';
+            warningEl.textContent = data.warning;
+        } else {
+            warningEl.style.display = 'none';
+            warningEl.textContent = '';
+        }
+
+        const buckets = Object.entries(data.limits || {});
+        if (!buckets.length) {
+            statusEl.innerHTML = '<div class="text-success">No active identifier rate-limit buckets for this user.</div>';
+        } else {
+            statusEl.innerHTML = buckets.map(([key, info]) => {
+                const blockedText = info.blocked
+                    ? `Blocked for ${info.retry_after_seconds || 0}s`
+                    : 'Not blocked';
+                const textClass = info.blocked ? 'text-danger' : 'text-muted';
+                return `
+                    <div class="border rounded p-2 mb-2">
+                        <div><strong>${escapeHtml(formatBucketLabel(key))}</strong></div>
+                        <div class="${textClass}">Attempts: ${info.attempts_in_window} / ${info.limit || '-'} in ${info.window_minutes}m</div>
+                        <div class="${textClass}">${blockedText}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        const blockedIps = data.blocked_login_ips || [];
+        if (!blockedIps.length) {
+            blockedIpEl.innerHTML = '<div>No globally blocked login IPs at the moment.</div>';
+            return;
+        }
+
+        blockedIpEl.innerHTML = `
+            <div class="mb-2"><strong>IPs currently blocked globally for login</strong></div>
+            ${blockedIps.map(item => `
+                <div class="border rounded p-2 mb-2 d-flex justify-content-between align-items-center gap-2">
+                    <div>
+                        <div><code>${escapeHtml(item.ip)}</code></div>
+                        <div class="text-muted">${escapeHtml(item.bucket)} bucket, ${item.attempts} attempts</div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-danger" onclick="prefillRateLimitIp(${JSON.stringify(item.ip)})">
+                        Use IP
+                    </button>
+                </div>
+            `).join('')}
+        `;
+    }
+
+    async function loadRateLimitStatus() {
+        const response = await secureFetch('/admin/rate-limits/status/' + encodeURIComponent(editedUsername));
+        if (!response) return;
+
+        const data = await response.json();
+        if (!response.ok) {
+            NotificationModal.error('Rate Limits', data.detail || 'Could not load rate limit status.');
+            return;
+        }
+
+        renderRateLimitStatus(data);
+    }
+
+    async function resetUserRateLimits() {
+        NotificationModal.confirm(
+            'Reset User Rate Limits',
+            `Clear all login and recovery rate-limit buckets for ${editedUsername}?`,
+            async () => {
+                const response = await secureFetch('/admin/rate-limits/clear/' + encodeURIComponent(editedUsername), {
+                    method: 'POST'
+                });
+                if (!response) return;
+
+                const data = await response.json();
+                if (!response.ok) {
+                    NotificationModal.error('Reset Failed', data.detail || 'Could not reset user rate limits.');
+                    return;
+                }
+
+                NotificationModal.success('Rate Limits Reset', `Cleared ${data.cleared} bucket(s) for ${editedUsername}.`);
+                if (data.warning) {
+                    NotificationModal.warning('Multi-worker Warning', data.warning);
+                }
+                loadRateLimitStatus();
+            }
+        );
+    }
+
+    function prefillRateLimitIp(ip) {
+        const input = document.getElementById('rateLimitIpInput');
+        if (!input) return;
+        input.value = ip;
+        input.focus();
+    }
+
+    async function resetIpRateLimits() {
+        const input = document.getElementById('rateLimitIpInput');
+        const ip = input ? input.value.trim() : '';
+        if (!ip) {
+            NotificationModal.warning('Missing IP', 'Enter an IP address to reset.');
+            return;
+        }
+
+        NotificationModal.confirm(
+            'Reset IP Rate Limits',
+            `Clear all global login rate-limit buckets for ${ip}?`,
+            async () => {
+                const response = await secureFetch('/admin/rate-limits/clear-ip/' + encodeURIComponent(ip), {
+                    method: 'POST'
+                });
+                if (!response) return;
+
+                const data = await response.json();
+                if (!response.ok) {
+                    NotificationModal.error('Reset Failed', data.detail || 'Could not reset IP rate limits.');
+                    return;
+                }
+
+                NotificationModal.success('IP Rate Limits Reset', `Cleared ${data.cleared} bucket(s) for ${ip}.`);
+                if (data.warning) {
+                    NotificationModal.warning('Multi-worker Warning', data.warning);
+                }
+                loadRateLimitStatus();
+            }
+        );
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadRateLimitStatus();
+    });
+    {% endif %}
 </script>
 {% endblock %}

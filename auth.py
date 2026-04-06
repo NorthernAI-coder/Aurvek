@@ -2,6 +2,7 @@
 import os
 import bcrypt
 import secrets
+import sqlite3
 import jwt
 from jwt import PyJWTError as JWTError
 from passlib.context import CryptContext
@@ -13,11 +14,19 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse, JSONResponse
+from urllib.parse import urlencode
 
 # Own libraries
 from log_config import logger
 from rediscfg import is_user_revoked
-from common import SECRET_KEY, PEPPER, SECURE_COOKIES, decode_jwt_cached, verify_token_expiration
+from common import (
+    SECRET_KEY,
+    PEPPER,
+    SECURE_COOKIES,
+    decode_jwt_cached,
+    verify_token_expiration,
+    get_auth_base_url,
+)
 
 load_dotenv()
 
@@ -47,7 +56,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     
     # Use UTC explicitly
     current_time = datetime.now(timezone.utc)
-    if expires_delta:
+    if expires_delta is not None:
         expire = current_time + expires_delta
     else:
         expire = current_time + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -125,6 +134,7 @@ async def get_current_user(request: Request) -> Optional[User]:
 # Function to get a user by username
 async def get_user_by_username(username: str) -> Optional[User]:
     logger.info("entra en get_user_by_username")
+    username = username.strip().lower()
     async with get_db_connection(readonly=True) as conn:
         query = '''
         SELECT
@@ -139,7 +149,7 @@ async def get_user_by_username(username: str) -> Optional[User]:
         FROM USERS u
         LEFT JOIN USER_DETAILS ud ON u.id = ud.user_id
         LEFT JOIN VOICES v ON ud.voice_id = v.id
-        WHERE u.username = ?
+        WHERE LOWER(u.username) = ?
         '''
         async with conn.execute(query, (username,)) as cursor:
             row = await cursor.fetchone()
@@ -339,12 +349,13 @@ async def create_user_info(user, used_magic_link):
         "used_magic_link": used_magic_link  # New boolean field
     }
 
-def create_login_response(user_info, redirect_url=None, default_redirect="/home"):
+def create_login_response(user_info, redirect_url=None, default_redirect="/home", expires_delta: Optional[timedelta] = None):
     token = create_access_token(
         data={
             "sub": user_info["username"],
             "user_info": user_info
-        }
+        },
+        expires_delta=expires_delta
     )
 
     # Use provided redirect_url if it's a safe internal path
@@ -356,7 +367,10 @@ def create_login_response(user_info, redirect_url=None, default_redirect="/home"
     response = RedirectResponse(url=url_redirect, status_code=status.HTTP_302_FOUND)
 
     # Configure cookie with correct expiration time
-    max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60  # convert to seconds
+    if expires_delta is not None:
+        max_age = int(expires_delta.total_seconds())
+    else:
+        max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60  # convert to seconds
     response.set_cookie(
         key="session",
         value=token,
@@ -379,25 +393,43 @@ def unauthenticated_response():
     return response
 
 
-async def generate_magic_link(user_id: int, url_path: str, request: Request) -> str:
+async def generate_magic_link(user_id: int, url_path: str, request: Request, next_url: Optional[str] = None) -> str:
     token = secrets.token_urlsafe(20)
     expires_at = datetime.now() + timedelta(days=3)
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
-        await cursor.execute('INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)', (user_id, token, expires_at))
+        try:
+            await cursor.execute(
+                '''
+                INSERT INTO magic_links (user_id, token, expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    token = excluded.token,
+                    expires_at = excluded.expires_at
+                ''',
+                (user_id, token, expires_at)
+            )
+        except sqlite3.OperationalError as e:
+            if "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" not in str(e):
+                raise
+            await cursor.execute(
+                'UPDATE magic_links SET token = ?, expires_at = ? WHERE user_id = ?',
+                (token, expires_at, user_id)
+            )
+            if cursor.rowcount == 0:
+                await cursor.execute(
+                    'INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)',
+                    (user_id, token, expires_at)
+                )
         await conn.commit()
-        await conn.close()
 
-        scheme = request.url.scheme
-        host = request.url.hostname
-        port = request.url.port
+        query_params = {"token": token}
+        if next_url:
+            query_params["next"] = next_url
 
-        if port and port not in [80, 443]:
-            magic_link = f'{scheme}://{host}:{port}/{url_path}?token={token}'
-        else:
-            magic_link = f'{scheme}://{host}/{url_path}?token={token}'
-
-        return magic_link
+        base_url = get_auth_base_url(request).rstrip("/")
+        path = url_path.lstrip("/")
+        return f"{base_url}/{path}?{urlencode(query_params)}"
 
 
 # Google OAuth helper functions

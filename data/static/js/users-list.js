@@ -44,6 +44,7 @@ function initializeUsersData() {
         return {
             element: row,
             username: row.dataset.username,
+            magicLink: row.dataset.magicLink || '',
             role: row.dataset.role || '',
             phone: row.dataset.phone || '',
             status: row.dataset.status,
@@ -276,6 +277,7 @@ function updateStats(filteredCount) {
     const active = UsersListState.users.filter(u => u.status === 'active').length;
     const expired = UsersListState.users.filter(u => u.status === 'expired').length;
     const password = UsersListState.users.filter(u => u.status === 'password').length;
+    const noLink = UsersListState.users.filter(u => u.status === 'no_link').length;
 
     document.getElementById('statTotal').textContent = total;
     document.getElementById('statActive').textContent = active;
@@ -283,6 +285,8 @@ function updateStats(filteredCount) {
 
     const statPassword = document.getElementById('statPassword');
     if (statPassword) statPassword.textContent = password;
+    const statNoLink = document.getElementById('statNoLink');
+    if (statNoLink) statNoLink.textContent = noLink;
 
     const filteredStat = document.getElementById('statFiltered');
     const filteredContainer = document.getElementById('statFilteredContainer');
@@ -365,8 +369,10 @@ function showMagicLink(magicLink, username, isExpired, isPasswordOnly) {
     const copyMessage = document.getElementById('copyMessage');
     if (copyMessage) copyMessage.style.display = 'none';
 
-    if (isPasswordOnly || !magicLink || magicLink === 'None') {
-        input.value = 'No magic link (password-only user)';
+    if (!magicLink || magicLink === 'None') {
+        input.value = isPasswordOnly
+            ? 'No magic link (password-only user)'
+            : 'No magic link generated';
         input.style.opacity = '0.6';
         actionButton.innerHTML = '<i class="fas fa-magic me-1"></i> Generate';
         actionButton.className = 'btn btn-info';
@@ -447,20 +453,30 @@ async function renewMagicLink(username) {
             NotificationModal.error('Renewal Failed', data.error);
             actionButton.innerHTML = '<i class="fas fa-sync me-1"></i> Renew';
         } else {
-            showMagicLink(data.magic_link, username, false);
+            showMagicLink(data.magic_link, username, false, false);
 
             // Update the row status
             const row = document.querySelector(`tr[data-username="${username}"]`);
             if (row) {
                 row.dataset.status = 'active';
+                row.dataset.magicLink = data.magic_link;
                 const statusCell = row.querySelector('.status-cell');
                 if (statusCell) {
                     statusCell.innerHTML = '<span class="status-active" title="Magic link active"><i class="fas fa-check-circle"></i></span>';
                 }
+                const usernameLink = row.querySelector('.username-link');
+                if (usernameLink) {
+                    usernameLink.onclick = function() {
+                        showMagicLink(data.magic_link, username, false, false);
+                    };
+                }
 
                 // Update state
                 const user = UsersListState.users.find(u => u.username === username);
-                if (user) user.status = 'active';
+                if (user) {
+                    user.status = 'active';
+                    user.magicLink = data.magic_link;
+                }
 
                 // Recalculate stats
                 updateStats(getVisibleCheckboxes().length);

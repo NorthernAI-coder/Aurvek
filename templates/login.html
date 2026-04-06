@@ -122,6 +122,7 @@
                 {% endif %}
 
                 <form action="{{ login_url }}" method="POST" id="loginFormPrompt" class="login-form">
+                    <input type="hidden" name="next" value="{{ next_url|default('', true) }}">
                     <div class="mb-3">
                         <label for="username" class="form-label">Username</label>
                         <input type="text" class="form-control form-control-lg" id="username" name="username" required
@@ -137,6 +138,9 @@
                     <div class="cf-turnstile mb-3" data-sitekey="{{ captcha.site_key }}" data-theme="light" data-callback="onTurnstileSuccess"></div>
                     {% endif %}
                     <input type="hidden" name="captcha_token" id="captchaTokenPrompt" value="">
+                    <div class="text-end mb-3">
+                        <a href="{{ recovery_url|default('/magic-link-recovery') }}" class="form-text text-decoration-none">Can't log in?</a>
+                    </div>
                     <div class="d-grid gap-2 mt-4">
                         <button type="submit" class="btn btn-primary btn-lg login-submit-btn" {% if captcha and captcha.enabled and captcha.provider == 'turnstile' %}disabled{% endif %}>Log In</button>
                     </div>
@@ -148,7 +152,7 @@
                 </div>
 
                 <div class="d-grid gap-2">
-                    <a href="/auth/google{% if prompt %}?prompt_id={{ prompt.id }}{% endif %}"
+                    <a href="{{ google_oauth_url|default('/auth/google') }}"
                        class="btn btn-outline-secondary btn-lg d-flex align-items-center justify-content-center">
                         <img src="{{ get_static_url('/static/img/providers/google.svg') }}" width="20" height="20" class="me-2" alt="">
                         Sign in with Google
@@ -177,6 +181,7 @@
             {% endif %}
 
             <form action="{{ login_url|default('/login') }}" method="POST" id="loginFormMain" class="login-form">
+                <input type="hidden" name="next" value="{{ next_url|default('', true) }}">
                 <div class="mb-3">
                     <label for="usernameMain" class="form-label">Username:</label>
                     <input type="text" class="form-control" id="usernameMain" name="username" required>
@@ -190,6 +195,9 @@
                 <div class="cf-turnstile mb-3" data-sitekey="{{ captcha.site_key }}" data-theme="light" data-callback="onTurnstileSuccess"></div>
                 {% endif %}
                 <input type="hidden" name="captcha_token" id="captchaTokenMain" value="">
+                <div class="text-end mb-3">
+                    <a href="{{ recovery_url|default('/magic-link-recovery') }}" class="form-text text-decoration-none">Can't log in?</a>
+                </div>
                 <div class="d-grid gap-2">
                     <button type="submit" class="btn btn-primary login-submit-btn" {% if captcha and captcha.enabled and captcha.provider == 'turnstile' %}disabled{% endif %}>Log In</button>
                 </div>
@@ -201,7 +209,7 @@
             </div>
 
             <div class="d-grid gap-2">
-                <a href="/auth/google"
+                <a href="{{ google_oauth_url|default('/auth/google') }}"
                    class="btn btn-outline-secondary d-flex align-items-center justify-content-center">
                     <img src="{{ get_static_url('/static/img/providers/google.svg') }}" width="18" height="18" class="me-2" alt="">
                     Sign in with Google

@@ -655,11 +655,43 @@ const NekoGlassControls = (() => {
             if (file.size > 5 * 1024 * 1024) {
                 wpStatus.textContent = 'Too large (max 5 MB)';
                 wpStatus.classList.add('error');
+                wpInput.value = '';
+                return;
+            }
+
+            // Client-side dimension check to avoid server timeouts on huge images
+            wpStatus.textContent = 'Checking image...';
+            wpStatus.classList.remove('error');
+            try {
+                await new Promise((resolve, reject) => {
+                    const url = URL.createObjectURL(file);
+                    const img = new Image();
+                    img.onload = () => {
+                        URL.revokeObjectURL(url);
+                        const pixels = img.width * img.height;
+                        if (pixels > 50_000_000) {
+                            reject(new Error(
+                                'Image resolution too high (' + img.width + 'x' + img.height +
+                                '). Max ~7000x7000 pixels'
+                            ));
+                        } else {
+                            resolve();
+                        }
+                    };
+                    img.onerror = () => {
+                        URL.revokeObjectURL(url);
+                        reject(new Error('Cannot read image. Check the file is valid'));
+                    };
+                    img.src = url;
+                });
+            } catch (validationErr) {
+                wpStatus.textContent = validationErr.message;
+                wpStatus.classList.add('error');
+                wpInput.value = '';
                 return;
             }
 
             wpStatus.textContent = 'Uploading...';
-            wpStatus.classList.remove('error');
 
             const formData = new FormData();
             formData.append('file', file);
@@ -673,7 +705,19 @@ const NekoGlassControls = (() => {
 
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
-                    throw new Error(err.detail || `Upload failed (${res.status})`);
+                    let msg = err.detail;
+                    if (!msg) {
+                        switch (res.status) {
+                            case 400: msg = 'Invalid image or unsupported format'; break;
+                            case 401: msg = 'Session expired. Please log in again'; break;
+                            case 413: msg = 'File too large (max 5 MB)'; break;
+                            case 524: msg = 'Upload timed out. Try a smaller image'; break;
+                            case 502:
+                            case 503: msg = 'Server temporarily unavailable. Try again'; break;
+                            default:  msg = 'Upload failed (error ' + res.status + ')';
+                        }
+                    }
+                    throw new Error(msg);
                 }
 
                 _settings.wallpaperMode = 'custom';

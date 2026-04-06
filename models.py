@@ -123,18 +123,17 @@ class User:
     async def get_magic_link_expiration(self) -> Optional[datetime]:
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
-            await cursor.execute('SELECT expires_at FROM magic_links WHERE user_id = ?', (self.id,))
+            await cursor.execute(
+                'SELECT expires_at FROM magic_links WHERE user_id = ? ORDER BY expires_at DESC LIMIT 1',
+                (self.id,)
+            )
             result = await cursor.fetchone()
         if result and result[0]:
-            return datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S.%f')
+            try:
+                return datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S.%f')
+            except ValueError:
+                return datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
         return None
-
-    async def session_expired(self) -> bool:
-        expires_at = await self.get_magic_link_expiration()
-        logger.info("SESSION EXPIRED RESULT: %s", expires_at)
-        if expires_at:
-            return expires_at < datetime.now()
-        return True
 
     def can_use_magic_link(self) -> bool:
         """Check if user can use magic link authentication"""

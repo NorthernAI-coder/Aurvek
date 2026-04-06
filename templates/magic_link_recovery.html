@@ -37,6 +37,7 @@
             {% endif %}
 
             <form id="recoveryForm" action="/magic-link-recovery" method="POST">
+                <input type="hidden" name="next" value="{{ next_url|default('', true) }}">
                 <div class="mb-3">
                     <label for="email" class="form-label">Email Address:</label>
                     <input type="email" class="form-control" id="email" name="email" required
@@ -51,7 +52,7 @@
 
             <div class="text-center mt-3">
                 <small class="text-muted">
-                    Remember your password? <a href="/login" class="text-decoration-none">Login here</a>
+                    Remember your password? <a href="{{ login_url|default('/login') }}" class="text-decoration-none">Login here</a>
                 </small>
             </div>
         </div>

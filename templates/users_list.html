@@ -89,6 +89,9 @@
     <span class="stat-badge stat-password">
         <i class="fas fa-key"></i> <strong id="statPassword">{{ users|selectattr('is_expired', 'eq', 'N/A')|list|length }}</strong> Password
     </span>
+    <span class="stat-badge">
+        <i class="fas fa-unlink"></i> <strong id="statNoLink">{{ users|selectattr('is_expired', 'eq', 'No Link')|list|length }}</strong> No Link
+    </span>
     <span class="stat-badge" id="statFilteredContainer" style="display: none;">
         <i class="fas fa-filter"></i> <strong id="statFiltered">0</strong> Shown
     </span>
@@ -114,6 +117,7 @@
                 <option value="active">Active</option>
                 <option value="expired">Expired</option>
                 <option value="password">Password Only</option>
+                <option value="no_link">No Link</option>
             </select>
         </div>
         <div class="flex-column">
@@ -205,7 +209,7 @@
                     <tr data-username="{{ user.username }}"
                         data-role="{{ user.role }}"
                         data-phone="{{ user.phone or '' }}"
-                        data-status="{{ 'expired' if user.is_expired == 'Expired' else ('password' if user.is_expired == 'N/A' else 'active') }}"
+                        data-status="{{ 'expired' if user.is_expired == 'Expired' else ('password' if user.is_expired == 'N/A' else ('no_link' if user.is_expired == 'No Link' else 'active')) }}"
                         data-prompt="{{ user.prompt_name }}"
                         data-llm="{{ user.llm_model }}"
                         data-tokens="{{ user.tokens }}"
@@ -217,7 +221,7 @@
                             <input type="checkbox" name="selected_users" value="{{ user.username }}" class="user-checkbox">
                         </td>
                         <td>
-                            <span class="username-link" onclick="showMagicLink('{{ user.magic_link or '' }}', '{{ user.username }}', {{ 'true' if user.is_expired == 'Expired' else 'false' }}, {{ 'true' if user.is_expired == 'N/A' else 'false' }})" title="Click to view magic link">
+                            <span class="username-link" onclick="showMagicLink('{{ user.magic_link or '' }}', '{{ user.username }}', {{ 'true' if user.is_expired == 'Expired' else 'false' }}, {{ 'true' if not user.magic_link and user.authentication_mode == 'password_only' else 'false' }})" title="Click to view magic link">
                                 <i class="fas fa-user me-1"></i>{{ user.username }}
                             </span>
                             {% if user.auth_provider in ('google', 'google_linked') %}
@@ -247,6 +251,8 @@
                             <span class="status-expired" title="Magic link expired"><i class="fas fa-times-circle"></i></span>
                             {% elif user.is_expired == 'N/A' %}
                             <span class="status-na" title="Password only"><i class="fas fa-shield-alt"></i></span>
+                            {% elif user.is_expired == 'No Link' %}
+                            <span class="status-na" title="No magic link"><i class="fas fa-unlink"></i></span>
                             {% else %}
                             <span class="status-active" title="Magic link active"><i class="fas fa-check-circle"></i></span>
                             {% endif %}

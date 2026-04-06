@@ -1211,14 +1211,6 @@ async def _validate_message_request(
                     status_code=401
                 )
 
-            user_info = payload.get("user_info", {})
-            used_magic_link = user_info.get("used_magic_link", False)
-            if used_magic_link and await current_user.session_expired():
-                return JSONResponse(
-                    content={'redirect': '/login'},
-                    status_code=401
-                )
-
         except JWTError:
             return JSONResponse(
                 content={'redirect': '/login'},

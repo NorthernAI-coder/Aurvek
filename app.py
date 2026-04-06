@@ -109,7 +109,7 @@ from ultra_admin import (
     generate_elevation_code, verify_elevation_code, is_elevated,
     revoke_elevation, get_elevation_ttl, get_active_lock_owner, ELEVATION_TTL
 )
-from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, sanitize_name, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags
+from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, sanitize_name, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags, get_auth_base_url, get_request_base_url
 from common import SCRIPT_DIR, DATA_DIR, CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL, CLOUDFLARE_ZONE_ID, CLOUDFLARE_API_URL, CLOUDFLARE_FOR_IMAGES, CLOUDFLARE_SECRET, CLOUDFLARE_IMAGE_SUBDOMAIN, CLOUDFLARE_BASE_URL, generate_cloudflare_signature, generate_signed_url_cloudflare, CLOUDFLARE_DOMAIN, CLOUDFLARE_CNAME_TARGET
 from common import ALGORITHM, MAX_TOKENS, MAX_MESSAGE_SIZE, MAX_IMAGE_UPLOAD_SIZE, MAX_IMAGE_PIXELS, PERPLEXITY_API_KEY, elevenlabs_key, openai_key, claude_key, gemini_key, openrouter_key, service_sid, twilio_sid, twilio_auth, twilio_messaging_service_sid, decode_jwt_cached, verify_token_expiration, validate_twilio_media_url, AVATAR_TOKEN_EXPIRE_HOURS, MEDIA_TOKEN_EXPIRE_HOURS
 from common import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
@@ -156,7 +156,7 @@ from security_guard_llm import check_security, is_security_guard_enabled
 from ranking import maybe_trigger_recalculation, get_ranking_config, start_scheduled_ranking_loop, recalculate_ranking_scores, invalidate_ranking_config_cache
 from rate_limiter import (
     check_rate_limits, check_failure_limit, record_failure,
-    RateLimitConfig as RLC, get_client_ip
+    RateLimitConfig as RLC, get_client_ip, rate_limiter
 )
 from captcha_service import verify_captcha, get_captcha_config, set_captcha_enabled, get_captcha_runtime_status
 from cloudflare_geo import get_all_geo_data, validate_country_codes, validate_continent_codes, geo_sync_engine, CloudflareGeoClient, get_countries_for_continent
@@ -2451,35 +2451,7 @@ async def get_user_init(request: Request, current_user: User = Depends(get_curre
     magic_link_expires_in = None
 
     if used_magic_link:
-        magic_link_expires_at = await current_user.get_magic_link_expiration()
-        if magic_link_expires_at is None:
-            session_data = {"expired": True, "reason": "magic_link_missing"}
-            response = JSONResponse(content={
-                "session": session_data,
-                "theme": {
-                    "forced_theme": None,
-                    "disable_theme_selector": False,
-                    "brand_color_primary": '#6366f1',
-                    "brand_color_secondary": '#10B981'
-                }
-            })
-            response.delete_cookie(key="session", path="/", samesite="lax", secure=SECURE_COOKIES)
-            return response
-
-        magic_link_expires_in = int((magic_link_expires_at - datetime.now()).total_seconds())
-        if magic_link_expires_in <= 0:
-            session_data = {"expired": True, "reason": "magic_link_expired"}
-            response = JSONResponse(content={
-                "session": session_data,
-                "theme": {
-                    "forced_theme": None,
-                    "disable_theme_selector": False,
-                    "brand_color_primary": '#6366f1',
-                    "brand_color_secondary": '#10B981'
-                }
-            })
-            response.delete_cookie(key="session", path="/", samesite="lax", secure=SECURE_COOKIES)
-            return response
+        magic_link_expires_in = max(0, expires_in)
 
     # Session is valid - build session data
     session_data = {
@@ -3976,6 +3948,14 @@ async def upload_nekoglass_wallpaper(
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
+    # Auto-resize large images to prevent processing timeouts (Cloudflare 524)
+    MAX_WALLPAPER_DIMENSION = 3840  # 4K is plenty for a wallpaper
+    if max(width, height) > MAX_WALLPAPER_DIMENSION:
+        ratio = MAX_WALLPAPER_DIMENSION / max(width, height)
+        new_width = int(width * ratio)
+        new_height = int(height * ratio)
+        image = image.resize((new_width, new_height), PilImage.Resampling.LANCZOS)
+
     hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
     profile_dir = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "profile")
     os.makedirs(profile_dir, exist_ok=True)
@@ -4743,17 +4723,7 @@ async def check_session(request: Request, current_user: User = Depends(get_curre
     magic_link_expires_in = None
 
     if used_magic_link:
-        magic_link_expires_at = await current_user.get_magic_link_expiration()
-        if magic_link_expires_at is None:
-            response = JSONResponse(content={"expired": True, "reason": "magic_link_missing"})
-            response.delete_cookie(key="session", path="/", samesite="lax", secure=SECURE_COOKIES)
-            return response
-
-        magic_link_expires_in = int((magic_link_expires_at - datetime.now()).total_seconds())
-        if magic_link_expires_in <= 0:
-            response = JSONResponse(content={"expired": True, "reason": "magic_link_expired"})
-            response.delete_cookie(key="session", path="/", samesite="lax", secure=SECURE_COOKIES)
-            return response
+        magic_link_expires_in = max(0, expires_in)
 
     return JSONResponse(content={
         "expired": False,
@@ -5065,9 +5035,101 @@ async def _handle_login_request(
         "google_oauth_available": bool(GOOGLE_CLIENT_ID)
     }
 
+    def _update_auth_template_links(current_next_url: Optional[str]) -> None:
+        recovery_url = "/magic-link-recovery"
+        if current_next_url:
+            recovery_url += "?" + urlencode({"next": current_next_url})
+
+        oauth_params = {}
+        if prompt_context:
+            oauth_params["prompt_id"] = prompt_context["id"]
+        if current_next_url:
+            oauth_params["next"] = current_next_url
+
+        google_oauth_url = "/auth/google"
+        if oauth_params:
+            google_oauth_url += "?" + urlencode(oauth_params)
+
+        template_context["next_url"] = current_next_url or ""
+        template_context["recovery_url"] = recovery_url
+        template_context["google_oauth_url"] = google_oauth_url
+
+    _update_auth_template_links(next_url)
+
     if request.method == "POST":
         form = await request.form()
-        username = form.get("username", "").lower()
+        next_url = form.get("next") or next_url
+        _update_auth_template_links(next_url)
+
+        magic_token = form.get("magic_token")
+        if magic_token:
+            expected_nonce = request.session.pop("ml_confirm_nonce", None)
+            submitted_nonce = form.get("confirm_nonce")
+            if not expected_nonce or expected_nonce != submitted_nonce:
+                record_failure(request, "magic_link")
+                return templates.TemplateResponse("login.html", {
+                    **template_context,
+                    "error": "Invalid request."
+                })
+
+            rate_error = check_rate_limits(
+                request,
+                ip_limit=RLC.LOGIN_BY_IP_ALL,
+                action_name="magic_link"
+            )
+            if rate_error:
+                return templates.TemplateResponse("login.html", {
+                    **template_context,
+                    "error": rate_error["message"]
+                })
+
+            async with get_db_connection(readonly=False) as conn:
+                cursor = await conn.cursor()
+                await cursor.execute(
+                    'SELECT user_id, expires_at FROM magic_links WHERE token = ?',
+                    (magic_token,)
+                )
+                magic_link = await cursor.fetchone()
+
+                if magic_link:
+                    try:
+                        expires_at = datetime.strptime(magic_link["expires_at"], '%Y-%m-%d %H:%M:%S.%f')
+                    except ValueError:
+                        expires_at = datetime.strptime(magic_link["expires_at"], '%Y-%m-%d %H:%M:%S')
+
+                    if expires_at >= datetime.now():
+                        user_obj = await get_user_by_id(magic_link["user_id"])
+                        if user_obj and user_obj.is_enabled:
+                            user_info = await create_user_info(user_obj, True)
+                            default_redirect = await _get_after_login_redirect(user_obj.id)
+
+                            await cursor.execute(
+                                'DELETE FROM magic_links WHERE token = ?',
+                                (magic_token,)
+                            )
+                            if cursor.rowcount == 1:
+                                await conn.commit()
+                                remaining = math.ceil((expires_at - datetime.now()).total_seconds())
+                                if remaining <= 0:
+                                    record_failure(request, "magic_link")
+                                    return templates.TemplateResponse("login.html", {
+                                        **template_context,
+                                        "error": "Magic link has expired."
+                                    })
+                                return create_login_response(
+                                    user_info,
+                                    redirect_url=next_url,
+                                    default_redirect=default_redirect,
+                                    expires_delta=timedelta(seconds=remaining)
+                                )
+
+            record_failure(request, "magic_link")
+            return templates.TemplateResponse("login.html", {
+                **template_context,
+                "error": "Invalid or expired magic link."
+            })
+
+        username = form.get("username", "").strip().lower()
         password = form.get("password", "")
         captcha_token = form.get("captcha_token", "") or form.get("cf-turnstile-response", "") or form.get("g-recaptcha-response", "")
 
@@ -5124,47 +5186,43 @@ async def _handle_login_request(
 
     token = request.query_params.get("token")
     if token:
-        # Rate limiting for magic link attempts
-        rate_error = check_rate_limits(
-            request,
-            ip_limit=RLC.LOGIN_BY_IP_ALL,
-            action_name="magic_link"
-        )
-        if rate_error:
-            return templates.TemplateResponse("login.html", {
-                **template_context,
-                "error": rate_error["message"]
-            })
+        nonce = secrets.token_urlsafe(16)
+        request.session["ml_confirm_nonce"] = nonce
 
-        async with get_db_connection(readonly=False) as conn:
+        async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
-            # First check if the token exists at all (even if expired)
-            await cursor.execute('''
+            await cursor.execute(
+                '''
                 SELECT user_id, expires_at
                 FROM magic_links
                 WHERE token = ?
-            ''', (token,))
+                ''',
+                (token,)
+            )
             magic_link = await cursor.fetchone()
 
             if magic_link:
-                # Check if the magic link is expired
-                from datetime import datetime
-                expires_at = datetime.strptime(magic_link["expires_at"], '%Y-%m-%d %H:%M:%S.%f')
-                is_expired = expires_at < datetime.now()
+                try:
+                    expires_at = datetime.strptime(magic_link["expires_at"], '%Y-%m-%d %H:%M:%S.%f')
+                except ValueError:
+                    expires_at = datetime.strptime(magic_link["expires_at"], '%Y-%m-%d %H:%M:%S')
 
-                if not is_expired:
-                    # Magic link is valid - delete it immediately (one-time use)
-                    await cursor.execute('DELETE FROM magic_links WHERE token = ?', (token,))
-                    await conn.commit()
+                if expires_at < datetime.now():
+                    return RedirectResponse(
+                        url=template_context["recovery_url"],
+                        status_code=status.HTTP_302_FOUND
+                    )
 
-                    user_obj = await get_user_by_id(magic_link["user_id"])
-                    if user_obj and user_obj.can_use_magic_link():
-                        user_info = await create_user_info(user_obj, True)  # True for magic link login
-                        default_redirect = await _get_after_login_redirect(user_obj.id)
-                        return create_login_response(user_info, redirect_url=next_url, default_redirect=default_redirect)
-                else:
-                    # Magic link is expired - redirect to recovery page
-                    return RedirectResponse(url="/magic-link-recovery", status_code=status.HTTP_302_FOUND)
+                user_obj = await get_user_by_id(magic_link["user_id"])
+                if user_obj and user_obj.is_enabled:
+                    return templates.TemplateResponse("magic_link_confirm.html", {
+                        "request": request,
+                        "token": token,
+                        "username": user_obj.username,
+                        "login_url": login_url,
+                        "next_url": next_url or "",
+                        "confirm_nonce": nonce
+                    })
 
         record_failure(request, "magic_link")
         return templates.TemplateResponse("login.html", {**template_context, "error": "Invalid magic link. Please, try again."})
@@ -5176,8 +5234,23 @@ async def _handle_login_request(
 
 @app.route("/magic-link-recovery", methods=["GET", "POST"])
 async def magic_link_recovery(request: Request):
+    next_url = request.query_params.get("next")
+
+    def _build_recovery_context(message=None, message_type=None, current_next_url=None):
+        login_url = "/login"
+        if current_next_url:
+            login_url += "?" + urlencode({"next": current_next_url})
+        return {
+            "request": request,
+            "message": message,
+            "message_type": message_type,
+            "next_url": current_next_url or "",
+            "login_url": login_url
+        }
+
     if request.method == "POST":
         form = await request.form()
+        next_url = form.get("next") or next_url
         email = form.get("email", "").strip().lower()
 
         # Rate limiting by IP
@@ -5189,28 +5262,25 @@ async def magic_link_recovery(request: Request):
             action_name="recovery"
         )
         if rate_error:
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": rate_error["message"],
-                "message_type": "danger"
-            })
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context(rate_error["message"], "danger", next_url)
+            )
 
         if not email:
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": "Please enter your email address.",
-                "message_type": "danger"
-            })
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context("Please enter your email address.", "danger", next_url)
+            )
 
         # Basic email validation
         import re
         email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         if not re.match(email_pattern, email):
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": "Please enter a valid email address.",
-                "message_type": "danger"
-            })
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context("Please enter a valid email address.", "danger", next_url)
+            )
         
         # Find user by email
         async with get_db_connection(readonly=True) as conn:
@@ -5220,27 +5290,33 @@ async def magic_link_recovery(request: Request):
         
         if not user_result:
             # Don't reveal if email exists or not for security
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": "If your email is registered, you will receive a new magic link shortly.",
-                "message_type": "success"
-            })
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context(
+                    "If your email is registered, you will receive a new magic link shortly.",
+                    "success",
+                    next_url
+                )
+            )
         
         user_id = user_result[0]
         username = user_result[1]
         
-        # Get user object to check magic link permissions
+        # A valid recovery token is enough authorization regardless of auth mode.
         user_obj = await get_user_by_id(user_id)
-        if not user_obj or not user_obj.can_use_magic_link():
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": "Magic link authentication is not available for your account.",
-                "message_type": "danger"
-            })
-        
+        if not user_obj or not user_obj.is_enabled:
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context(
+                    "Magic link recovery is not available for this account.",
+                    "danger",
+                    next_url
+                )
+            )
+
         # Generate new magic link
         try:
-            magic_link = await generate_magic_link(user_id, 'login', request)
+            magic_link = await generate_magic_link(user_id, 'login', request, next_url=next_url)
 
             # Get branding for this user (from their creator)
             from common import get_branding_for_user
@@ -5254,28 +5330,29 @@ async def magic_link_recovery(request: Request):
                 if not email_service.use_email_service:
                     message += " Check the console for your magic link."
                 
-                return templates.TemplateResponse("magic_link_recovery.html", {
-                    "request": request,
-                    "message": message,
-                    "message_type": "success"
-                })
+                return templates.TemplateResponse(
+                    "magic_link_recovery.html",
+                    _build_recovery_context(message, "success", next_url)
+                )
             else:
-                return templates.TemplateResponse("magic_link_recovery.html", {
-                    "request": request,
-                    "message": "There was an error sending your magic link. Please try again later.",
-                    "message_type": "danger"
-                })
+                return templates.TemplateResponse(
+                    "magic_link_recovery.html",
+                    _build_recovery_context(
+                        "There was an error sending your magic link. Please try again later.",
+                        "danger",
+                        next_url
+                    )
+                )
                 
         except Exception as e:
             logger.error(f"Error generating magic link recovery: {e}")
-            return templates.TemplateResponse("magic_link_recovery.html", {
-                "request": request,
-                "message": "An error occurred. Please try again later.",
-                "message_type": "danger"
-            })
+            return templates.TemplateResponse(
+                "magic_link_recovery.html",
+                _build_recovery_context("An error occurred. Please try again later.", "danger", next_url)
+            )
     
     # GET request - show the recovery form
-    return templates.TemplateResponse("magic_link_recovery.html", {"request": request})
+    return templates.TemplateResponse("magic_link_recovery.html", _build_recovery_context(current_next_url=next_url))
 
 @app.get("/logout", response_class=HTMLResponse)
 def logout(request: Request):
@@ -5419,6 +5496,8 @@ async def create_user_post(
     
     if use_random_username or not username:
         username = generate_random_username()
+        while await _username_exists(username):
+            username = generate_random_username()
     else:
         # Validate username length
         if len(username) < 3 or len(username) > 20:
@@ -5431,6 +5510,9 @@ async def create_user_post(
         # Validate username is not forbidden (security)
         if is_forbidden_username(username):
             raise HTTPException(status_code=400, detail="This username is not available. Please choose a different username.")
+
+        if await _username_exists(username):
+            raise HTTPException(status_code=400, detail="This username is already in use.")
 
     # Process category_access for curation mode
     # If public_prompts_access is enabled and specific categories were selected, store them
@@ -5586,7 +5668,7 @@ async def edit_user_form(
                 FROM USERS u
                 JOIN USER_DETAILS ud ON u.id = ud.user_id
                 JOIN USER_ROLES ur ON u.role_id = ur.id
-                WHERE u.username = ?
+                WHERE LOWER(u.username) = LOWER(?)
             """, (username,))
 
         user_row = await cursor.fetchone()
@@ -5675,7 +5757,7 @@ async def update_user(
         cursor = await conn.cursor()
 
         # Verify if the user exists
-        await cursor.execute("SELECT id, role_id FROM USERS WHERE username = ?", (username,))
+        await cursor.execute("SELECT id, role_id FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
         user = await cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -5710,7 +5792,10 @@ async def update_user(
             raise HTTPException(status_code=400, detail="The username can only contain letters, numbers, hyphens, and underscores.")
         
         # Verify if the new username is already in use
-        await cursor.execute("SELECT id FROM USERS WHERE username = ? AND id != ?", (new_username, user_id))
+        await cursor.execute(
+            "SELECT id FROM USERS WHERE LOWER(username) = LOWER(?) AND id != ?",
+            (new_username, user_id)
+        )
         if await cursor.fetchone():
             raise HTTPException(status_code=400, detail="This username is already in use.")
         
@@ -5843,6 +5928,9 @@ async def update_user(
 
         await cursor.execute(update_details_query, update_details_params)
 
+        if authentication_mode == "password_only":
+            await cursor.execute("DELETE FROM magic_links WHERE user_id = ?", (user_id,))
+
         # Record balance change in TRANSACTIONS if balance was modified
         if abs(balance - previous_balance) > 0.001:
             balance_diff = balance - previous_balance
@@ -5895,7 +5983,8 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
                 ud.balance,
                 u.phone_number,
                 ur.role_name,
-                u.auth_provider
+                u.auth_provider,
+                ud.authentication_mode
             FROM USERS u
             JOIN USER_DETAILS ud ON u.id = ud.user_id
             LEFT JOIN (
@@ -5907,7 +5996,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             LEFT JOIN PROMPTS p ON ud.current_prompt_id = p.id
             LEFT JOIN LLM ll ON ud.llm_id = ll.id
             JOIN USER_ROLES ur ON u.role_id = ur.id
-            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider
+            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
             ''')
         else:
             await cursor.execute('''
@@ -5924,7 +6013,8 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
                 ud.balance,
                 u.phone_number,
                 ur.role_name,
-                u.auth_provider
+                u.auth_provider,
+                ud.authentication_mode
             FROM USERS u
             JOIN USER_DETAILS ud ON u.id = ud.user_id
             LEFT JOIN (
@@ -5939,12 +6029,11 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             JOIN USER_CREATOR_RELATIONSHIPS ucr ON u.id = ucr.user_id
             WHERE ucr.creator_id = ?
               AND ucr.relationship_type = 'assigned_by'
-            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider
+            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
             ''', (current_user.id,))
         
         url_path = 'login?token='
-        scheme = request.url.scheme
-        host = request.headers['Host']
+        base_url = get_auth_base_url(request).rstrip("/")
         users = []        
         for row in await cursor.fetchall():
             user_id = row[0]
@@ -5952,7 +6041,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             tokens = row[2]
             total_cost = row[3]  
             if row[4] and row[5]:
-                magic_link = f'{scheme}://{host}/{url_path}{row[4]}'
+                magic_link = f'{base_url}/{url_path}{row[4]}'
                 try:
                     expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S.%f')
                 except ValueError:
@@ -5961,7 +6050,8 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             else:
                 magic_link = None
                 expires_at = None
-                is_expired = 'N/A'
+                auth_mode = row[13]
+                is_expired = 'N/A' if auth_mode == 'password_only' else 'No Link'
             conversation_count = row[6]
             balance = row[9]
             phone = row[10]
@@ -5982,6 +6072,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
                 'phone': phone,
                 'role': role_name,
                 'auth_provider': auth_provider,
+                'authentication_mode': row[13] or 'magic_link_only',
                 "is_admin": await current_user.is_admin
             })
         await conn.close()
@@ -6014,7 +6105,7 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
 
-        await cursor.execute("SELECT id FROM USERS WHERE username = ?", (username,))
+        await cursor.execute("SELECT id FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
         user = await cursor.fetchone()
         if user:
             user_id = user[0]
@@ -6029,27 +6120,136 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
 
             new_token = secrets.token_urlsafe(20)
             new_expires_at = datetime.now() + timedelta(days=1)
-            query = """
-            UPDATE magic_links
-            SET token = ?, expires_at = ?
-            WHERE user_id = ?
-            """
-            await cursor.execute(query, (new_token, new_expires_at, user_id))
-            if cursor.rowcount == 0:
+            try:
                 await cursor.execute(
-                    "INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)",
+                    """
+                    INSERT INTO magic_links (user_id, token, expires_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        token = excluded.token,
+                        expires_at = excluded.expires_at
+                    """,
                     (user_id, new_token, new_expires_at)
                 )
+            except sqlite3.OperationalError as e:
+                if "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" not in str(e):
+                    raise
+                query = """
+                UPDATE magic_links
+                SET token = ?, expires_at = ?
+                WHERE user_id = ?
+                """
+                await cursor.execute(query, (new_token, new_expires_at, user_id))
+                if cursor.rowcount == 0:
+                    await cursor.execute(
+                        "INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)",
+                        (user_id, new_token, new_expires_at)
+                    )
             await conn.commit()
-            await conn.close()
             url_path = 'login?token='
-            scheme = request.url.scheme
-            host = request.headers['Host']
-            full_magic_link = f'{scheme}://{host}/{url_path}{new_token}'
+            full_magic_link = f"{get_auth_base_url(request).rstrip('/')}/{url_path}{new_token}"
             return JSONResponse(content={"magic_link": full_magic_link, "expires_at": new_expires_at.isoformat()}, status_code=200)
         else:
-            await conn.close()
             return JSONResponse(content={"error": "No user found with that username."}, status_code=404)
+
+
+def _get_rate_limit_reset_warning() -> Optional[str]:
+    worker_count = int(os.getenv("UVICORN_WORKERS", "3"))
+    if worker_count > 1:
+        return (
+            f"Rate limits are stored in-memory per worker. UVICORN_WORKERS={worker_count}, "
+            "so this reset may be incomplete across workers."
+        )
+    return None
+
+
+@app.post("/admin/rate-limits/clear/{username}")
+async def clear_user_rate_limits(request: Request, username: str, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    cleared = rate_limiter.clear_for_identifier(username)
+
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT email FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            cleared += rate_limiter.clear_for_identifier(row[0])
+
+    warning = _get_rate_limit_reset_warning()
+    logger.info(
+        "Admin %s cleared rate limits for %s (%s keys)",
+        current_user.username,
+        username,
+        cleared
+    )
+
+    return JSONResponse({
+        "cleared": cleared,
+        "username": username,
+        "warning": warning,
+        "worker_count": int(os.getenv("UVICORN_WORKERS", "3"))
+    })
+
+
+@app.post("/admin/rate-limits/clear-ip/{ip:path}")
+async def clear_ip_rate_limits(request: Request, ip: str, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    cleared = rate_limiter.clear_for_ip(ip)
+    warning = _get_rate_limit_reset_warning()
+    logger.info(
+        "Admin %s cleared rate limits for IP %s (%s keys)",
+        current_user.username,
+        ip,
+        cleared
+    )
+
+    return JSONResponse({
+        "cleared": cleared,
+        "ip": ip,
+        "warning": warning,
+        "worker_count": int(os.getenv("UVICORN_WORKERS", "3"))
+    })
+
+
+@app.get("/admin/rate-limits/status/{username}")
+async def get_user_rate_limit_status(request: Request, username: str, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    limits_config = {
+        "id:login": RLC.LOGIN_BY_USER,
+        "id_fail:login": RLC.LOGIN_BY_USER,
+        "id:recovery": RLC.RECOVERY_BY_EMAIL,
+        "id_fail:recovery": RLC.RECOVERY_BY_EMAIL,
+    }
+    status_data = rate_limiter.get_status_for_identifier(username, limits_config)
+
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT email FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
+        row = await cursor.fetchone()
+        if row and row[0]:
+            status_data.update(rate_limiter.get_status_for_identifier(row[0], limits_config))
+
+    blocked_ips = rate_limiter.get_blocked_ips_for_action(
+        "login",
+        {
+            "ip_all": RLC.LOGIN_BY_IP_ALL,
+            "ip_fail": RLC.LOGIN_BY_IP_FAILURES,
+        }
+    )
+
+    return JSONResponse({
+        "username": username,
+        "limits": status_data,
+        "blocked_login_ips": blocked_ips,
+        "warning": _get_rate_limit_reset_warning(),
+        "worker_count": int(os.getenv("UVICORN_WORKERS", "3"))
+    })
 
 @app.post("/api/refresh-session")
 async def refresh_session(request: Request, current_user: User = Depends(get_current_user)):
@@ -6060,13 +6260,30 @@ async def refresh_session(request: Request, current_user: User = Depends(get_cur
     try:
         # Create new user info with current data
         user_info = await create_user_info(current_user, current_user.used_magic_link)
-        
-        # Create new token with fresh expiration
+
+        expires_delta = None
+        if current_user.used_magic_link:
+            current_token = request.cookies.get("session")
+            if not current_token:
+                raise HTTPException(status_code=401, detail="Session token missing")
+
+            current_payload = decode_jwt_cached(current_token, SECRET_KEY)
+            original_exp = current_payload.get("exp")
+            if original_exp is None:
+                raise HTTPException(status_code=401, detail="Session expired")
+
+            remaining = int(original_exp) - int(time.time())
+            if remaining <= 0:
+                raise HTTPException(status_code=401, detail="Session expired")
+
+            expires_delta = timedelta(seconds=remaining)
+
         token = create_access_token(
             data={
                 "sub": user_info["username"],
                 "user_info": user_info
-            }
+            },
+            expires_delta=expires_delta
         )
         
         # Set the new token in cookie
@@ -6076,7 +6293,10 @@ async def refresh_session(request: Request, current_user: User = Depends(get_cur
         })
         
         # Configure cookie with the correct expiration time
-        max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60  # convert to seconds
+        if expires_delta is not None:
+            max_age = int(expires_delta.total_seconds())
+        else:
+            max_age = ACCESS_TOKEN_EXPIRE_MINUTES * 60  # convert to seconds
         response.set_cookie(
             key="session",
             value=token,
@@ -6088,6 +6308,8 @@ async def refresh_session(request: Request, current_user: User = Depends(get_cur
         
         return response
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error refreshing session: {str(e)}")
         raise HTTPException(status_code=500, detail="Error refreshing session")
@@ -6096,6 +6318,8 @@ async def refresh_session(request: Request, current_user: User = Depends(get_cur
 async def delete_user(username, current_user, request_ip=None):
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
+        username = username.strip()
+        username_ci = username.lower()
         logger.debug(f"Attempting to delete username: {username} by user: {current_user.username}")
         
         # First verify if the user to delete exists
@@ -6103,8 +6327,8 @@ async def delete_user(username, current_user, request_ip=None):
             SELECT u.id, u.username, u.role_id
             FROM users u
             JOIN user_details ud ON u.id = ud.user_id
-            WHERE u.username = ?
-        """, (username,))
+            WHERE LOWER(u.username) = ?
+        """, (username_ci,))
         user = await cursor.fetchone()
         
         if not user:
@@ -6121,7 +6345,7 @@ async def delete_user(username, current_user, request_ip=None):
 
         # Verify if the current user is admin
         is_current_user_admin = await current_user.is_admin
-        is_self_deletion = current_user.username == username
+        is_self_deletion = current_user.username.strip().lower() == username_ci
         
         # Security validations
         ultra_admin_elevated = await is_elevated(current_user.id, request_ip=request_ip) if is_current_user_admin else False
@@ -14814,8 +15038,8 @@ async def admin_whatsapp(request: Request, current_user: User = Depends(get_curr
                     welcome_message = row[1] or ""
                 elif row[0] == 'whatsapp_require_phone_verification':
                     require_phone_verification = row[1] == '1'
-    except Exception:
-        pass  # Table might not exist yet
+    except Exception as e:
+        logger.error(f"Failed to load WhatsApp config from SYSTEM_CONFIG: {e}")
 
     # Get users with WhatsApp active
     whatsapp_users = []
@@ -15015,8 +15239,8 @@ async def admin_telegram(request: Request, current_user: User = Depends(get_curr
             unknown_user_message = config.get('telegram_unknown_user_message', '')
             welcome_message = config.get('telegram_welcome_message', '')
             require_phone_verification = config.get('telegram_require_phone_verification', '0') == '1'
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to load Telegram config from SYSTEM_CONFIG: {e}")
 
     # Get active Telegram users
     telegram_users = []
@@ -16175,16 +16399,21 @@ async def telegram_webhook(request: Request):
                     return JSONResponse(content={"ok": True})
                 else:
                     # Phone not found in our system
+                    msg = "This phone number is not registered on the platform."
                     try:
                         async with get_db_connection(readonly=True) as conn:
                             cursor = await conn.execute(
                                 "SELECT value FROM SYSTEM_CONFIG WHERE key = 'telegram_unknown_user_message'"
                             )
                             row = await cursor.fetchone()
-                        msg = row[0] if row and row[0] else "This phone number is not registered on the platform."
+                        if row and row[0]:
+                            msg = row[0]
+                    except Exception as e:
+                        logger.error(f"Failed to load telegram_unknown_user_message from SYSTEM_CONFIG: {e}")
+                    try:
                         await async_telegram.send_message(chat_id, msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Failed to send 'phone not found' message to Telegram chat {chat_id}: {e}")
                     return JSONResponse(content={"ok": True})
             else:
                 # Not linked and didn't share contact -- ask them to share
@@ -17715,26 +17944,11 @@ def _get_google_flow(redirect_uri: str) -> Flow:
 
 def _build_redirect_uri(request: Request) -> str:
     """Build OAuth redirect URI from current request."""
-    # Cloudflare Tunnel terminates HTTPS but connects to origin via HTTP,
-    # and nginx overwrites X-Forwarded-Proto with $scheme (http).
-    # If behind Cloudflare, scheme is always https.
-    if request.headers.get("cf-connecting-ip"):
-        scheme = "https"
-    else:
-        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", request.url.hostname)
-    # Behind reverse proxy: host header is authoritative, ignore port
-    if "x-forwarded-proto" in request.headers or "cf-connecting-ip" in request.headers:
-        return f"{scheme}://{host}/auth/google/callback"
-    # Local dev: include port if non-standard
-    port = request.url.port
-    if port and port not in [80, 443]:
-        return f"{scheme}://{host}:{port}/auth/google/callback"
-    return f"{scheme}://{host}/auth/google/callback"
+    return f"{get_request_base_url(request).rstrip('/')}/auth/google/callback"
 
 
 @app.get("/auth/google")
-async def auth_google(request: Request, prompt_id: int = None, pack_id: int = None):
+async def auth_google(request: Request, prompt_id: int = None, pack_id: int = None, next: str = None):
     """
     Initiate Google OAuth flow.
     Saves prompt_id/pack_id in session to determine role after callback.
@@ -17786,6 +18000,10 @@ async def auth_google(request: Request, prompt_id: int = None, pack_id: int = No
     request.session["oauth_prompt_id"] = prompt_id
     request.session["oauth_pack_id"] = pack_id
     request.session["oauth_redirect_uri"] = redirect_uri
+    if next and next.startswith("/") and not next.startswith("//"):
+        request.session["oauth_next"] = next
+    else:
+        request.session.pop("oauth_next", None)
 
     authorization_url, state = flow.authorization_url(
         access_type="offline",
@@ -17944,6 +18162,7 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
     prompt_id = request.session.pop("oauth_prompt_id", None)
     pack_id = request.session.pop("oauth_pack_id", None)
     redirect_uri = request.session.pop("oauth_redirect_uri", None)
+    oauth_next = request.session.pop("oauth_next", None)
     request.session.pop("oauth_state", None)
 
     if not redirect_uri:
@@ -17989,6 +18208,8 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
             redirect_url = None
             if pack_id:
                 redirect_url = await _handle_pack_for_existing_user(pack_id, user.id)
+            if redirect_url is None:
+                redirect_url = oauth_next
 
             # Direct login
             logger.info(f"Google OAuth login for existing user {user.id}")
@@ -18020,6 +18241,8 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
             redirect_url = None
             if pack_id:
                 redirect_url = await _handle_pack_for_existing_user(pack_id, user.id)
+            if redirect_url is None:
+                redirect_url = oauth_next
 
             user_info = await create_user_info(user, used_magic_link=False)
             default_redirect = await _get_after_login_redirect(user.id)
@@ -18237,7 +18460,7 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
         user = await get_user_by_id(user_id)
         logger.info(f"Created new {target_role} from Google OAuth: user_id={user_id}, username={username}")
 
-        redirect_url = paid_pack_landing_url  # None for free packs, URL for paid packs
+        redirect_url = paid_pack_landing_url or oauth_next  # None for free packs, URL for paid packs
         user_info = await create_user_info(user, used_magic_link=False)
         default_redirect = await _get_after_login_redirect(user.id)
         return create_login_response(user_info, redirect_url=redirect_url, default_redirect=default_redirect)
@@ -21488,13 +21711,7 @@ async def _send_entitlement_claim_email(
         return
 
     # Build claim URL
-    scheme = request.url.scheme
-    host = request.url.hostname
-    port = request.url.port
-    if port and port not in (80, 443):
-        claim_url = f"{scheme}://{host}:{port}/claim-entitlement/{token}"
-    else:
-        claim_url = f"{scheme}://{host}/claim-entitlement/{token}"
+    claim_url = f"{get_auth_base_url(request).rstrip('/')}/claim-entitlement/{token}"
 
     # Get product name and branding for the email
     from common import get_user_branding
@@ -21834,14 +22051,7 @@ async def register_submit(
         }, status_code=500)
 
     # Build verification URL
-    scheme = request.url.scheme
-    host = request.url.hostname
-    port = request.url.port
-
-    if port and port not in [80, 443]:
-        verification_url = f"{scheme}://{host}:{port}/verify-email/{token}"
-    else:
-        verification_url = f"{scheme}://{host}/verify-email/{token}"
+    verification_url = f"{get_auth_base_url(request).rstrip('/')}/verify-email/{token}"
 
     # Get branding from prompt owner if registering via landing page
     branding = None
@@ -22010,13 +22220,7 @@ async def register_pack_submit(request: Request):
         return JSONResponse({"status": "error", "message": "Registration failed. Please try again."}, status_code=500)
 
     # Build verification URL
-    scheme = request.url.scheme
-    host = request.url.hostname
-    port = request.url.port
-    if port and port not in [80, 443]:
-        verification_url = f"{scheme}://{host}:{port}/verify-email/{token}"
-    else:
-        verification_url = f"{scheme}://{host}/verify-email/{token}"
+    verification_url = f"{get_auth_base_url(request).rstrip('/')}/verify-email/{token}"
 
     # Get branding from pack owner
     branding = None
