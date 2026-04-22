@@ -136,7 +136,7 @@ AURVEK implements defense-in-depth security with multiple independent layers:
 - Pre-execution content analysis using a dedicated LLM evaluator
 - 4 threat categories: system info extraction, prompt injection, malicious code, jailbreak attempts
 - Supports Claude, GPT, Gemini, and xAI as evaluators
-- Temperature 0.0 for deterministic classification
+- Temperature 0.0 for deterministic classification (legacy Claude / GPT / Gemini / xAI models). Claude 4.6+ uses Anthropic's default — the `temperature` parameter is deprecated and omitted per Anthropic's Opus 4.7 migration guidance.
 
 **Application Security**
 - JWT tokens in HTTPOnly cookies with Redis-backed revocation

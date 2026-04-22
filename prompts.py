@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import logging
 from PIL import Image as PilImage
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Union, Optional, List, Dict
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -25,6 +25,7 @@ from common import (
     consume_token,
     decrypt_api_key,
     generate_user_hash,
+    get_llm_info,
     get_llm_token_costs,
     get_template_context,
     get_user_api_key_mode,
@@ -159,7 +160,7 @@ async def list_prompts(request: Request, current_user: User = Depends(get_curren
                 prompt_image_url = None
                 prompt_image_fullsize_url = None
                 if prompt['image']:
-                    current_time = datetime.utcnow()
+                    current_time = datetime.now(timezone.utc)
                     new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
                     # Thumbnail (32px)
                     image_base_url = f"{prompt['image']}_32.webp"
@@ -493,6 +494,7 @@ async def create_prompt_post(
                 actual_hide_llm_name = False
                 actual_allowed_llms = None
 
+            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
             # Insert the new prompt with the found voice_id and pricing fields
             cursor = await conn.execute(
                 """INSERT INTO Prompts (name, prompt, description, voice_id, created_by_user_id, created_at, public,
@@ -501,7 +503,7 @@ async def create_prompt_post(
                    extensions_enabled, extensions_auto_advance, extensions_free_selection,
                    gransabio_enabled, gransabio_config)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (name, prompt, description, voice_id, current_user.id, datetime.utcnow(), public,
+                (name, prompt, description, voice_id, current_user.id, created_at, public,
                  is_paid_bool, actual_markup, actual_forced_llm_id, actual_hide_llm_name, disable_web_search, force_web_search,
                  enable_moderation, watchdog_config_json, actual_allowed_llms,
                  extensions_enabled, extensions_auto_advance, extensions_free_selection,
@@ -628,7 +630,7 @@ async def edit_prompt(request: Request, prompt_id: int, current_user: User = Dep
     # Generate prompt image URL
     prompt_image_url = None
     if prompt[4]:  # prompt[4] is the 'image' column in the Prompts table
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
         image_base_url = f"{prompt[4]}_128.webp"
         token = generate_img_token(image_base_url, new_expiration, current_user)
@@ -2244,15 +2246,12 @@ async def watchdog_suggest_config(
     prompt_text = prompt_text[:10000]  # Truncate to limit cost
 
     # Lookup LLM
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.execute(
-            "SELECT machine, model FROM LLM WHERE id = ?", (llm_id,)
-        )
-        llm_row = await cursor.fetchone()
-        if not llm_row:
-            raise HTTPException(status_code=404, detail="LLM not found")
+    llm_info = await get_llm_info(llm_id)
+    if not llm_info:
+        raise HTTPException(status_code=404, detail="LLM not found")
 
-    machine, model = llm_row[0], llm_row[1]
+    machine = llm_info["machine"]
+    model = llm_info["model"]
 
     # Resolve BYOK/system key for this provider
     user_api_keys = {}
@@ -2288,6 +2287,20 @@ async def watchdog_suggest_config(
             detail=f"API key required for provider {machine} in own-only mode.",
         )
 
+    from ai_calls import assert_billable_claude_system_key
+
+    wd_guard_error = assert_billable_claude_system_key(
+        machine=machine,
+        model=model,
+        llm_id=llm_id,
+        is_byok=resolved_key is not None,
+        input_token_cost=llm_info.get("input_token_cost", 0),
+        output_token_cost=llm_info.get("output_token_cost", 0),
+    )
+    if wd_guard_error:
+        logger.error(wd_guard_error)
+        raise HTTPException(status_code=500, detail=wd_guard_error)
+
     # Call LLM
     from tools.llm_caller import (
         call_llm_non_streaming_with_usage,
@@ -2317,7 +2330,7 @@ async def watchdog_suggest_config(
         async with get_db_connection() as bill_conn:
             await bill_conn.execute("BEGIN IMMEDIATE")
             bill_cursor = await bill_conn.cursor()
-            input_cost, output_cost = await get_llm_token_costs(model, bill_conn)
+            input_cost, output_cost = await get_llm_token_costs(conn=bill_conn, llm_id=llm_id)
             billed = await consume_token(
                 user_id=current_user.id,
                 input_tokens=result.input_tokens,

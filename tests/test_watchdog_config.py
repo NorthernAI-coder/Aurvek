@@ -28,30 +28,48 @@ class TestGetDefaultWatchdogConfig:
     def test_returns_dict(self):
         config = get_default_watchdog_config()
         assert isinstance(config, dict)
+        assert "pre_watchdog" in config
+        assert "post_watchdog" in config
 
     def test_disabled_by_default(self):
         config = get_default_watchdog_config()
-        assert config["enabled"] is False
-        assert config["llm_id"] is None
+        assert config["pre_watchdog"]["enabled"] is False
+        assert config["pre_watchdog"]["llm_id"] is None
+        assert config["post_watchdog"]["enabled"] is False
+        assert config["post_watchdog"]["llm_id"] is None
 
     def test_returns_fresh_dict_each_call(self):
         """Factory function must not return a shared mutable reference."""
         a = get_default_watchdog_config()
         b = get_default_watchdog_config()
         assert a is not b
-        assert a["thresholds"] is not b["thresholds"]
-        a["objectives"].append("mutated")
-        assert "mutated" not in b["objectives"]
+        assert a["pre_watchdog"] is not b["pre_watchdog"]
+        assert a["post_watchdog"] is not b["post_watchdog"]
+        assert a["post_watchdog"]["thresholds"] is not b["post_watchdog"]["thresholds"]
+        a["post_watchdog"]["objectives"].append("mutated")
+        assert "mutated" not in b["post_watchdog"]["objectives"]
 
     def test_default_values(self):
         config = get_default_watchdog_config()
-        assert config["mode"] == "custom"
-        assert config["objectives"] == []
-        assert config["steering_prompt"] == ""
-        assert config["frequency"] == 3
-        assert config["max_hint_chars"] == 500
-        assert config["thresholds"]["max_turns_off_topic"] == 3
-        assert config["thresholds"]["max_turns_same_subtopic"] == 5
+        pre = config["pre_watchdog"]
+        post = config["post_watchdog"]
+
+        assert pre["objectives"] == []
+        assert pre["steering_prompt"] == ""
+        assert pre["frequency"] == 1
+        assert pre["can_takeover"] is True
+        assert pre["can_lock"] is False
+
+        assert post["mode"] == "custom"
+        assert post["objectives"] == []
+        assert post["steering_prompt"] == ""
+        assert post["frequency"] == 3
+        assert post["max_hint_chars"] == 500
+        assert post["thresholds"]["max_turns_off_topic"] == 3
+        assert post["thresholds"]["max_turns_same_subtopic"] == 5
+        assert post["can_takeover"] is False
+        assert post["takeover_threshold"] == 5
+        assert post["can_lock"] is False
 
 
 # ===================================================================
@@ -60,233 +78,224 @@ class TestGetDefaultWatchdogConfig:
 
 class TestValidateWatchdogConfig:
 
+    def make_config(self, **post_overrides):
+        config = get_default_watchdog_config()
+        config["post_watchdog"].update({
+            "enabled": True,
+            "llm_id": 1,
+            "objectives": ["X"],
+        })
+        thresholds = post_overrides.pop("thresholds", None)
+        config["post_watchdog"].update(post_overrides)
+        if thresholds is not None:
+            config["post_watchdog"]["thresholds"] = thresholds
+        return config
+
     # --- Happy paths ---
 
     def test_valid_enabled_config(self):
-        config = {
-            "enabled": True,
-            "llm_id": 7,
-            "mode": "interview",
-            "objectives": ["Track topics", "Detect drift"],
-            "frequency": 3,
-        }
+        config = self.make_config(
+            llm_id=7,
+            mode="interview",
+            objectives=["Track topics", "Detect drift"],
+            frequency=3,
+        )
         result = validate_watchdog_config(config)
-        assert result["enabled"] is True
-        assert result["llm_id"] == 7
-        assert result["mode"] == "interview"
-        assert len(result["objectives"]) == 2
-        assert result["frequency"] == 3
+        post = result["post_watchdog"]
+        assert post["enabled"] is True
+        assert post["llm_id"] == 7
+        assert post["mode"] == "interview"
+        assert len(post["objectives"]) == 2
+        assert post["frequency"] == 3
 
     def test_disabled_config_allows_empty_fields(self):
-        result = validate_watchdog_config({"enabled": False})
-        assert result["enabled"] is False
-        assert result["llm_id"] is None
-        assert result["objectives"] == []
+        result = validate_watchdog_config({"post_watchdog": {"enabled": False}})
+        assert result["post_watchdog"]["enabled"] is False
+        assert result["post_watchdog"]["llm_id"] is None
+        assert result["post_watchdog"]["objectives"] == []
 
     def test_disabled_config_ignores_invalid_llm_id(self):
         """When disabled, llm_id validation is skipped."""
-        result = validate_watchdog_config({"enabled": False, "llm_id": None})
-        assert result["enabled"] is False
+        result = validate_watchdog_config({"post_watchdog": {"enabled": False, "llm_id": None}})
+        assert result["post_watchdog"]["enabled"] is False
 
     def test_valid_all_modes(self):
         for mode in ("interview", "coaching", "education", "custom"):
-            config = {
-                "enabled": True,
-                "llm_id": 1,
-                "mode": mode,
-                "objectives": ["Test"],
-            }
+            config = self.make_config(mode=mode, objectives=["Test"])
             result = validate_watchdog_config(config)
-            assert result["mode"] == mode
+            assert result["post_watchdog"]["mode"] == mode
 
     # --- Required fields when enabled ---
 
     def test_enabled_without_llm_id_raises(self):
         with pytest.raises(ValueError, match="llm_id is required"):
-            validate_watchdog_config({"enabled": True, "llm_id": None, "objectives": ["X"]})
+            validate_watchdog_config(self.make_config(llm_id=None, objectives=["X"]))
 
     def test_enabled_without_objectives_raises(self):
-        with pytest.raises(ValueError, match="At least one objective"):
-            validate_watchdog_config({"enabled": True, "llm_id": 1, "objectives": []})
+        with pytest.raises(ValueError, match="[Aa]t least one objective"):
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=[]))
 
     def test_enabled_with_empty_string_objectives_raises(self):
         """Objectives that are only whitespace should be filtered and raise."""
-        with pytest.raises(ValueError, match="At least one non-empty objective"):
-            validate_watchdog_config({"enabled": True, "llm_id": 1, "objectives": ["  ", ""]})
+        with pytest.raises(ValueError, match="[Aa]t least one non-empty objective"):
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=["  ", ""]))
 
     def test_enabled_with_non_string_objectives_raises(self):
         """Non-string objectives are silently skipped; if none remain, raise."""
-        with pytest.raises(ValueError, match="At least one non-empty objective"):
-            validate_watchdog_config({"enabled": True, "llm_id": 1, "objectives": [123, None]})
+        with pytest.raises(ValueError, match="[Aa]t least one non-empty objective"):
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=[123, None]))
 
     # --- Invalid modes ---
 
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="mode must be one of"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "mode": "therapy", "objectives": ["X"]
-            })
+            validate_watchdog_config(self.make_config(llm_id=1, mode="therapy", objectives=["X"]))
 
     # --- llm_id validation ---
 
     def test_llm_id_string_converts_to_int(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": "7", "mode": "custom", "objectives": ["X"]
-        })
-        assert result["llm_id"] == 7
+        result = validate_watchdog_config(self.make_config(llm_id="7", mode="custom", objectives=["X"]))
+        assert result["post_watchdog"]["llm_id"] == 7
 
     def test_llm_id_non_numeric_raises(self):
         with pytest.raises(ValueError, match="llm_id must be an integer"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": "abc", "mode": "custom", "objectives": ["X"]
-            })
+            validate_watchdog_config(self.make_config(llm_id="abc", mode="custom", objectives=["X"]))
 
     # --- Frequency ---
 
     def test_frequency_zero_raises(self):
         with pytest.raises(ValueError, match="frequency must be between 1 and 20"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"], "frequency": 0
-            })
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"], frequency=0))
 
     def test_frequency_21_raises(self):
         with pytest.raises(ValueError, match="frequency must be between 1 and 20"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"], "frequency": 21
-            })
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"], frequency=21))
 
     def test_frequency_defaults_to_3(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"]
-        })
-        assert result["frequency"] == 3
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"]))
+        assert result["post_watchdog"]["frequency"] == 3
 
     def test_frequency_non_numeric_defaults(self):
         """Non-convertible frequency falls back to default 3."""
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"], "frequency": "abc"
-        })
-        assert result["frequency"] == 3
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"], frequency="abc"))
+        assert result["post_watchdog"]["frequency"] == 3
 
     # --- max_hint_chars ---
 
     def test_max_hint_chars_below_100_raises(self):
         with pytest.raises(ValueError, match="max_hint_chars must be between 100 and 2000"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"], "max_hint_chars": 50
-            })
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"], max_hint_chars=50))
 
     def test_max_hint_chars_above_2000_raises(self):
         with pytest.raises(ValueError, match="max_hint_chars must be between 100 and 2000"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"], "max_hint_chars": 3000
-            })
+            validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"], max_hint_chars=3000))
 
     def test_max_hint_chars_defaults_to_500(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"]
-        })
-        assert result["max_hint_chars"] == 500
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"]))
+        assert result["post_watchdog"]["max_hint_chars"] == 500
 
     # --- Thresholds ---
 
     def test_thresholds_valid(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "thresholds": {"max_turns_off_topic": 5, "max_turns_same_subtopic": 10}
-        })
-        assert result["thresholds"]["max_turns_off_topic"] == 5
-        assert result["thresholds"]["max_turns_same_subtopic"] == 10
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            thresholds={"max_turns_off_topic": 5, "max_turns_same_subtopic": 10},
+        ))
+        assert result["post_watchdog"]["thresholds"]["max_turns_off_topic"] == 5
+        assert result["post_watchdog"]["thresholds"]["max_turns_same_subtopic"] == 10
 
     def test_thresholds_unknown_keys_discarded(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "thresholds": {"max_turns_off_topic": 5, "unknown_key": 99}
-        })
-        assert "unknown_key" not in result["thresholds"]
-        assert result["thresholds"]["max_turns_off_topic"] == 5
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            thresholds={"max_turns_off_topic": 5, "unknown_key": 99},
+        ))
+        assert "unknown_key" not in result["post_watchdog"]["thresholds"]
+        assert result["post_watchdog"]["thresholds"]["max_turns_off_topic"] == 5
 
     def test_thresholds_below_0_raises(self):
         with pytest.raises(ValueError, match="threshold.*must be between 0 and 50"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"],
-                "thresholds": {"max_turns_off_topic": -1}
-            })
+            validate_watchdog_config(self.make_config(
+                llm_id=1,
+                objectives=["X"],
+                thresholds={"max_turns_off_topic": -1},
+            ))
 
     def test_thresholds_zero_is_valid(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "thresholds": {"max_warnings_before_action": 0}
-        })
-        assert result["thresholds"]["max_warnings_before_action"] == 0
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            thresholds={"max_warnings_before_action": 0},
+        ))
+        assert result["post_watchdog"]["thresholds"]["max_warnings_before_action"] == 0
 
     def test_thresholds_above_50_raises(self):
         with pytest.raises(ValueError, match="threshold.*must be between 0 and 50"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1, "objectives": ["X"],
-                "thresholds": {"max_turns_same_subtopic": 51}
-            })
+            validate_watchdog_config(self.make_config(
+                llm_id=1,
+                objectives=["X"],
+                thresholds={"max_turns_same_subtopic": 51},
+            ))
 
     def test_thresholds_defaults_when_missing(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"]
-        })
-        assert result["thresholds"]["max_turns_off_topic"] == 3
-        assert result["thresholds"]["max_turns_same_subtopic"] == 5
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=["X"]))
+        assert result["post_watchdog"]["thresholds"]["max_turns_off_topic"] == 3
+        assert result["post_watchdog"]["thresholds"]["max_turns_same_subtopic"] == 5
 
     def test_thresholds_non_dict_ignored(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "thresholds": "not a dict"
-        })
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            thresholds="not a dict",
+        ))
         # Should use defaults
-        assert result["thresholds"]["max_turns_off_topic"] == 3
+        assert result["post_watchdog"]["thresholds"]["max_turns_off_topic"] == 3
 
     # --- Sanitization ---
 
     def test_steering_prompt_truncated_to_5000(self):
         long_prompt = "A" * 10000
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "steering_prompt": long_prompt,
-        })
-        assert len(result["steering_prompt"]) == 5000
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            steering_prompt=long_prompt,
+        ))
+        assert len(result["post_watchdog"]["steering_prompt"]) == 5000
 
     def test_steering_prompt_stripped(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "steering_prompt": "  padded text  ",
-        })
-        assert result["steering_prompt"] == "padded text"
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            steering_prompt="  padded text  ",
+        ))
+        assert result["post_watchdog"]["steering_prompt"] == "padded text"
 
     def test_steering_prompt_xss_preserved_as_string(self):
         """XSS payload in steering_prompt is stored as-is (no HTML rendering)."""
         xss = '<script>alert("xss")</script>'
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["X"],
-            "steering_prompt": xss,
-        })
-        assert result["steering_prompt"] == xss
+        result = validate_watchdog_config(self.make_config(
+            llm_id=1,
+            objectives=["X"],
+            steering_prompt=xss,
+        ))
+        assert result["post_watchdog"]["steering_prompt"] == xss
 
     def test_objectives_truncated_to_500_chars(self):
         long_obj = "O" * 1000
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": [long_obj],
-        })
-        assert len(result["objectives"][0]) == 500
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=[long_obj]))
+        assert len(result["post_watchdog"]["objectives"][0]) == 500
 
     def test_objectives_max_20(self):
-        with pytest.raises(ValueError, match="Maximum 20 objectives"):
-            validate_watchdog_config({
-                "enabled": True, "llm_id": 1,
-                "objectives": [f"Obj {i}" for i in range(21)],
-            })
+        with pytest.raises(ValueError, match="[Mm]aximum 20 objectives"):
+            validate_watchdog_config(self.make_config(
+                llm_id=1,
+                objectives=[f"Obj {i}" for i in range(21)],
+            ))
 
     def test_objectives_stripped(self):
-        result = validate_watchdog_config({
-            "enabled": True, "llm_id": 1, "objectives": ["  trim me  "],
-        })
-        assert result["objectives"][0] == "trim me"
+        result = validate_watchdog_config(self.make_config(llm_id=1, objectives=["  trim me  "]))
+        assert result["post_watchdog"]["objectives"][0] == "trim me"
 
     # --- Type coercion ---
 
@@ -295,8 +304,8 @@ class TestValidateWatchdogConfig:
             validate_watchdog_config("string")
 
     def test_enabled_truthy_converts_to_bool(self):
-        result = validate_watchdog_config({"enabled": 1, "llm_id": 1, "objectives": ["X"]})
-        assert result["enabled"] is True
+        result = validate_watchdog_config(self.make_config(enabled=1, llm_id=1, objectives=["X"]))
+        assert result["post_watchdog"]["enabled"] is True
 
 
 # ===================================================================
@@ -426,8 +435,8 @@ class TestFormatMessagesForEval:
             {"role": "bot", "content": "Hello!", "date": "2026-01-01"},
         ]
         result = _format_messages_for_eval(messages)
-        assert "[USER]: Hi" in result
-        assert "[BOT]: Hello!" in result
+        assert "--- MSG 1 [USER] ---\nHi" in result
+        assert "--- MSG 2 [BOT] ---\nHello!" in result
 
     def test_preserves_order(self):
         messages = [
@@ -436,10 +445,7 @@ class TestFormatMessagesForEval:
             {"role": "user", "content": "Third", "date": "2026-01-01"},
         ]
         result = _format_messages_for_eval(messages)
-        lines = result.strip().split("\n")
-        assert len(lines) == 3
-        assert "First" in lines[0]
-        assert "Third" in lines[2]
+        assert result.index("First") < result.index("Second") < result.index("Third")
 
     def test_empty_list(self):
         assert _format_messages_for_eval([]) == ""
@@ -499,8 +505,8 @@ class TestBuildEvaluationPrompt:
             {"role": "bot", "content": "Hello user", "date": "2026-01-01"},
         ]
         result = _build_evaluation_prompt(config, messages)
-        assert "[USER]: Hello AI" in result
-        assert "[BOT]: Hello user" in result
+        assert "--- MSG 1 [USER] ---\nHello AI" in result
+        assert "--- MSG 2 [BOT] ---\nHello user" in result
 
     def test_includes_json_response_format(self):
         config = {
@@ -548,7 +554,7 @@ class TestBuildEvaluationPrompt:
             hint_tracking=tracking,
         )
         assert "IGNORED HINT TRACKING" in result
-        assert "Consecutive hints generated: 3" in result
+        assert "Consecutive redirect-level hints ignored: 3" in result
         assert "Last hint severity: redirect" in result
         assert "Redirect the conversation" in result
 

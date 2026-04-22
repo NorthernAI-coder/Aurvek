@@ -287,9 +287,11 @@ document.addEventListener('DOMContentLoaded', function() {
             if (isValid) {
                 // Session is valid, send message and clear form
                 try {
-                    sendMessage(messageText);
-                    document.getElementById('message-text').value = ''; 
-                    Config.attachedFiles = [];
+                    const didSend = sendMessage(messageText);
+                    if (didSend) {
+                        document.getElementById('message-text').value = '';
+                        Config.attachedFiles = [];
+                    }
                 } catch (error) {
                     console.error('Error sending message:', error);
                     // Don't clear form if there was an error
@@ -364,46 +366,72 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
     
-    function handleDroppedFiles(files) {
+    async function handleDroppedFiles(files) {
         const imagePreviews = document.getElementById('image-previews');
-        for (const file of files) {
-            if (!isAcceptedFileType(file) || !validateFileSize(file)) continue;
 
-            if (file.type === 'application/pdf') {
-                const pdfPreview = document.createElement('div');
-                pdfPreview.className = 'pdf-preview-item';
-                const iconSpan = document.createElement('span');
-                iconSpan.className = 'pdf-icon';
-                iconSpan.textContent = 'PDF';
-                const nameSpan = document.createElement('span');
-                nameSpan.className = 'pdf-name';
-                nameSpan.textContent = file.name;
-                pdfPreview.appendChild(iconSpan);
-                pdfPreview.appendChild(nameSpan);
-                imagePreviews.appendChild(pdfPreview);
-            } else if (isTextFile(file)) {
-                const previewItem = document.createElement('div');
-                previewItem.className = 'text-preview-item';
-                const icon = document.createElement('span');
-                icon.className = 'text-icon';
-                icon.textContent = 'TXT';
-                const name = document.createElement('span');
-                name.className = 'text-name';
-                name.textContent = file.name;
-                previewItem.appendChild(icon);
-                previewItem.appendChild(name);
-                imagePreviews.appendChild(previewItem);
-            } else if (file.type.startsWith('image/')) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const img = document.createElement('img');
-                    img.src = e.target.result;
-                    img.className = 'preview-image';
-                    imagePreviews.appendChild(img);
-                };
-                reader.readAsDataURL(file);
+        compressionInProgress++;
+        try {
+            let compressedCount = 0;
+            let totalSavedBytes = 0;
+
+            for (const file of files) {
+                if (!isAcceptedFileType(file) || !validateFileSize(file)) continue;
+
+                if (file.type === 'application/pdf') {
+                    const pdfPreview = document.createElement('div');
+                    pdfPreview.className = 'pdf-preview-item';
+                    const iconSpan = document.createElement('span');
+                    iconSpan.className = 'pdf-icon';
+                    iconSpan.textContent = 'PDF';
+                    const nameSpan = document.createElement('span');
+                    nameSpan.className = 'pdf-name';
+                    nameSpan.textContent = file.name;
+                    pdfPreview.appendChild(iconSpan);
+                    pdfPreview.appendChild(nameSpan);
+                    imagePreviews.appendChild(pdfPreview);
+                    attachedFiles.push(file);
+                } else if (isTextFile(file)) {
+                    const previewItem = document.createElement('div');
+                    previewItem.className = 'text-preview-item';
+                    const icon = document.createElement('span');
+                    icon.className = 'text-icon';
+                    icon.textContent = 'TXT';
+                    const name = document.createElement('span');
+                    name.className = 'text-name';
+                    name.textContent = file.name;
+                    previewItem.appendChild(icon);
+                    previewItem.appendChild(name);
+                    imagePreviews.appendChild(previewItem);
+                    attachedFiles.push(file);
+                } else if (file.type.startsWith('image/')) {
+                    const processed = await maybeCompressImage(file);
+                    attachedFiles.push(processed);
+
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        const img = document.createElement('img');
+                        img.src = e.target.result;
+                        img.className = 'preview-image';
+                        imagePreviews.appendChild(img);
+                    };
+                    reader.readAsDataURL(processed);
+
+                    if (processed !== file && processed.size < file.size) {
+                        compressedCount++;
+                        totalSavedBytes += file.size - processed.size;
+                    }
+                }
             }
-            attachedFiles.push(file);
+
+            if (compressedCount > 0) {
+                const saved = (totalSavedBytes / (1024 * 1024)).toFixed(1);
+                const msg = compressedCount === 1
+                    ? `Image compressed (saved ${saved} MB)`
+                    : `${compressedCount} images compressed (saved ${saved} MB)`;
+                NotificationModal.toast(msg, 'info', 3000);
+            }
+        } finally {
+            compressionInProgress--;
         }
 
         if (attachedFiles.length > 0) {

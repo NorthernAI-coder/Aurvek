@@ -508,7 +508,6 @@ textarea {
     word-wrap: break-word;
     overflow-wrap: anywhere;
     width: fit-content;
-    overflow: hidden;
 }
 
 /* User messages: accent glass bubble with white text */

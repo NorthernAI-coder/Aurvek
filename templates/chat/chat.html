@@ -715,6 +715,7 @@
     <script src="{{ get_static_url('/static/js/chat/audio.js') }}"></script>
     <script src="{{ get_static_url('/static/js/chat/main.js') }}"></script>
     <script src="{{ get_static_url('/static/js/chat/chat.js') }}"></script>
+    <script src="{{ get_static_url('/static/js/chat/warmup.js') }}"></script>
     <script src="{{ get_static_url('/static/js/chat/message-search.js') }}"></script>
     <script src="{{ get_static_url('/static/js/chat/folders.js') }}"></script>
     <script src="{{ get_static_url('/static/js/themeManager.js') }}"></script>
@@ -733,6 +734,8 @@
         var currentConversationId = {{ conversation_id|tojson }};
         var have_vision = {{ have_vision | tojson }};
         Config.can_send_files = {{ can_send_files | tojson }};
+        Config.max_api_image_size_mb = {{ max_api_image_size_mb | tojson }};
+        Config.max_chat_image_dimension = {{ max_chat_image_dimension | tojson }};
         var user_id = {{ user_id }};
         var username = "{{ username }}";
         var userProfilePicture = "{{ user_profile_picture | default('', true) }}";

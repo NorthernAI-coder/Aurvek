@@ -188,7 +188,7 @@ VALID_NOTICE_PERIODS = [0, 90, 180, 365, 730]
 
 ALGORITHM = "HS256"
 
-MAX_TOKENS = int(os.getenv('MAX_TOKENS', 4096))
+MAX_TOKENS = int(os.getenv('MAX_TOKENS', 8192))
 MAX_MESSAGE_SIZE = int(os.getenv('MAX_MESSAGE_SIZE', 5120))
 
 # Image upload security limits
@@ -198,6 +198,9 @@ MAX_IMAGE_PIXELS = int(os.getenv('MAX_IMAGE_PIXELS', 50_000_000))  # 50 megapixe
 # Chat image upload limits (compression + AI API)
 MAX_RAW_UPLOAD_SIZE_MB = int(os.getenv('MAX_RAW_UPLOAD_SIZE_MB', 20))   # Pre-compression gate per file
 MAX_API_IMAGE_SIZE_MB = int(os.getenv('MAX_API_IMAGE_SIZE_MB', 5))      # Post-compression gate (Claude's API limit)
+# Chat image longest-side cap before provider upload. Single source of truth:
+# frontend reads it via Config.max_chat_image_dimension from the chat template.
+MAX_CHAT_IMAGE_DIMENSION = 1568
 
 # PDF upload limits
 MAX_PDF_SIZE_MB = int(os.getenv('MAX_PDF_SIZE_MB', 25))        # Under Claude's 32MB request limit
@@ -237,7 +240,7 @@ CLOUDFLARE_API_URL = os.getenv('CLOUDFLARE_API_URL')
 CLOUDFLARE_FOR_IMAGES = os.getenv("CLOUDFLARE_FOR_IMAGES", "false").lower() == "true"
 CLOUDFLARE_SECRET = os.getenv("CLOUDFLARE_SECRET")
 CLOUDFLARE_IMAGE_SUBDOMAIN = os.getenv("CLOUDFLARE_IMAGE_SUBDOMAIN")
-CLOUDFLARE_BASE_URL = os.getenv("CLOUDFLARE_BASE_URL")
+CLOUDFLARE_BASE_URL = os.getenv("CLOUDFLARE_BASE_URL", "")
 
 # Cloudflare DNS Management (for auto-creating user subdomains)
 CLOUDFLARE_DOMAIN = os.getenv("CLOUDFLARE_DOMAIN")
@@ -1790,12 +1793,29 @@ async def get_llm_info(llm_id: int) -> dict | None:
         return None
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
-            "SELECT id, machine, model FROM LLM WHERE id = ?", (llm_id,)
+            """
+            SELECT id, machine, model, provider_key, provider_model_id,
+                   enabled, max_output_tokens,
+                   COALESCE(input_token_cost, 0), COALESCE(output_token_cost, 0)
+            FROM LLM
+            WHERE id = ?
+            """,
+            (llm_id,),
         )
         row = await cursor.fetchone()
         if not row:
             return None
-        return {"id": row[0], "machine": row[1], "model": row[2]}
+        return {
+            "id": row[0],
+            "machine": row[1],
+            "model": row[2],
+            "provider_key": row[3] if len(row) > 3 else None,
+            "provider_model_id": row[4] if len(row) > 4 else None,
+            "enabled": bool(row[5]) if len(row) > 5 else True,
+            "max_output_tokens": int(row[6] or 0) if len(row) > 6 else 0,
+            "input_token_cost": float(row[7] or 0.0) if len(row) > 7 else 0.0,
+            "output_token_cost": float(row[8] or 0.0) if len(row) > 8 else 0.0,
+        }
 
 
 def extract_post_watchdog_config(config: dict | None) -> dict | None:
@@ -1819,15 +1839,49 @@ def extract_pre_watchdog_config(config: dict | None) -> dict | None:
     return None
 
 
-async def get_llm_token_costs(model: str, conn=None) -> tuple[float, float]:
-    """Return (input_token_cost, output_token_cost) per million tokens for a model."""
-    query = "SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?"
+async def get_llm_token_costs(
+    model: str | None = None,
+    conn=None,
+    *,
+    llm_id: int | None = None,
+    provider_key: str | None = None,
+    provider_model_id: str | None = None,
+) -> tuple[float, float]:
+    """Return (input_token_cost, output_token_cost) per million tokens.
+
+    Prefer llm_id. Provider/model identity is the secondary key. Bare model
+    lookup is retained only for legacy callers that do not yet carry identity.
+    """
+    normalized_llm_id = None
+    try:
+        if llm_id is not None and int(llm_id) > 0:
+            normalized_llm_id = int(llm_id)
+    except (TypeError, ValueError):
+        normalized_llm_id = None
+
+    if normalized_llm_id is not None:
+        query = "SELECT input_token_cost, output_token_cost FROM LLM WHERE id = ?"
+        params = (normalized_llm_id,)
+    elif provider_key and provider_model_id:
+        query = """
+            SELECT input_token_cost, output_token_cost
+            FROM LLM
+            WHERE provider_key = ? AND provider_model_id = ?
+        """
+        params = (provider_key, provider_model_id)
+    elif model:
+        query = "SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?"
+        params = (model,)
+        logger.warning("Using legacy bare-model LLM cost lookup for model=%s", model)
+    else:
+        return 0.0, 0.0
+
     if conn:
-        cursor = await conn.execute(query, (model,))
+        cursor = await conn.execute(query, params)
         row = await cursor.fetchone()
     else:
         async with get_db_connection(readonly=True) as new_conn:
-            cursor = await new_conn.execute(query, (model,))
+            cursor = await new_conn.execute(query, params)
             row = await cursor.fetchone()
 
     if not row:

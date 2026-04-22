@@ -5,7 +5,7 @@ import sys
 import logging
 import asyncio
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 from pydub import AudioSegment
 from io import BytesIO
@@ -99,7 +99,7 @@ async def generate_and_save_mp3(conversation_id: int, user_id: int, is_admin: bo
         mp3_convo_folder = os.path.join(BASE_DIR, hash_prefixes[0], hash_prefixes[1], user_hash, "files", prefix1, prefix2, "mp3")
         os.makedirs(mp3_convo_folder, exist_ok=True)
 
-        timestamp = datetime.utcnow().strftime("%Y_%m_%d_%H_%M_%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
         prompt_name_safe = ''.join(c for c in conversation["prompt_name"] if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
         mp3_filename = f"{prompt_name_safe}_{timestamp}.mp3"
         mp3_file_path = os.path.join(mp3_convo_folder, mp3_filename)
@@ -109,4 +109,3 @@ async def generate_and_save_mp3(conversation_id: int, user_id: int, is_admin: bo
             logger.debug(f"MP3 saved successfully at {mp3_file_path} for conversation_id: {conversation_id}")
         except Exception as e:
             logger.error(f"Error saving MP3: {e}")
-

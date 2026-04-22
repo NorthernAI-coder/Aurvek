@@ -10,6 +10,135 @@ const TEXT_FILE_EXTENSIONS = new Set([
     '.php', '.r', '.swift', '.kt', '.lua'
 ]);
 
+const COMPRESSION_THRESHOLD_BYTES = 3 * 1024 * 1024; // 3MB - matches server SIZE_THRESHOLD
+const COMPRESSION_QUALITY = 0.85;
+const MAX_SHRINK_STEPS = 10;
+const COMPRESSIBLE_TYPES = new Set([
+    'image/png', 'image/bmp', 'image/tiff', 'image/gif',
+    'image/jpeg', 'image/webp'
+]);
+
+// Tracks in-flight compression operations. Exported for chat.js send guard.
+let compressionInProgress = 0;
+
+function getCompressionTargetBytes() {
+    const sizeMb = Number(Config.max_api_image_size_mb);
+    if (Number.isFinite(sizeMb) && sizeMb > 0) {
+        return sizeMb * 1024 * 1024;
+    }
+    // Safe fallback: matches the current backend default in common.py.
+    return 5 * 1024 * 1024;
+}
+
+// ORDERING HAZARD (do NOT revert this to a module-level const):
+// fileHandling.js is loaded by chat.html at line 714. The inline <script>
+// block that assigns Config.max_chat_image_dimension runs at chat.html:737,
+// AFTER this file has already been parsed and its top-level const declarations
+// have been evaluated. A module-level
+//     const COMPRESSION_MAX_DIMENSION = Config.max_chat_image_dimension || 1568;
+// would always resolve to the fallback 1568 on initial page load, silently
+// defeating the backend -> frontend Config channel. If the cap is ever tuned
+// in common.py, a module-level const would NOT pick it up on reload.
+// Read inside the function body instead, mirroring getCompressionTargetBytes()
+// above. This is the F1 fix from round 8 external review.
+function getCompressionMaxDimension() {
+    const dim = Number(Config.max_chat_image_dimension);
+    if (Number.isFinite(dim) && dim > 0) {
+        return dim;
+    }
+    // Safe fallback: matches common.py's MAX_CHAT_IMAGE_DIMENSION.
+    return 1568;
+}
+
+/**
+ * Compress an image file to WebP if it exceeds the size threshold.
+ * Uses Canvas API -- no external libraries.
+ *
+ * @param {File|Blob} file - The image file to potentially compress
+ * @returns {Promise<File|Blob>} - Compressed file, or original if compression
+ *   is not beneficial, not applicable, or fails
+ */
+async function maybeCompressImage(file) {
+    // Only compress image types we know how to handle
+    if (!file.type || !COMPRESSIBLE_TYPES.has(file.type)) return file;
+
+    try {
+        const compressionTargetBytes = getCompressionTargetBytes();
+        const maxDim = getCompressionMaxDimension();
+        const bitmap = await createImageBitmap(file);
+        const exceedsDimensionCap = bitmap.width > maxDim || bitmap.height > maxDim;
+
+        if (file.size <= COMPRESSION_THRESHOLD_BYTES && !exceedsDimensionCap) {
+            bitmap.close();
+            return file;
+        }
+
+        let width = bitmap.width;
+        let height = bitmap.height;
+        let compressedBlob = null;
+
+        // Scale down first if any dimension exceeds the hard cap.
+        if (exceedsDimensionCap) {
+            const scale = maxDim / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+        }
+
+        try {
+            for (let step = 0; step < MAX_SHRINK_STEPS; step++) {
+                const canvas = new OffscreenCanvas(width, height);
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return file;
+
+                ctx.drawImage(bitmap, 0, 0, width, height);
+                compressedBlob = await canvas.convertToBlob({
+                    type: 'image/webp',
+                    quality: COMPRESSION_QUALITY
+                });
+
+                if (!compressedBlob || compressedBlob.size === 0) return file;
+                if (compressedBlob.size <= compressionTargetBytes) break;
+                if (width === 1 && height === 1) break;
+
+                // Try again with a smaller frame if we are still above the backend gate.
+                const scale = 0.85;
+                width = Math.max(1, Math.round(width * scale));
+                height = Math.max(1, Math.round(height * scale));
+            }
+        } finally {
+            bitmap.close();
+        }
+
+        if (!compressedBlob || compressedBlob.size === 0) return file;
+
+        // If we still could not fit under the backend gate, keep the original
+        // so the existing server-side path can make the final decision.
+        if (compressedBlob.size > compressionTargetBytes) return file;
+
+        // Only use compressed version if it is actually smaller.
+        if (compressedBlob.size >= file.size && !exceedsDimensionCap) return file;
+
+        // Build a proper File with a corrected name (.webp extension)
+        const originalName = file.name || 'image';
+        const baseName = originalName.replace(/\.[^.]+$/, '');
+        const compressedFile = new File(
+            [compressedBlob],
+            baseName + '.webp',
+            { type: 'image/webp', lastModified: Date.now() }
+        );
+
+        const originalMB = (file.size / (1024 * 1024)).toFixed(1);
+        const compressedMB = (compressedFile.size / (1024 * 1024)).toFixed(1);
+        console.log(`[compression] ${originalName}: ${originalMB}MB -> ${compressedMB}MB`);
+
+        return compressedFile;
+    } catch (err) {
+        // Fallback: send original file if Canvas compression fails
+        console.warn('[compression] Failed, sending original:', err);
+        return file;
+    }
+}
+
 function isTextFile(file) {
     if (!file.name) return false;
     const ext = '.' + file.name.split('.').pop().toLowerCase();
@@ -42,27 +171,60 @@ function validateFileSize(file) {
     return true;
 }
 
-function handlePasteEvent(event) {
+async function handlePasteEvent(event) {
 
     if (!Config.can_send_files) return;
-    var items = (event.clipboardData || event.originalEvent.clipboardData).items;
-    for (var index in items) {
-        var item = items[index];
+    const items = (event.clipboardData || event.originalEvent.clipboardData).items;
+
+    // Collect image blobs first (clipboard items are ephemeral -- extract immediately)
+    const imageBlobs = [];
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
         if (item.kind === 'file' && item.type.startsWith('image/')) {
-            var blob = item.getAsFile();
+            const blob = item.getAsFile();
             if (!blob || !validateFileSize(blob)) continue;
-            attachedFiles.push(blob);
-            var reader = new FileReader();
+            imageBlobs.push(blob);
+        }
+    }
+
+    if (imageBlobs.length === 0) return;
+
+    compressionInProgress++;
+    try {
+        let compressedCount = 0;
+        let totalSavedBytes = 0;
+
+        for (const blob of imageBlobs) {
+            const processed = await maybeCompressImage(blob);
+
+            attachedFiles.push(processed);
+            const reader = new FileReader();
             reader.onload = function(event){
-                var img = document.createElement('img');
+                const img = document.createElement('img');
                 img.src = event.target.result;
                 img.className = 'preview-image';
                 document.getElementById('image-previews').appendChild(img);
                 document.getElementById('image-previews').classList.remove('hidden');
             };
-            reader.readAsDataURL(blob);
+            reader.readAsDataURL(processed);
+
+            if (processed !== blob && processed.size < blob.size) {
+                compressedCount++;
+                totalSavedBytes += blob.size - processed.size;
+            }
         }
+
+        if (compressedCount > 0) {
+            const saved = (totalSavedBytes / (1024 * 1024)).toFixed(1);
+            const msg = compressedCount === 1
+                ? `Image compressed (saved ${saved} MB)`
+                : `${compressedCount} images compressed (saved ${saved} MB)`;
+            NotificationModal.toast(msg, 'info', 3000);
+        }
+    } finally {
+        compressionInProgress--;
     }
+
     setTimeout(() => {
         document.getElementById('message-text').focus();
     }, 0);
@@ -173,58 +335,84 @@ function initFileHandling() {
     if (fileInput) fileInput.addEventListener('change', handleFileSelect);
 }
 
-function handleFileSelect(event) {
+async function handleFileSelect(event) {
     const files = event.target.files;
     const imagePreviews = document.getElementById('image-previews');
 
-    for (const file of files) {
-        if (!isAcceptedFileType(file) || !validateFileSize(file)) {
-            if (!isAcceptedFileType(file)) {
-                NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
+    compressionInProgress++;
+    try {
+        let compressedCount = 0;
+        let totalSavedBytes = 0;
+
+        for (const file of files) {
+            if (!isAcceptedFileType(file) || !validateFileSize(file)) {
+                if (!isAcceptedFileType(file)) {
+                    NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
+                }
+                continue;
             }
-            continue;
+
+            if (file.type === 'application/pdf') {
+                // PDF preview (unchanged)
+                const pdfPreview = document.createElement('div');
+                pdfPreview.className = 'pdf-preview-item';
+                const iconSpan = document.createElement('span');
+                iconSpan.className = 'pdf-icon';
+                iconSpan.textContent = 'PDF';
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'pdf-name';
+                nameSpan.textContent = file.name;
+                pdfPreview.appendChild(iconSpan);
+                pdfPreview.appendChild(nameSpan);
+                imagePreviews.appendChild(pdfPreview);
+                attachedFiles.push(file);
+            } else if (isTextFile(file)) {
+                // Text preview (unchanged)
+                const previewItem = document.createElement('div');
+                previewItem.className = 'text-preview-item';
+                const icon = document.createElement('span');
+                icon.className = 'text-icon';
+                icon.textContent = 'TXT';
+                const name = document.createElement('span');
+                name.className = 'text-name';
+                name.textContent = file.name;
+                previewItem.appendChild(icon);
+                previewItem.appendChild(name);
+                imagePreviews.appendChild(previewItem);
+                attachedFiles.push(file);
+            } else {
+                // Image: compress before preview
+                const processed = await maybeCompressImage(file);
+                attachedFiles.push(processed);
+
+                const reader = new FileReader();
+                reader.onload = function (e) {
+                    const img = document.createElement('img');
+                    img.src = e.target.result;
+                    img.className = 'preview-image';
+                    imagePreviews.appendChild(img);
+                };
+                reader.onerror = function (e) {
+                    console.error('Error reading file:', e);
+                };
+                reader.readAsDataURL(processed);
+
+                if (processed !== file && processed.size < file.size) {
+                    compressedCount++;
+                    totalSavedBytes += file.size - processed.size;
+                }
+            }
         }
 
-        if (file.type === 'application/pdf') {
-            // PDF preview
-            const pdfPreview = document.createElement('div');
-            pdfPreview.className = 'pdf-preview-item';
-            const iconSpan = document.createElement('span');
-            iconSpan.className = 'pdf-icon';
-            iconSpan.textContent = 'PDF';
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'pdf-name';
-            nameSpan.textContent = file.name;
-            pdfPreview.appendChild(iconSpan);
-            pdfPreview.appendChild(nameSpan);
-            imagePreviews.appendChild(pdfPreview);
-        } else if (isTextFile(file)) {
-            const previewItem = document.createElement('div');
-            previewItem.className = 'text-preview-item';
-            const icon = document.createElement('span');
-            icon.className = 'text-icon';
-            icon.textContent = 'TXT';
-            const name = document.createElement('span');
-            name.className = 'text-name';
-            name.textContent = file.name;
-            previewItem.appendChild(icon);
-            previewItem.appendChild(name);
-            imagePreviews.appendChild(previewItem);
-        } else {
-            // Existing image preview logic
-            const reader = new FileReader();
-            reader.onload = function (e) {
-                const img = document.createElement('img');
-                img.src = e.target.result;
-                img.className = 'preview-image';
-                imagePreviews.appendChild(img);
-            };
-            reader.onerror = function (e) {
-                console.error('Error reading file:', e);
-            };
-            reader.readAsDataURL(file);
+        if (compressedCount > 0) {
+            const saved = (totalSavedBytes / (1024 * 1024)).toFixed(1);
+            const msg = compressedCount === 1
+                ? `Image compressed (saved ${saved} MB)`
+                : `${compressedCount} images compressed (saved ${saved} MB)`;
+            NotificationModal.toast(msg, 'info', 3000);
         }
-        attachedFiles.push(file);
+    } finally {
+        compressionInProgress--;
     }
 
     if (attachedFiles.length > 0) {

@@ -916,7 +916,7 @@ async function sharePrompt(name, landingUrl) {
         } catch (e) {
             // Double fallback: show URL in a modal so user can select and copy
             const safeUrl = shareUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            NotificationModal.info('Share Link', `<input class="form-control" value="${safeUrl}" readonly onclick="this.select()">`);
+            NotificationModal.info('Share Link', `<input class="form-control" value="${safeUrl}" readonly onclick="this.select()">`, { allowHtml: true });
         }
     }
 }

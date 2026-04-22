@@ -17,6 +17,8 @@ tst/
 
 # Virtual environments
 .venv/
+.venv*/
+deploy.sh
 
 # Environment and secrets
 .env

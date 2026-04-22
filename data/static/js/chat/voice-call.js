@@ -467,6 +467,10 @@
                 return;
             }
 
+            if (window.ChatWarmup && typeof window.ChatWarmup.signal === 'function') {
+                window.ChatWarmup.signal('voice_call', {});
+            }
+
             // Force refresh to get fresh watchdog hint from backend
             const config = await fetchConfig(true);
             if (!config) {

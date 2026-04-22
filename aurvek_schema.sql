@@ -25,8 +25,30 @@ CREATE TABLE LLM (
     model TEXT NOT NULL,
     input_token_cost REAL,
     output_token_cost REAL,
-    vision BOOLEAN DEFAULT FALSE
+    vision BOOLEAN DEFAULT FALSE,
+    provider_key TEXT,
+    provider_model_id TEXT,
+    display_name TEXT,
+    description TEXT,
+    context_window_tokens INTEGER,
+    max_input_tokens INTEGER,
+    max_output_tokens INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sync_source TEXT,
+    sync_status TEXT NOT NULL DEFAULT 'manual',
+    last_synced_at TEXT,
+    raw_metadata_json TEXT,
+    capabilities_json TEXT,
+    manual_overrides_json TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_provider_model
+ON LLM(provider_key, provider_model_id)
+WHERE provider_key IS NOT NULL AND provider_key != ''
+  AND provider_model_id IS NOT NULL AND provider_model_id != '';
+
+CREATE INDEX IF NOT EXISTS idx_llm_enabled ON LLM(enabled);
+CREATE INDEX IF NOT EXISTS idx_llm_sync_status ON LLM(sync_status);
 
 CREATE TABLE USERS (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

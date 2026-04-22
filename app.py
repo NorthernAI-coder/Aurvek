@@ -118,6 +118,7 @@ from common import encrypt_api_key, decrypt_api_key, mask_api_key
 from common import CDN_FILES_URL, ENABLE_CDN
 from common import SECURE_COOKIES
 from common import READONLY_MODE
+from common import MAX_API_IMAGE_SIZE_MB, MAX_CHAT_IMAGE_DIMENSION
 from common import compute_static_hashes
 import nh3
 from elevenlabs_service import service as elevenlabs_service
@@ -129,6 +130,20 @@ from tools.tts_config import get_tts_config, invalidate_tts_config_cache, VALID_
 from tools.tts_load_balancer import get_elevenlabs_key
 from system_prompt_defaults import (
     MANDATORY_SYSTEM_KEYS, SYSTEM_BLOCK_METADATA, DEFAULT_SYSTEM_BLOCKS, MAX_BLOCK_CONTENT_SIZE
+)
+from llm_catalog import (
+    LlmCatalogError,
+    build_manual_insert_metadata,
+    fetch_remote_models,
+    get_catalog as get_llm_catalog,
+    get_provider_catalog_view,
+    get_selector_llms,
+    is_sync_managed,
+    merge_manual_overrides,
+    normalize_provider_key,
+    set_model_enabled,
+    sync_all_providers,
+    sync_provider,
 )
 
 from ai_calls import router as ai_router
@@ -216,6 +231,18 @@ async def lifespan(app: FastAPI):
     # Set WAL journal mode once (persistent across connections)
     from database import ensure_wal_mode
     await ensure_wal_mode()
+
+    # Keep additive schema migrations available for existing installs. The
+    # standalone runner still handles deployment migrations; this guard keeps
+    # local/legacy startup from reaching routes with missing LLM catalog columns.
+    try:
+        from migration_llm_catalog_metadata import migrate as migrate_llm_catalog_metadata
+        await asyncio.to_thread(migrate_llm_catalog_metadata)
+    except ModuleNotFoundError:
+        logger.info("LLM catalog migration module not found; assuming schema is current")
+    except Exception:
+        logger.exception("Failed to apply LLM catalog metadata migration")
+        raise
 
     # Compute static asset hashes for cache-busting
     compute_static_hashes()
@@ -1212,7 +1239,7 @@ async def show_edit_profile_form(request: Request, current_user: User = Depends(
 
     # Generate token URL for profile picture, add _128 suffix, and replace 'sk' with 'get_image'
     if user_data_dict["profile_picture"]:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
         profile_picture_url = f"{user_data_dict['profile_picture']}_128.webp"
         token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -1230,7 +1257,7 @@ async def show_edit_profile_form(request: Request, current_user: User = Depends(
         
         # Generate token URL for alter ego profile picture
         if alter_ego_dict["profile_picture"]:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
             profile_picture_url = f"{alter_ego_dict['profile_picture']}_128.webp"
             token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -1299,7 +1326,7 @@ async def settings_page(request: Request, current_user: User = Depends(get_curre
     }
 
     if user_data_dict["profile_picture"]:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
         profile_picture_url = f"{user_data_dict['profile_picture']}_128.webp"
         token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -1314,7 +1341,7 @@ async def settings_page(request: Request, current_user: User = Depends(get_curre
             "profile_picture": alter_ego[3] if alter_ego[3] else ""
         }
         if alter_ego_dict["profile_picture"]:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
             profile_picture_url = f"{alter_ego_dict['profile_picture']}_128.webp"
             token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -4292,7 +4319,7 @@ async def get_alter_ego_details(alter_ego_id: int, current_user: User = Depends(
         # Generate token URL for alter-ego profile picture only if it exists
         profile_picture_url = None
         if profile_picture:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
             profile_picture_url = f"{profile_picture}_128.webp"
             token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -4381,7 +4408,7 @@ async def create_alter_ego(
             
             # If there's an image, generate URL with token for response
             if profile_picture_url:
-                current_time = datetime.utcnow()
+                current_time = datetime.now(timezone.utc)
                 new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
                 profile_picture_token_url = f"{profile_picture_url}_128.webp"
                 token = generate_img_token(profile_picture_token_url, new_expiration, current_user)
@@ -4490,7 +4517,7 @@ async def update_alter_ego(
 
                 # If there's a profile picture, generate URL with token
                 if updated_alter_ego[2]:
-                    current_time = datetime.utcnow()
+                    current_time = datetime.now(timezone.utc)
                     new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
                     profile_picture_url = f"{updated_alter_ego[2]}_128.webp"
                     token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -5380,8 +5407,12 @@ async def create_user(request: Request, current_user: User = Depends(get_current
         # Use the function get_user_accessible_prompts
         prompts = await get_user_accessible_prompts(current_user, cursor)
 
-        await cursor.execute("SELECT id, machine, model, vision FROM LLM WHERE machine != 'GranSabio' ORDER BY machine DESC")
-        llm_models = await cursor.fetchall()
+        preserve_ids = [selected_machine] if selected_machine else []
+        llm_models_rows = await get_selector_llms(conn, preserve_ids=preserve_ids)
+        llm_models = [
+            (row["id"], row["machine"], row["model"], row["vision"])
+            for row in llm_models_rows
+        ]
 
         # Get categories for category access selection
         await cursor.execute('''
@@ -5478,6 +5509,19 @@ async def create_user_post(
     from common import VALID_API_KEY_MODES
     if api_key_mode not in VALID_API_KEY_MODES:
         raise HTTPException(status_code=400, detail="Invalid API key mode.")
+
+    async with get_db_connection(readonly=True) as conn:
+        async with conn.execute(
+            """
+            SELECT id
+            FROM LLM
+            WHERE id = ?
+              AND COALESCE(enabled, 1) = 1
+            """,
+            (machine,),
+        ) as cursor:
+            if not await cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Selected LLM is not available.")
 
     if phone:
         async with get_db_connection(readonly=True) as conn:
@@ -5642,10 +5686,6 @@ async def edit_user_form(
         # Get all prompts
         prompts = await get_user_accessible_prompts(current_user, cursor)
         
-        # Get all LLM models
-        await cursor.execute("SELECT id, machine, model, vision FROM LLM WHERE machine != 'GranSabio' ORDER BY machine DESC")
-        llm_models = await cursor.fetchall()
-
         # Get all categories for curation mode
         await cursor.execute("SELECT id, name, icon, is_age_restricted FROM CATEGORIES ORDER BY display_order")
         categories = [{'id': row[0], 'name': row[1], 'icon': row[2], 'is_age_restricted': row[3]} for row in await cursor.fetchall()]
@@ -5674,6 +5714,11 @@ async def edit_user_form(
         user_row = await cursor.fetchone()
 
         if user_row:
+            llm_models_rows = await get_selector_llms(conn, preserve_ids=[user_row[4]])
+            llm_models = [
+                (row["id"], row["machine"], row["model"], row["vision"])
+                for row in llm_models_rows
+            ]
             user_data = {
                 'id': user_row[0],
                 'username': user_row[1],
@@ -5764,10 +5809,11 @@ async def update_user(
 
         user_id, role_id = user
 
-        # Get current balance for audit trail
-        await cursor.execute("SELECT balance FROM USER_DETAILS WHERE user_id = ?", (user_id,))
+        # Get current balance/default LLM for audit trail and disabled-model preservation
+        await cursor.execute("SELECT balance, llm_id FROM USER_DETAILS WHERE user_id = ?", (user_id,))
         balance_row = await cursor.fetchone()
         previous_balance = balance_row[0] if balance_row else 0.0
+        current_user_llm_id = balance_row[1] if balance_row else None
 
         # Verify permissions
         if await current_user.is_user and role_id == 1:  # Assuming role_id 1 is for admin
@@ -5783,6 +5829,20 @@ async def update_user(
         valid_auth_modes = ["magic_link_only", "magic_link_password", "password_only"]
         if authentication_mode not in valid_auth_modes:
             raise HTTPException(status_code=400, detail="Invalid authentication mode.")
+
+        await cursor.execute(
+            """
+            SELECT id, COALESCE(enabled, 1)
+            FROM LLM
+            WHERE id = ?
+            """,
+            (machine,),
+        )
+        selected_llm = await cursor.fetchone()
+        if not selected_llm:
+            raise HTTPException(status_code=400, detail="Selected LLM does not exist.")
+        if not bool(selected_llm[1]) and int(machine) != int(current_user_llm_id or 0):
+            raise HTTPException(status_code=400, detail="Selected LLM is disabled.")
 
         # Validate the new username
         if len(new_username) < 3 or len(new_username) > 20:
@@ -6824,7 +6884,7 @@ async def update_conversation_model(
             
             # Verify conversation belongs to user and get the prompt (role_id)
             await cursor.execute('''
-                SELECT id, role_id FROM CONVERSATIONS
+                SELECT id, role_id, llm_id FROM CONVERSATIONS
                 WHERE id = ? AND user_id = ?
             ''', (conversation_id, current_user.id))
 
@@ -6833,6 +6893,7 @@ async def update_conversation_model(
                 raise HTTPException(status_code=404, detail="Conversation not found")
 
             prompt_id = conv_data[1]
+            current_llm_id = conv_data[2]
 
             # Check if prompt has forced_llm_id - if so, reject model change
             if prompt_id:
@@ -6862,12 +6923,16 @@ async def update_conversation_model(
 
             # Verify LLM exists and get model name
             await cursor.execute('''
-                SELECT id, machine, model FROM LLM WHERE id = ?
+                SELECT id, machine, model, COALESCE(enabled, 1)
+                FROM LLM
+                WHERE id = ?
             ''', (new_llm_id,))
             
             llm_data = await cursor.fetchone()
             if not llm_data:
                 raise HTTPException(status_code=404, detail="LLM model not found")
+            if not bool(llm_data[3]) and int(new_llm_id) != int(current_llm_id or 0):
+                raise HTTPException(status_code=400, detail="This LLM model is disabled")
             
             # Update conversation
             await cursor.execute('''
@@ -6912,7 +6977,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 ud.public_prompts_access,
                 ud.category_access,
                 ud.allow_image_generation,
-                ud.llm_id AS current_model_type,
+                COALESCE(c.llm_id, ud.llm_id) AS current_model_type,
                 COALESCE(ud.web_search_enabled, 1) AS web_search_enabled,
                 (SELECT COUNT(*) FROM conversations WHERE user_id = u.id) AS conversation_count,
                 c.id AS conversation_id,
@@ -6920,7 +6985,11 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 c.role_id,
                 COALESCE(p.image, p2.image) AS bot_picture,
                 COALESCE(p.description, p2.description) AS prompt_description,
-                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model)) FROM (SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model)) AS llm_models_json,
+                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model, 'enabled', enabled))
+                 FROM LLM
+                 WHERE machine != 'GranSabio'
+                   AND (COALESCE(enabled, 1) = 1 OR id = ud.llm_id OR id = c.llm_id)
+                 ORDER BY machine, model) AS llm_models_json,
                 (SELECT json_group_array(json_object('id', id, 'name', name)) FROM Voices) AS voices_json,
                 ud.current_alter_ego_id,
                 ae.name AS alter_ego_name,
@@ -6962,7 +7031,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
 
         # Generate token for profile picture if exists
         if user_profile_picture:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
             profile_picture_url = f"{user_profile_picture}_32.webp"
             token = generate_img_token(profile_picture_url, new_expiration, current_user)
@@ -6971,7 +7040,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
         # Generate token for bot image if exists
         bot_profile_picture = full_data['bot_picture']
         if bot_profile_picture:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
             bot_picture_url = f"{bot_profile_picture}_32.webp"
             token = generate_img_token(bot_picture_url, new_expiration, current_user)
@@ -7140,6 +7209,8 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             "initial_conversations": initial_conversations,
             "web_search_enabled": bool(full_data['web_search_enabled']),
             "readonly_mode": READONLY_MODE,
+            "max_api_image_size_mb": MAX_API_IMAGE_SIZE_MB,
+            "max_chat_image_dimension": MAX_CHAT_IMAGE_DIMENSION,
         }
     # print("Debug - Prompt Description:", full_data['prompt_description'])
     # print("Debug - Context:", {
@@ -7768,7 +7839,12 @@ async def _reassign_and_delete_llm(
     source_llm = dict(source_row)
 
     async with conn.execute(
-        "SELECT id, machine, model, input_token_cost, output_token_cost, vision FROM LLM WHERE machine != 'GranSabio'"
+        """
+        SELECT id, machine, model, input_token_cost, output_token_cost, vision
+        FROM LLM
+        WHERE machine != 'GranSabio'
+          AND COALESCE(enabled, 1) = 1
+        """
     ) as cursor:
         llm_catalog = [dict(row) for row in await cursor.fetchall()]
 
@@ -7855,27 +7931,48 @@ async def llm_list(request: Request, current_user: User = Depends(get_current_us
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
     async with get_db_connection(readonly=True) as conn:
-        async with conn.execute("SELECT id, machine, model, input_token_cost, output_token_cost, vision FROM LLM ORDER BY model ASC") as cursor:
-            llms = await cursor.fetchall()
-        llms = [(id, machine, model, input_token_cost, output_token_cost, bool(vision)) for id, machine, model, input_token_cost, output_token_cost, vision in llms]
-        # Get unique providers for filter dropdown
-        providers = sorted(set(llm[1] for llm in llms))
+        llms = await get_llm_catalog(conn)
+        providers = sorted(set(llm["machine"] for llm in llms))
         context = await get_template_context(request, current_user)
         context.update({"llms": llms, "providers": providers})
         return templates.TemplateResponse("llms/llm_list.html", context)
 
 
 @app.get("/api/llms")
-async def api_llms_list(current_user: User = Depends(get_current_user)):
+async def api_llms_list(
+    preserve_ids: str | None = Query(None),
+    include_current_llm_id: int | None = Query(None),
+    current_user: User = Depends(get_current_user),
+):
     """Return list of LLMs as JSON for frontend selects"""
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.execute("SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model ASC") as cursor:
-            rows = await cursor.fetchall()
+    preserved: set[int] = set()
+    if include_current_llm_id:
+        preserved.add(int(include_current_llm_id))
+    if preserve_ids:
+        for value in preserve_ids.split(","):
+            try:
+                if value.strip():
+                    preserved.add(int(value.strip()))
+            except ValueError:
+                continue
 
-    return [{"id": row[0], "machine": row[1], "model": row[2]} for row in rows]
+    async with get_db_connection(readonly=True) as conn:
+        rows = await get_selector_llms(conn, preserve_ids=preserved)
+
+    return [
+        {
+            "id": row["id"],
+            "machine": row["machine"],
+            "model": row["model"],
+            "display_name": row["display_name"] or row["model"],
+            "vision": bool(row["vision"]),
+            "enabled": bool(row["enabled"]),
+        }
+        for row in rows
+    ]
 
 
 @app.get("/admin/llm/new", response_class=HTMLResponse)
@@ -7907,10 +8004,34 @@ async def create_llm_post(
     if machine == 'GranSabio' and model == 'gransabio-pipeline':
         raise HTTPException(status_code=403, detail="This machine/model combination is reserved for the system.")
 
+    metadata = build_manual_insert_metadata(machine, model, vision)
     async with get_db_connection() as conn:
         await conn.execute(
-            "INSERT INTO LLM (machine, model, input_token_cost, output_token_cost, vision) VALUES (?, ?, ?, ?, ?)",
-            (machine, model, input_token_cost, output_token_cost, vision)
+            """
+            INSERT INTO LLM (
+                machine, model, input_token_cost, output_token_cost, vision,
+                provider_key, provider_model_id, display_name, enabled,
+                sync_source, sync_status, raw_metadata_json,
+                capabilities_json, manual_overrides_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                machine,
+                model,
+                input_token_cost,
+                output_token_cost,
+                vision,
+                metadata["provider_key"],
+                metadata["provider_model_id"],
+                metadata["display_name"],
+                metadata["enabled"],
+                metadata["sync_source"],
+                metadata["sync_status"],
+                metadata["raw_metadata_json"],
+                metadata["capabilities_json"],
+                metadata["manual_overrides_json"],
+            ),
         )
         await conn.commit()
 
@@ -7925,7 +8046,16 @@ async def edit_llm(request: Request, llm_id: int, current_user: User = Depends(g
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
-        await cursor.execute("SELECT machine, model, input_token_cost, output_token_cost, vision FROM LLM WHERE id = ?", (llm_id,))
+        await cursor.execute(
+            """
+            SELECT machine, model, input_token_cost, output_token_cost, vision,
+                   provider_key, provider_model_id, display_name, sync_source,
+                   manual_overrides_json
+            FROM LLM
+            WHERE id = ?
+            """,
+            (llm_id,),
+        )
         llm = await cursor.fetchone()
         await conn.close()
 
@@ -7943,12 +8073,31 @@ async def edit_llm(request: Request, llm_id: int, current_user: User = Depends(g
             "llm_model": llm[1],
             "llm_input_cost": llm[2],
             "llm_output_cost": llm[3],
-            "llm_vision": llm[4]
+            "llm_vision": llm[4],
+            "llm_provider_key": llm[5],
+            "llm_provider_model_id": llm[6],
+            "llm_display_name": llm[7] or llm[1],
+            "llm_sync_source": llm[8] or "manual",
+            "llm_sync_managed": is_sync_managed({
+                "machine": llm[0],
+                "provider_key": llm[5],
+                "sync_source": llm[8],
+            }),
         })
         return templates.TemplateResponse("llms/edit_llm.html", context)
 
 @app.post("/admin/llm/update/{llm_id}")
-async def update_llm(request: Request, llm_id: int, current_user: User = Depends(get_current_user), machine: str = Form(...), model: str = Form(...), input_token_cost: float = Form(...), output_token_cost: float = Form(...), vision: bool = Form(False)):
+async def update_llm(
+    request: Request,
+    llm_id: int,
+    current_user: User = Depends(get_current_user),
+    machine: str = Form(...),
+    model: str = Form(...),
+    input_token_cost: float = Form(...),
+    output_token_cost: float = Form(...),
+    vision: bool = Form(False),
+    display_name: str | None = Form(None),
+):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
         
@@ -7957,7 +8106,14 @@ async def update_llm(request: Request, llm_id: int, current_user: User = Depends
 
     # Prevent modification of synthetic GranSabio LLM row
     async with get_db_connection(readonly=True) as conn:
-        async with conn.execute("SELECT machine, model FROM LLM WHERE id = ?", (llm_id,)) as cur:
+        async with conn.execute(
+            """
+            SELECT machine, model, provider_key, provider_model_id, sync_source, manual_overrides_json
+            FROM LLM
+            WHERE id = ?
+            """,
+            (llm_id,),
+        ) as cur:
             row = await cur.fetchone()
         if row and row[0] == 'GranSabio' and row[1] == 'gransabio-pipeline':
             raise HTTPException(status_code=403, detail="System LLM cannot be modified.")
@@ -7965,9 +8121,61 @@ async def update_llm(request: Request, llm_id: int, current_user: User = Depends
     if machine == 'GranSabio' and model == 'gransabio-pipeline':
         raise HTTPException(status_code=403, detail="This machine/model combination is reserved for the system.")
 
+    if not row:
+        raise HTTPException(status_code=404, detail="LLM not found")
+
+    sync_managed = is_sync_managed({
+        "machine": row[0],
+        "provider_key": row[2],
+        "sync_source": row[4],
+    })
+    display_name_value = (display_name or model).strip()
+
     async with get_db_connection() as conn:
-        await conn.execute("UPDATE LLM SET machine = ?, model = ?, input_token_cost = ?, output_token_cost = ?, vision = ? WHERE id = ?",
-                             (machine, model, input_token_cost, output_token_cost, vision, llm_id))
+        if sync_managed:
+            overrides_json = merge_manual_overrides(
+                row[5],
+                ["display_name", "input_token_cost", "output_token_cost", "vision"],
+            )
+            await conn.execute(
+                """
+                UPDATE LLM
+                SET display_name = ?,
+                    input_token_cost = ?,
+                    output_token_cost = ?,
+                    vision = ?,
+                    manual_overrides_json = ?
+                WHERE id = ?
+                """,
+                (display_name_value or row[1], input_token_cost, output_token_cost, vision, overrides_json, llm_id),
+            )
+        else:
+            provider_key = normalize_provider_key(machine)
+            await conn.execute(
+                """
+                UPDATE LLM
+                SET machine = ?,
+                    model = ?,
+                    input_token_cost = ?,
+                    output_token_cost = ?,
+                    vision = ?,
+                    provider_key = ?,
+                    provider_model_id = ?,
+                    display_name = ?
+                WHERE id = ?
+                """,
+                (
+                    machine,
+                    model,
+                    input_token_cost,
+                    output_token_cost,
+                    vision,
+                    provider_key,
+                    model,
+                    display_name_value or model,
+                    llm_id,
+                ),
+            )
         await conn.commit()
         return RedirectResponse(url="/admin/llms", status_code=303)
 
@@ -8277,11 +8485,8 @@ async def admin_security_guard(request: Request, current_user: User = Depends(ge
             if row and row[0]:
                 current_llm_id = int(row[0])
 
-        # Get list of available LLMs (exclude synthetic GranSabio row)
-        cursor = await conn.execute(
-            "SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model"
-        )
-        llms = await cursor.fetchall()
+        llm_rows = await get_selector_llms(conn, preserve_ids=[current_llm_id] if current_llm_id else [])
+        llms = [(row["id"], row["machine"], row["model"]) for row in llm_rows]
 
     context = await get_template_context(request, current_user)
     context.update({
@@ -8355,40 +8560,63 @@ async def get_security_guard_status(current_user: User = Depends(get_current_use
 
 
 # ============================================================
-# OpenRouter Models Management
+# LLM Catalog Sync Management
 # ============================================================
 
-@app.get("/admin/openrouter", response_class=HTMLResponse)
-async def admin_openrouter(request: Request, current_user: User = Depends(get_current_user)):
-    """Admin page for managing OpenRouter models."""
+LLM_SYNC_PROVIDER_TABS = [
+    {"key": "openrouter", "label": "OpenRouter", "icon": "fa-route"},
+    {"key": "openai", "label": "OpenAI", "icon": "fa-robot"},
+    {"key": "anthropic", "label": "Claude", "icon": "fa-brain"},
+    {"key": "google", "label": "Gemini", "icon": "fa-gem"},
+    {"key": "xai", "label": "xAI", "icon": "fa-xmark"},
+]
+
+
+@app.get("/admin/models", response_class=HTMLResponse)
+async def admin_models(request: Request, current_user: User = Depends(get_current_user)):
+    """Admin page for discovering and syncing LLM provider catalogs."""
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Get currently enabled OpenRouter models from DB
-    enabled_models = []
-    enabled_count = 0
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.execute(
-            "SELECT model FROM LLM WHERE machine = 'OpenRouter' ORDER BY model"
-        ) as cursor:
-            rows = await cursor.fetchall()
-            enabled_models = [row[0] for row in rows]
-            enabled_count = len(enabled_models)
+    requested_provider = normalize_provider_key(request.query_params.get("provider") or "openrouter")
+    provider_keys = {provider["key"] for provider in LLM_SYNC_PROVIDER_TABS}
+    if requested_provider not in provider_keys:
+        requested_provider = "openrouter"
 
-    message = request.query_params.get("message")
-    error = request.query_params.get("error")
+    async with get_db_connection(readonly=True) as conn:
+        catalog = await get_llm_catalog(conn)
+
+    provider_counts = {}
+    for llm in catalog:
+        provider_key = normalize_provider_key(llm.get("provider_key") or llm.get("machine"))
+        counts = provider_counts.setdefault(provider_key, {"total": 0, "enabled": 0, "needs_review": 0})
+        counts["total"] += 1
+        if llm.get("enabled"):
+            counts["enabled"] += 1
+        if llm.get("needs_review"):
+            counts["needs_review"] += 1
 
     context = await get_template_context(request, current_user)
     context.update({
-        "enabled_models": enabled_models,
-        "enabled_count": enabled_count,
-        "message": message,
-        "error": error
+        "provider_tabs": LLM_SYNC_PROVIDER_TABS,
+        "active_provider": requested_provider,
+        "catalog_count": len(catalog),
+        "enabled_count": sum(1 for llm in catalog if llm.get("enabled")),
+        "needs_review_count": sum(1 for llm in catalog if llm.get("needs_review")),
+        "provider_counts": provider_counts,
+        "message": request.query_params.get("message"),
+        "error": request.query_params.get("error"),
     })
-    return templates.TemplateResponse("admin_openrouter.html", context)
+    return templates.TemplateResponse("admin_models.html", context)
+
+
+@app.get("/admin/openrouter", response_class=HTMLResponse)
+async def admin_openrouter(request: Request, current_user: User = Depends(get_current_user)):
+    """Compatibility alias for the previous OpenRouter-only admin page."""
+    return RedirectResponse(url="/admin/models?provider=openrouter", status_code=303)
 
 
 @app.get("/api/openrouter/models")
@@ -8400,70 +8628,34 @@ async def get_openrouter_models(current_user: User = Depends(get_current_user)):
     if not await current_user.is_admin:
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
 
-    if not openrouter_key:
-        return JSONResponse(content={"error": "OpenRouter API key not configured"}, status_code=500)
-
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {openrouter_key}"},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    return JSONResponse(
-                        content={"error": f"OpenRouter API error: {error_text}"},
-                        status_code=response.status
-                    )
-
-                data = await response.json()
-                models_data = data.get("data", [])
-
-                # Transform to our format
-                models = []
-                for m in models_data:
-                    model_id = m.get("id", "")
-                    provider = model_id.split("/")[0] if "/" in model_id else "unknown"
-
-                    # Get pricing (per token, convert to per 1M tokens)
-                    pricing = m.get("pricing", {})
-                    input_price_str = pricing.get("prompt", "0")
-                    output_price_str = pricing.get("completion", "0")
-
-                    # Handle special pricing values like "-1" (variable)
-                    try:
-                        input_price = float(input_price_str) * 1_000_000 if float(input_price_str) > 0 else 0
-                    except (ValueError, TypeError):
-                        input_price = 0
-
-                    try:
-                        output_price = float(output_price_str) * 1_000_000 if float(output_price_str) > 0 else 0
-                    except (ValueError, TypeError):
-                        output_price = 0
-
-                    # Check for vision support
-                    architecture = m.get("architecture", {})
-                    input_modalities = architecture.get("input_modalities", [])
-                    has_vision = "image" in input_modalities
-
-                    models.append({
-                        "id": model_id,
-                        "name": m.get("name", model_id),
-                        "provider": provider,
-                        "context_length": m.get("context_length", 0),
-                        "input_price": input_price,
-                        "output_price": output_price,
-                        "vision": has_vision
-                    })
-
-                # Sort by provider, then by name
-                models.sort(key=lambda x: (x["provider"].lower(), x["name"].lower()))
-
-                return JSONResponse(content={"models": models})
-
-    except asyncio.TimeoutError:
-        return JSONResponse(content={"error": "Request to OpenRouter timed out"}, status_code=504)
+        async with get_db_connection(readonly=True) as conn:
+            provider_view = await get_provider_catalog_view(conn, "openrouter")
+        models = []
+        for model in provider_view.get("models", []):
+            if not model.get("remote_available", True):
+                continue
+            model_id = model["provider_model_id"]
+            provider = model_id.split("/")[0] if "/" in model_id else "unknown"
+            models.append({
+                "id": model_id,
+                "name": model["display_name"],
+                "provider": provider,
+                "context_length": model.get("context_window_tokens") or 0,
+                "max_output_tokens": model.get("max_output_tokens") or 0,
+                "input_price": model.get("input_token_cost") or 0,
+                "output_price": model.get("output_token_cost") or 0,
+                "vision": bool(model.get("vision")),
+                "local_id": model.get("local_id"),
+                "enabled": bool(model.get("enabled")),
+                "sync_status": model.get("sync_status"),
+                "needs_review": bool(model.get("needs_review")),
+                "metadata_source": model.get("metadata_source"),
+            })
+        models.sort(key=lambda x: (x["provider"].lower(), x["name"].lower()))
+        return JSONResponse(content={"models": models})
+    except LlmCatalogError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
     except Exception as e:
         logger.exception("Error fetching OpenRouter models")
         return JSONResponse(content={"error": str(e)}, status_code=500)
@@ -8481,55 +8673,19 @@ async def sync_openrouter_models(request: Request, current_user: User = Depends(
     try:
         body = await request.json()
         models_to_save = body.get("models", [])
+        selected_model_ids = [m.get("id") for m in models_to_save if m.get("id")]
+        disabled_model_ids = body.get("disabled_model_ids", [])
 
         async with get_db_connection() as conn:
             try:
                 await conn.execute("BEGIN IMMEDIATE")
-                # Get current OpenRouter models
-                async with conn.execute(
-                    "SELECT id, model FROM LLM WHERE machine = 'OpenRouter'"
-                ) as cursor:
-                    existing = {row[1]: row[0] for row in await cursor.fetchall()}
-
-                # Models to add/update
-                new_model_ids = {m["id"] for m in models_to_save}
-
-                # Add/update models
-                for model in models_to_save:
-                    model_id = model["id"]
-                    if model_id in existing:
-                        # Update existing
-                        await conn.execute(
-                            """UPDATE LLM
-                               SET input_token_cost = ?, output_token_cost = ?, vision = ?
-                               WHERE id = ?""",
-                            (model["input_price"], model["output_price"], model["vision"], existing[model_id])
-                        )
-                    else:
-                        # Insert new
-                        await conn.execute(
-                            """INSERT INTO LLM (machine, model, input_token_cost, output_token_cost, vision)
-                               VALUES ('OpenRouter', ?, ?, ?, ?)""",
-                            (model_id, model["input_price"], model["output_price"], model["vision"])
-                        )
-
-                # Delete models that are no longer selected, but reassign first
-                models_to_delete = [model_id for model_id in existing.keys() if model_id not in new_model_ids]
-                deleted_details = []
-                if models_to_delete:
-                    async with conn.execute(
-                        f"SELECT id FROM LLM WHERE machine = 'OpenRouter' AND model IN ({','.join('?' for _ in models_to_delete)})",
-                        models_to_delete,
-                    ) as cursor:
-                        rows_to_delete = await cursor.fetchall()
-
-                    delete_ids = [int(row["id"]) for row in rows_to_delete]
-                    blocked_ids = set(delete_ids)
-                    for delete_id in delete_ids:
-                        result = await _reassign_and_delete_llm(conn, delete_id, blocked_llm_ids=blocked_ids)
-                        deleted_details.append(result)
-
-                orphan_fix_metrics = await _repair_orphan_llm_references(conn, fallback_model=LLM_FALLBACK_MODEL)
+                result = await sync_provider(
+                    conn,
+                    "openrouter",
+                    selected_model_ids=selected_model_ids,
+                    remote_models=models_to_save,
+                    disabled_model_ids=disabled_model_ids,
+                )
                 await conn.commit()
             except HTTPException:
                 await conn.rollback()
@@ -8540,18 +8696,120 @@ async def sync_openrouter_models(request: Request, current_user: User = Depends(
 
         return JSONResponse(content={
             "success": True,
-            "added": len(new_model_ids - set(existing.keys())),
-            "updated": len(new_model_ids & set(existing.keys())),
-            "removed": len(deleted_details),
-            "deleted_details": deleted_details,
-            "orphan_fix": orphan_fix_metrics,
+            "added": result["added"],
+            "updated": result["updated"],
+            "disabled": result["disabled"],
+            "removed": 0,
+            "stale": result["stale"],
+            "skipped": result["skipped"],
         })
 
     except HTTPException:
         raise
+    except LlmCatalogError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
         logger.exception("Error syncing OpenRouter models")
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/api/admin/llms/catalog")
+async def api_admin_llm_catalog(current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Access denied"}, status_code=403)
+    async with get_db_connection(readonly=True) as conn:
+        catalog = await get_llm_catalog(conn)
+    return JSONResponse(content={"models": catalog})
+
+
+@app.get("/api/admin/llms/providers/{provider_key}/remote")
+async def api_admin_llm_provider_remote(provider_key: str, current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Access denied"}, status_code=403)
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            provider_view = await get_provider_catalog_view(conn, provider_key)
+        return JSONResponse(content=provider_view)
+    except LlmCatalogError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error fetching remote LLM provider")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/api/admin/llms/providers/{provider_key}/sync")
+async def api_admin_llm_provider_sync(request: Request, provider_key: str, current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Access denied"}, status_code=403)
+    try:
+        body = await request.json()
+        selected_model_ids = body.get("selected_model_ids")
+        remote_models = body.get("models")
+        disabled_model_ids = body.get("disabled_model_ids")
+        if remote_models is None:
+            remote_models = await fetch_remote_models(provider_key)
+        async with get_db_connection() as conn:
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                result = await sync_provider(
+                    conn,
+                    provider_key,
+                    selected_model_ids=selected_model_ids,
+                    remote_models=remote_models,
+                    disabled_model_ids=disabled_model_ids,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return JSONResponse(content={"success": True, **result})
+    except LlmCatalogError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error syncing LLM provider")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.patch("/api/admin/llms/{llm_id}/enabled")
+async def api_admin_llm_enabled(llm_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Access denied"}, status_code=403)
+    try:
+        body = await request.json()
+        raw_enabled = body.get("enabled")
+        if isinstance(raw_enabled, str):
+            enabled = raw_enabled.lower() in {"1", "true", "yes", "on"}
+        else:
+            enabled = bool(raw_enabled)
+        async with get_db_connection() as conn:
+            result = await set_model_enabled(conn, llm_id, enabled)
+            await conn.commit()
+        return JSONResponse(content={"success": True, **result})
+    except LlmCatalogError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error updating LLM enabled state")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/api/admin/llms/sync-all")
+async def api_admin_llm_sync_all(current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Access denied"}, status_code=403)
+    async with get_db_connection() as conn:
+        results = await sync_all_providers(conn)
+        await conn.commit()
+    return JSONResponse(content={"success": True, "results": results})
 
 
 # ============================================================================
@@ -9943,67 +10201,175 @@ async def auth_image(request: Request, token: str = Query(None), request_uri: st
         raise e
 
 
-async def process_message(message: str, request: Request, current_user: User = Depends(get_current_user)):
+_LOCAL_MARKDOWN_IMAGE_PATTERN = re.compile(r'!\[(?P<alt>[^\]]*)\]\((?P<url>[^)]+)\)')
+
+
+def _normalize_local_markdown_image_url(url: str, media_owner_username: str) -> Optional[str]:
+    """Return a base media URL for legacy local markdown images, or None."""
+    candidate = (url or "").strip()
+    if not candidate:
+        return None
+
+    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(media_owner_username)
+    allowed_prefix = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/"
+
+    if CLOUDFLARE_BASE_URL and candidate.startswith(CLOUDFLARE_BASE_URL):
+        relative_path = candidate[len(CLOUDFLARE_BASE_URL):]
+    elif candidate.startswith('/users/'):
+        relative_path = candidate.lstrip('/')
+    elif candidate.startswith('users/'):
+        relative_path = candidate
+    else:
+        return None
+
+    relative_path = relative_path.split('?', 1)[0]
+    if not relative_path:
+        return None
+    if not relative_path.startswith(allowed_prefix):
+        return None
+
+    relative_to_user = relative_path[len(allowed_prefix):]
+    if not relative_to_user:
+        return None
+
+    try:
+        validated_path = validate_path_within_directory(relative_to_user, Path(get_user_directory(media_owner_username)))
+    except FastAPIHTTPException:
+        return None
+
+    normalized_relative = validated_path.relative_to(Path("data").resolve()).as_posix()
+    return f"{CLOUDFLARE_BASE_URL}{normalized_relative}"
+
+
+def _convert_legacy_markdown_images_to_blocks(message: str, media_owner_username: str) -> Optional[List[Dict]]:
+    """Convert legacy local markdown images into structured blocks for re-hydration."""
+    matches = list(_LOCAL_MARKDOWN_IMAGE_PATTERN.finditer(message or ""))
+    if not matches:
+        return None
+
+    blocks = []
+    cursor = 0
+    converted = False
+
+    for match in matches:
+        prefix = message[cursor:match.start()]
+        if prefix:
+            blocks.append({"type": "text", "text": prefix})
+
+        base_url = _normalize_local_markdown_image_url(match.group("url"), media_owner_username)
+        if base_url:
+            converted = True
+            blocks.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": base_url,
+                    "alt": match.group("alt"),
+                }
+            })
+        else:
+            blocks.append({"type": "text", "text": match.group(0)})
+
+        cursor = match.end()
+
+    suffix = message[cursor:]
+    if suffix:
+        blocks.append({"type": "text", "text": suffix})
+
+    if not converted:
+        return None
+
+    merged_blocks = []
+    for block in blocks:
+        if block.get("type") == "text":
+            text = block.get("text", "")
+            if not text:
+                continue
+            if merged_blocks and merged_blocks[-1].get("type") == "text":
+                merged_blocks[-1]["text"] += text
+            else:
+                merged_blocks.append({"type": "text", "text": text})
+        else:
+            merged_blocks.append(block)
+
+    return merged_blocks
+
+
+async def process_message(
+    message: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    media_owner_username: Optional[str] = None,
+):
     valid_extensions = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     # CLOUDFLARE_BASE_URL imported from common.py (reads from env var)
     start = f"{CLOUDFLARE_BASE_URL}sk" if CLOUDFLARE_BASE_URL else ""
     start_len = len(start)
+    media_owner_username = media_owner_username or current_user.username
+    media_token_user = current_user
+
+    if not CLOUDFLARE_FOR_IMAGES and media_owner_username != current_user.username:
+        owner_user = await get_user_by_username(media_owner_username)
+        if owner_user:
+            media_token_user = owner_user
 
     try:
         message_json = orjson.loads(message)
-        if isinstance(message_json, list):
-            for entry in message_json:
-                if entry.get('type') == 'image_url':
-                    url = entry.get('image_url', {}).get('url', '')
-
-                    extension = url.rsplit('.', 1)[-1].lower()
-                    if extension not in valid_extensions:
-                        continue
-
-                    # Handle old URLs (with /sk)
-                    if url.startswith(start):
-                        hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
-                        image_path = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/{url[start_len:]}"
-
-                        if CLOUDFLARE_FOR_IMAGES:
-                            signed_url = generate_signed_url_cloudflare(image_path, expiration_seconds=3600)
-                            entry['image_url']['url'] = signed_url
-                        else:
-                            token = await get_or_generate_img_token(current_user)
-                            full_url = urljoin(CLOUDFLARE_BASE_URL, f"{image_path}?token={token}")
-                            entry['image_url']['url'] = full_url
-
-                    # Handle new URLs (that start with CLOUDFLARE_BASE_URL)
-                    elif url.startswith(CLOUDFLARE_BASE_URL):
-                        image_path = url[len(CLOUDFLARE_BASE_URL):]
-
-                        if CLOUDFLARE_FOR_IMAGES:
-                            signed_url = generate_signed_url_cloudflare(image_path, expiration_seconds=3600)
-                            entry['image_url']['url'] = signed_url
-                        else:
-                            token = await get_or_generate_img_token(current_user)
-                            full_url = urljoin(CLOUDFLARE_BASE_URL, f"{image_path}?token={token}")
-                            entry['image_url']['url'] = full_url
-
-                # Handle video URLs (same as images)
-                elif entry.get('type') == 'video_url':
-                    url = entry.get('video_url', {}).get('url', '')
-                    
-                    # Only process videos that start with CLOUDFLARE_BASE_URL
-                    if url.startswith(CLOUDFLARE_BASE_URL):
-                        video_path = url[len(CLOUDFLARE_BASE_URL):]
-
-                        if CLOUDFLARE_FOR_IMAGES:
-                            signed_url = generate_signed_url_cloudflare(video_path, expiration_seconds=3600)
-                            entry['video_url']['url'] = signed_url
-                        else:
-                            token = await get_or_generate_img_token(current_user)
-                            full_url = urljoin(CLOUDFLARE_BASE_URL, f"{video_path}?token={token}")
-                            entry['video_url']['url'] = full_url
-
-            return orjson.dumps(message_json).decode('utf-8')
     except orjson.JSONDecodeError:
-        pass
+        message_json = _convert_legacy_markdown_images_to_blocks(message, media_owner_username)
+        if message_json is None:
+            return message
+
+    if isinstance(message_json, list):
+        for entry in message_json:
+            if entry.get('type') == 'image_url':
+                url = entry.get('image_url', {}).get('url', '')
+
+                extension = url.rsplit('.', 1)[-1].lower()
+                if extension not in valid_extensions:
+                    continue
+
+                # Handle old URLs (with /sk)
+                if url.startswith(start):
+                    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(media_owner_username)
+                    image_path = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/{url[start_len:]}"
+
+                    if CLOUDFLARE_FOR_IMAGES:
+                        signed_url = generate_signed_url_cloudflare(image_path, expiration_seconds=3600)
+                        entry['image_url']['url'] = signed_url
+                    else:
+                        token = await get_or_generate_img_token(media_token_user)
+                        full_url = urljoin(CLOUDFLARE_BASE_URL, f"{image_path}?token={token}")
+                        entry['image_url']['url'] = full_url
+
+                # Handle new URLs (that start with CLOUDFLARE_BASE_URL)
+                elif url.startswith(CLOUDFLARE_BASE_URL):
+                    image_path = url[len(CLOUDFLARE_BASE_URL):]
+
+                    if CLOUDFLARE_FOR_IMAGES:
+                        signed_url = generate_signed_url_cloudflare(image_path, expiration_seconds=3600)
+                        entry['image_url']['url'] = signed_url
+                    else:
+                        token = await get_or_generate_img_token(media_token_user)
+                        full_url = urljoin(CLOUDFLARE_BASE_URL, f"{image_path}?token={token}")
+                        entry['image_url']['url'] = full_url
+
+            # Handle video URLs (same as images)
+            elif entry.get('type') == 'video_url':
+                url = entry.get('video_url', {}).get('url', '')
+                
+                # Only process videos that start with CLOUDFLARE_BASE_URL
+                if url.startswith(CLOUDFLARE_BASE_URL):
+                    video_path = url[len(CLOUDFLARE_BASE_URL):]
+
+                    if CLOUDFLARE_FOR_IMAGES:
+                        signed_url = generate_signed_url_cloudflare(video_path, expiration_seconds=3600)
+                        entry['video_url']['url'] = signed_url
+                    else:
+                        token = await get_or_generate_img_token(media_token_user)
+                        full_url = urljoin(CLOUDFLARE_BASE_URL, f"{video_path}?token={token}")
+                        entry['video_url']['url'] = full_url
+
+        return orjson.dumps(message_json).decode('utf-8')
 
     return message
 
@@ -10165,7 +10531,7 @@ async def get_messages(
     # Build conversation_info from the dedicated query
     bot_profile_picture = conv_row['bot_picture'] if conv_row else None
     if bot_profile_picture:
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
         bot_picture_url = f"{bot_profile_picture}_32.webp"
         token = generate_img_token(bot_picture_url, new_expiration, current_user)
@@ -10211,7 +10577,12 @@ async def get_messages(
     messages_list = []
     for row in rows:
         if row['message_id'] is not None:
-            processed_message = await process_message(custom_unescape(row['message']), request, current_user)
+            processed_message = await process_message(
+                custom_unescape(row['message']),
+                request,
+                current_user,
+                media_owner_username=row['username'],
+            )
             msg_data = {
                 "id": row['message_id'],
                 "conversation_id": conversation_id,
@@ -10998,7 +11369,12 @@ async def get_bookmarked_messages(
         
         messages_list = []
         for msg in messages:
-            processed_message = await process_message(custom_unescape(msg['message']), request, current_user)
+            processed_message = await process_message(
+                custom_unescape(msg['message']),
+                request,
+                current_user,
+                media_owner_username=msg['username'],
+            )
             messages_list.append({
                 "id": msg['id'],
                 "conversation_id": msg['conversation_id'],
@@ -11572,7 +11948,7 @@ def get_time(timezone: str) -> str:
     return now.strftime("%H:%M")
 
 def get_time_difference(timezone1: str, timezone2: str) -> str:
-    now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+    now_utc = datetime.now(timezone.utc)
     tz1_time = now_utc.astimezone(ZoneInfo(timezone1))
     tz2_time = now_utc.astimezone(ZoneInfo(timezone2))
     tz1_offset = tz1_time.utcoffset().total_seconds()
@@ -14176,7 +14552,7 @@ async def prompt_purchase_success_page(
                             slug = slugify(row[0]) if row[0] else ""
                             prompt_landing_url = f"/p/{row[1]}/{slug}/" if row[1] else None
                             if row[2]:  # image
-                                current_time = datetime.utcnow()
+                                current_time = datetime.now(timezone.utc)
                                 new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
                                 img_base = f"{row[2]}_128.webp"
                                 token = generate_img_token(img_base, new_expiration, current_user)
@@ -15932,100 +16308,121 @@ async def whatsapp_webhook(request: Request):
             )
             await log_conn.commit()
 
+        def parse_structured_whatsapp_content(payload):
+            if isinstance(payload, dict):
+                return payload if isinstance(payload.get("type"), str) else None
+
+            if isinstance(payload, list) and payload:
+                if all(isinstance(item, dict) and isinstance(item.get("type"), str) for item in payload):
+                    return payload
+
+            return None
+
+        async def send_whatsapp_text_message(text: str):
+            if not text or not text.strip():
+                return
+
+            if answer_mode == "voice":
+                logger.debug("WhatsApp voice response mode")
+                logger.debug(f"WhatsApp conversation id: {conversation_id}")
+                audio_path, error = await handle_tts_request(None, {"text": text, "author": "bot", "conversationId": conversation_id}, current_user, is_whatsapp=True, tts_context="external")
+
+                if error:
+                    error_message = "Sorry, there was a problem generating the voice message. I will send you the message as text."
+                    await async_twilio.send_message(
+                        body=f"{error_message}\n\n{text}",
+                        from_=to_number,
+                        to=from_number
+                    )
+                    logger.error(f"Error generating voice message: {error}")
+                    return
+
+                token = await get_or_generate_img_token(current_user)
+                relative_path = audio_path[len(str(cache_directory)):]
+                media_url = f"{request.url.scheme}://{request.url.hostname}/get-audio{relative_path}?token={token}"
+                media_url = media_url.replace('\\', '/')
+                logger.debug("Generated TTS media URL for WhatsApp")
+                await async_twilio.send_message(
+                    media_url=[media_url],
+                    from_=to_number,
+                    to=from_number
+                )
+                return
+
+            logger.debug("WhatsApp text response mode")
+            await async_twilio.send_message(
+                body=text,
+                from_=to_number,
+                to=from_number
+            )
+
+        async def send_whatsapp_text(text: str, *, chunk_long_text: bool = False):
+            if not text or not text.strip():
+                return
+
+            if chunk_long_text and len(text) >= 900:
+                text_chunks = await insert_tts_break(text, min_length=700, max_length=900, look_ahead=100)
+                for text_chunk in text_chunks:
+                    await send_whatsapp_text_message(text_chunk)
+                return
+
+            await send_whatsapp_text_message(text)
+
+        async def send_whatsapp_block(block) -> bool:
+            if not isinstance(block, dict):
+                return False
+
+            block_type = block.get('type')
+            if block_type == 'text':
+                await send_whatsapp_text(block.get('text', ''), chunk_long_text=True)
+                return True
+
+            if block_type == 'image_url':
+                logger.debug("Processing image URL for WhatsApp delivery")
+                image_data = block.get('image_url', {})
+                image_url = image_data.get('url')
+                alt_text = image_data.get('alt', 'Image')
+                if not image_url:
+                    return False
+                logger.debug("Sending image via Twilio")
+                await async_twilio.send_message(
+                    body=f"Image: {alt_text}",
+                    media_url=[image_url],
+                    from_=to_number,
+                    to=from_number
+                )
+                return True
+
+            if block_type == 'audio_url':
+                logger.debug("Processing audio URL for WhatsApp delivery")
+                audio_data = block.get('audio_url', {})
+                audio_url = audio_data.get('url')
+                if not audio_url:
+                    return False
+                logger.debug("Sending audio via Twilio")
+                await async_twilio.send_message(
+                    media_url=[audio_url],
+                    from_=to_number,
+                    to=from_number
+                )
+                return True
+
+            return False
+
         async def send_chunks(chunks):
             for chunk in chunks:
-                try:
-                    if isinstance(chunk, (list, dict)):
-                        json_content = chunk
-                    else:
-                        json_content = orjson.loads(chunk)
-                    
-                    if isinstance(json_content, list) and len(json_content) > 0:
-                        if json_content[0].get('type') == 'image_url':
-                            logger.debug("Processing image URL for WhatsApp delivery")
-                            image_url = json_content[0]['image_url']['url']
-                            alt_text = json_content[0]['image_url']['alt']
-                            logger.debug("Sending image via Twilio")
-                            
-                            message = await async_twilio.send_message(
-                                body=f"Image: {alt_text}",
-                                media_url=[image_url],
-                                from_=to_number,
-                                to=from_number
-                            )
-                        elif json_content[0].get('type') == 'audio_url':
-                            logger.debug("Processing audio URL for WhatsApp delivery")
-                            audio_url = json_content[0]['audio_url']['url']
-                            logger.debug("Sending audio via Twilio")
-                            
-                            message = await async_twilio.send_message(
-                                media_url=[audio_url],
-                                from_=to_number,
-                                to=from_number
-                            )
-                    else:
-                        if answer_mode == "voice":
-                            logger.debug("WhatsApp voice response mode")
-                            logger.debug(f"WhatsApp conversation id: {conversation_id}")
-                            audio_path, error = await handle_tts_request(None, {"text": chunk, "author": "bot", "conversationId": conversation_id}, current_user, is_whatsapp=True, tts_context="external")
+                json_content = parse_structured_whatsapp_content(chunk)
+                if isinstance(json_content, list):
+                    handled_any = False
+                    for block in json_content:
+                        block_handled = await send_whatsapp_block(block)
+                        handled_any = handled_any or block_handled
+                    if handled_any:
+                        continue
+                elif json_content and await send_whatsapp_block(json_content):
+                    continue
 
-                            if error:
-                                error_message = "Sorry, there was a problem generating the voice message. I will send you the message as text."
-                                message = await async_twilio.send_message(
-                                    body=f"{error_message}\n\n{chunk}",
-                                    from_=to_number,
-                                    to=from_number
-                                )
-                                logger.error(f"Error generating voice message: {error}")
-                            else:
-                                token = await get_or_generate_img_token(current_user)
-                                relative_path = audio_path[len(str(cache_directory)):]
-                                media_url = f"{request.url.scheme}://{request.url.hostname}/get-audio{relative_path}?token={token}"
-                                media_url = media_url.replace('\\', '/')
-                                logger.debug("Generated TTS media URL for WhatsApp")
-                                message = await async_twilio.send_message(
-                                    media_url=[media_url],
-                                    from_=to_number,
-                                    to=from_number
-                                )
-                        else:
-                            logger.debug("WhatsApp text response mode")
-                            message = await async_twilio.send_message(
-                                body=chunk,
-                                from_=to_number,
-                                to=from_number
-                            )
-                except orjson.JSONDecodeError:
-                    if answer_mode == "voice":
-                        logger.debug("WhatsApp voice mode - processing plain text response")
-                        audio_path, error = await handle_tts_request(None, {"text": chunk, "author": "bot", "conversationId": conversation_id}, current_user, is_whatsapp=True, tts_context="external")
-
-                        if error:
-                            error_message = "Sorry, there was a problem generating the voice message. I will send you the message as text."
-                            message = await async_twilio.send_message(
-                                body=f"{error_message}\n\n{chunk}",
-                                from_=to_number,
-                                to=from_number
-                            )
-                            logger.error(f"Error generating voice message: {error}")
-                        else:
-                            token = await get_or_generate_img_token(current_user)
-                            relative_path = audio_path[len(str(cache_directory)):]
-                            media_url = f"{request.url.scheme}://{request.url.hostname}/get-audio{relative_path}?token={token}"
-                            media_url = media_url.replace('\\', '/')
-                            logger.debug("Generated TTS media URL for WhatsApp")
-                            message = await async_twilio.send_message(
-                                media_url=[media_url],
-                                from_=to_number,
-                                to=from_number
-                            )
-                    else:
-                        logger.debug("WhatsApp text mode - processing plain text response")
-                        message = await async_twilio.send_message(
-                            body=chunk,
-                            from_=to_number,
-                            to=from_number
-                        )
+                await send_whatsapp_text(chunk if isinstance(chunk, str) else orjson.dumps(chunk).decode())
 
         # Prepare files list with all downloaded images
         files = files_list if files_list else None
@@ -16118,6 +16515,20 @@ async def whatsapp_webhook(request: Request):
         if isinstance(response, StreamingResponse):
             accumulated_text = ""
             last_full_content = ""
+
+            async def flush_accumulated_text():
+                nonlocal accumulated_text
+                if not accumulated_text.strip():
+                    accumulated_text = ""
+                    return
+
+                if len(accumulated_text) >= 900:
+                    chunks = await insert_tts_break(accumulated_text, min_length=700, max_length=900, look_ahead=100)
+                    await send_chunks(chunks)
+                else:
+                    await send_chunks([accumulated_text])
+                accumulated_text = ""
+
             async for chunk in response.body_iterator:
                 chunk_str = chunk.decode('utf-8') if isinstance(chunk, bytes) else chunk
                 
@@ -16127,9 +16538,9 @@ async def whatsapp_webhook(request: Request):
                             data = orjson.loads(line[5:].strip())
                             content = data.get('content', '')
                             
-                            if isinstance(content, list):
-                                if content[0].get('type') == 'image_url' or content[0].get('type') == 'audio_url':
-                                    await send_chunks([content])
+                            if isinstance(content, (list, dict)):
+                                await flush_accumulated_text()
+                                await send_chunks([content])
                             else:
                                 accumulated_text += content
                                 
@@ -16143,12 +16554,7 @@ async def whatsapp_webhook(request: Request):
                         except orjson.JSONDecodeError:
                             logger.error(f"Error decoding JSON: {line}")
 
-            if len(accumulated_text) >= 900:
-                chunks = await insert_tts_break(accumulated_text, min_length=700, max_length=900, look_ahead=100)
-                await send_chunks(chunks)
-            else:
-                if accumulated_text.strip():
-                    await send_chunks([accumulated_text])
+            await flush_accumulated_text()
 
         else:
             # Handle non-streaming responses (rate limit, insufficient balance, etc.)
@@ -17005,8 +17411,8 @@ async def get_audio(path: str, token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     if validated_path.exists():
-        current_time = datetime.utcnow()
-        expiration_time = datetime.fromtimestamp(exp)
+        current_time = datetime.now(timezone.utc)
+        expiration_time = datetime.fromtimestamp(exp, timezone.utc)
         time_until_expiration = expiration_time - current_time
 
         if time_until_expiration.total_seconds() <= 0:
@@ -18254,7 +18660,15 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
 
         # Get default LLM ID
         async with get_db_connection(readonly=True) as conn:
-            cursor = await conn.execute("SELECT id FROM LLM ORDER BY id LIMIT 1")
+            cursor = await conn.execute(
+                """
+                SELECT id
+                FROM LLM
+                WHERE COALESCE(enabled, 1) = 1
+                ORDER BY id
+                LIMIT 1
+                """
+            )
             llm_row = await cursor.fetchone()
             default_llm_id = llm_row[0] if llm_row else 1
 
@@ -18624,7 +19038,18 @@ async def verify_email(request: Request, token: str):
         if not default_llm_id:
             default_llm_id = landing_config.get("_prompt_forced_llm_id")
         if not default_llm_id:
-            default_llm_id = 1
+            async with get_db_connection(readonly=True) as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT id
+                    FROM LLM
+                    WHERE COALESCE(enabled, 1) = 1
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                )
+                llm_row = await cursor.fetchone()
+                default_llm_id = llm_row[0] if llm_row else 1
 
         # Prepare category_access as JSON string if it's a list
         category_access = landing_config.get("category_access")
@@ -18640,7 +19065,7 @@ async def verify_email(request: Request, token: str):
             prompt_id=prompt_id if not is_user else None,
             all_prompts_access=False,
             public_prompts_access=landing_config.get("public_prompts_access", True) if not is_user else True,
-            llm_id=default_llm_id if not is_user else 1,
+            llm_id=default_llm_id,
             allow_file_upload=is_user or landing_config.get("allow_file_upload", False),
             allow_image_generation=is_user or landing_config.get("allow_image_generation", False),
             balance=landing_config.get("initial_balance", 0.0) if not is_user else 0.0,
@@ -19297,11 +19722,15 @@ async def get_landing_config_endpoint(
 
         # Get the configuration
         config = await get_landing_registration_config(prompt_id)
+        preserved_llm_ids = []
+        for key in ("default_llm_id", "_prompt_forced_llm_id"):
+            if config.get(key):
+                preserved_llm_ids.append(config.get(key))
 
         # Get available LLMs for the dropdown (exclude synthetic GranSabio row)
         async with get_db_connection(readonly=True) as conn:
-            async with conn.execute("SELECT id, machine, model FROM LLM WHERE machine != 'GranSabio' ORDER BY machine, model") as cursor:
-                llms = [{"id": row[0], "name": f"{row[1]} - {row[2]}"} for row in await cursor.fetchall()]
+            llm_rows = await get_selector_llms(conn, preserve_ids=preserved_llm_ids)
+            llms = [{"id": row["id"], "name": f"{row['machine']} - {row['model']}"} for row in llm_rows]
 
             # Get available categories for the dropdown
             async with conn.execute("SELECT id, name FROM CATEGORIES ORDER BY display_order, name") as cursor:
@@ -20989,7 +21418,7 @@ async def explore_prompts(
                     })
 
     # Build response with signed image URLs
-    current_time = datetime.utcnow()
+    current_time = datetime.now(timezone.utc)
     new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
     prompts = []
     for row in rows:
@@ -22755,7 +23184,7 @@ async def delete_mp3(request: Request, current_user: User = Depends(get_current_
 # Helper function to process image paths
 def process_image_path(url: str, user_dir: Path) -> Tuple[Path, Path]:
     """Process the image URL and return paths for both variants"""
-    path_str = url.split('://')[-1].split('/', 1)[-1]
+    path_str = url.split('://')[-1].split('/', 1)[-1].split('?', 1)[0]
     
     if path_str[:3] == 'sk/':
         relative_path = path_str[3:]
@@ -22770,10 +23199,11 @@ def process_image_path(url: str, user_dir: Path) -> Tuple[Path, Path]:
     full_path = user_dir / relative_path
     base_name = full_path.stem.rsplit('_', 1)[0] if any(suffix in full_path.stem for suffix in ['_256', '_fullsize']) else full_path.stem
     file_dir = full_path.parent
+    extension = full_path.suffix or ".webp"
 
     return (
-        file_dir / f"{base_name}_256.webp",
-        file_dir / f"{base_name}_fullsize.webp"
+        file_dir / f"{base_name}_256{extension}",
+        file_dir / f"{base_name}_fullsize{extension}"
     )
 
 # Helper function to extract image URLs
@@ -22785,6 +23215,25 @@ def extract_image_urls(message_data: dict) -> List[str]:
     elif isinstance(message_data, dict) and message_data.get('type') == 'image_url':
         return [message_data['image_url']['url']]
     return []
+
+
+def build_message_after_image_delete(message_data) -> str:
+    """Remove image blocks while preserving any remaining structured content."""
+    if isinstance(message_data, list):
+        remaining_items = [
+            item for item in message_data
+            if not (isinstance(item, dict) and item.get('type') == 'image_url')
+        ]
+        if remaining_items:
+            return orjson.dumps(remaining_items).decode()
+        return "[image deleted]"
+
+    if isinstance(message_data, dict):
+        if message_data.get('type') == 'image_url':
+            return "[image deleted]"
+        return orjson.dumps(message_data).decode()
+
+    return "[image deleted]"
 
 # Helper function to delete files
 async def delete_file_variants(variants: List[Path], user_dir: Path) -> Tuple[int, int]:
@@ -22846,9 +23295,10 @@ async def delete_image(message_id: int, current_user: User = Depends(get_current
                 logging.error(f"Error processing image URL {url}: {e}")
                 failed_count += 1
 
+        replacement_message = build_message_after_image_delete(message_data)
         await cursor.execute(
             "UPDATE MESSAGES SET message = ? WHERE id = ?",
-            ("[image deleted]", message_id)
+            (replacement_message, message_id)
         )
         await conn.commit()
 
@@ -22887,37 +23337,39 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
         ''', image_ids)
 
         user_dir = Path(get_user_directory(current_user.username))
-        successfully_deleted_ids = []
+        replacements_to_apply = []
         deleted_count = failed_count = 0
 
         for message in await cursor.fetchall():
             message_data = orjson.loads(message['message'])
+            message_deleted = False
             
             for url in extract_image_urls(message_data):
                 try:
                     variant_paths = process_image_path(url, user_dir)
                     deleted, failed = await delete_file_variants(variant_paths, user_dir)
-                    if deleted > 0:
-                        successfully_deleted_ids.append(message['id'])
+                    if deleted > 0 and not message_deleted:
+                        replacements_to_apply.append(
+                            (build_message_after_image_delete(message_data), message['id'])
+                        )
+                        message_deleted = True
                     deleted_count += deleted
                     failed_count += failed
                 except Exception as e:
                     logging.error(f"Error processing image URL {url}: {e}")
                     failed_count += 1
 
-        if successfully_deleted_ids:
-            placeholders = ','.join(['?' for _ in successfully_deleted_ids])
-            await cursor.execute(f'''
-                UPDATE MESSAGES
-                SET message = ?
-                WHERE id IN ({placeholders})
-            ''', ("[image deleted]", *successfully_deleted_ids))
+        if replacements_to_apply:
+            await cursor.executemany(
+                "UPDATE MESSAGES SET message = ? WHERE id = ?",
+                replacements_to_apply
+            )
             await conn.commit()
 
         return {
             "success": True,
             "message": f"Successfully deleted: {deleted_count}, Failed: {failed_count}",
-            "deleted_ids": successfully_deleted_ids
+            "deleted_ids": [message_id for _, message_id in replacements_to_apply]
         }
     
 @app.post("/delete-pdfs")
@@ -24194,7 +24646,7 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
                     p['has_welcome'] = False
 
         # Generate prompt image URLs for loose prompts
-        new_expiration = datetime.utcnow() + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+        new_expiration = datetime.now(timezone.utc) + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
         for p in loose_prompts:
             p['image_url'] = None
             if p.get('image'):
@@ -24389,7 +24841,7 @@ async def get_home_pack(pack_id: int, request: Request, current_user: User = Dep
         pack_data = dict(pack)
 
         # Generate signed URLs for pack cover and creator avatar
-        new_expiration = datetime.utcnow() + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+        new_expiration = datetime.now(timezone.utc) + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
 
         pack_data['cover_image_url'] = None
         if pack_data.get('cover_image'):
@@ -24517,7 +24969,7 @@ async def get_home_prompt(prompt_id: int, request: Request, current_user: User =
         prompt_data = dict(prompt)
 
         # Generate signed URLs for prompt image and creator avatar
-        new_expiration = datetime.utcnow() + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+        new_expiration = datetime.now(timezone.utc) + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
 
         prompt_data['image_url'] = None
         if prompt_data.get('image'):
@@ -24762,7 +25214,9 @@ async def save_prompt_welcome_message(prompt_id: int, request: Request, current_
             else:
                 try:
                     notified_dt = datetime.fromisoformat(last_notified)
-                    if (datetime.utcnow() - notified_dt).days >= 7:
+                    if notified_dt.tzinfo is None:
+                        notified_dt = notified_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - notified_dt).days >= 7:
                         reset_reads = True
                 except (ValueError, TypeError):
                     reset_reads = True
@@ -24850,7 +25304,9 @@ async def save_pack_welcome_message(pack_id: int, request: Request, current_user
             else:
                 try:
                     notified_dt = datetime.fromisoformat(last_notified)
-                    if (datetime.utcnow() - notified_dt).days >= 7:
+                    if notified_dt.tzinfo is None:
+                        notified_dt = notified_dt.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - notified_dt).days >= 7:
                         reset_reads = True
                 except (ValueError, TypeError):
                     reset_reads = True
@@ -25027,7 +25483,7 @@ async def get_all_welcome_messages(current_user: User = Depends(get_current_user
         pack_rows = [dict(row) for row in await cursor.fetchall()]
 
     # Build response with signed image URLs
-    new_expiration = datetime.utcnow() + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+    new_expiration = datetime.now(timezone.utc) + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
     messages = []
 
     for row in prompt_rows:

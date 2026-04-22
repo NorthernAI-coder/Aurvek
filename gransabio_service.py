@@ -1146,10 +1146,12 @@ async def generate_via_gransabio(
 
 async def _load_context_messages(conversation_id: int) -> list[dict]:
     """Load and parse conversation history for context. Shared by watchdog and generation."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timezone, timedelta
     from ai_calls import parse_stored_message, custom_unescape, flatten_multi_ai_context
 
-    context_start = datetime.utcnow() - timedelta(days=60)
+    context_start = (
+        datetime.now(timezone.utc) - timedelta(days=60)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
             "SELECT message, type FROM MESSAGES WHERE conversation_id = ? AND date >= ? "

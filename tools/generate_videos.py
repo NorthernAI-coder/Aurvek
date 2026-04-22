@@ -9,7 +9,7 @@ import time
 import re
 import base64
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, Response, HTTPException, Depends, Request, Form, status, UploadFile, File
 from urllib.parse import urlparse
@@ -268,8 +268,8 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
         )
 
         # Generate token for immediate display (same as process_message does for DB loads)
-        from datetime import datetime, timedelta
-        expiration = datetime.utcnow() + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+        from datetime import datetime, timezone, timedelta
+        expiration = datetime.now(timezone.utc) + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
         token = generate_img_token(video_link_base, expiration, user)
         video_url_with_token = f"{video_link_base}?token={token}"
 

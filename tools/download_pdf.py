@@ -6,7 +6,7 @@ import logging
 import asyncio
 import orjson
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 import hashlib
 from urllib.parse import urlparse
@@ -673,7 +673,7 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
     os.makedirs(pdf_convo_folder, exist_ok=True)
 
     # 2. Generate timestamp
-    timestamp = datetime.utcnow().strftime("%Y_%m_%d_%H_%M_%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
 
     # 3. Define PDF filename with timestamp
     # We use 'prompt_name' as name. You can adjust this according to your needs.

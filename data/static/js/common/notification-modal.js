@@ -339,7 +339,11 @@ const NotificationModal = {
 
         // Set content
         modalLabel.textContent = title;
-        modalBody.innerHTML = message;
+        if (options.allowHtml === true) {
+            modalBody.innerHTML = message;
+        } else {
+            modalBody.textContent = message;
+        }
         modalIcon.innerHTML = this._getIcon(type);
 
         // Configure buttons
@@ -400,7 +404,12 @@ const NotificationModal = {
             document.getElementById('notificationModalLabel').textContent = title;
         }
         if (message !== undefined) {
-            document.getElementById('notificationModalBody').innerHTML = message;
+            const modalBody = document.getElementById('notificationModalBody');
+            if (options.allowHtml === true) {
+                modalBody.innerHTML = message;
+            } else {
+                modalBody.textContent = message;
+            }
         }
         if (confirmText !== undefined) {
             document.getElementById('notificationModalConfirmBtn').textContent = confirmText;
@@ -421,29 +430,29 @@ const NotificationModal = {
     /**
      * Show success modal
      */
-    success(title, message, onConfirm = null) {
-        return this.show('success', title, message, { onConfirm });
+    success(title, message, options = {}) {
+        return this.show('success', title, message, options);
     },
 
     /**
      * Show error modal
      */
-    error(title, message, onConfirm = null) {
-        return this.show('error', title, message, { onConfirm });
+    error(title, message, options = {}) {
+        return this.show('error', title, message, options);
     },
 
     /**
      * Show warning modal
      */
-    warning(title, message, onConfirm = null) {
-        return this.show('warning', title, message, { onConfirm });
+    warning(title, message, options = {}) {
+        return this.show('warning', title, message, options);
     },
 
     /**
      * Show info modal
      */
-    info(title, message, onConfirm = null) {
-        return this.show('info', title, message, { onConfirm });
+    info(title, message, options = {}) {
+        return this.show('info', title, message, options);
     },
 
     /**
@@ -474,11 +483,23 @@ const NotificationModal = {
 
         const toast = document.createElement('div');
         toast.className = `notification-toast toast-${type}`;
-        toast.innerHTML = `
-            <span class="notification-toast-icon">${iconMap[type] || iconMap.info}</span>
-            <span class="notification-toast-message">${message}</span>
-            <button class="notification-toast-close" aria-label="Close">&times;</button>
-        `;
+
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'notification-toast-icon';
+        iconSpan.innerHTML = iconMap[type] || iconMap.info;  // trusted hardcoded SVG
+
+        const messageSpan = document.createElement('span');
+        messageSpan.className = 'notification-toast-message';
+        messageSpan.textContent = message;  // XSS-safe for caller content
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'notification-toast-close';
+        closeBtn.setAttribute('aria-label', 'Close');
+        closeBtn.innerHTML = '&times;';  // trusted hardcoded glyph
+
+        toast.appendChild(iconSpan);
+        toast.appendChild(messageSpan);
+        toast.appendChild(closeBtn);
 
         container.appendChild(toast);
 
@@ -507,7 +528,8 @@ const NotificationModal = {
             cancelText: options.cancelText || 'Cancel',
             onConfirm,
             onCancel,
-            hideOnConfirm: options.hideOnConfirm !== false
+            hideOnConfirm: options.hideOnConfirm !== false,
+            allowHtml: options.allowHtml === true
         });
     }
 };
@@ -517,6 +539,23 @@ if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => NotificationModal.init());
 } else {
     NotificationModal.init();
+}
+
+/**
+ * Escape HTML to prevent XSS in dynamic content.
+ *
+ * Moved from chat.js in PR 1 (F3 round 8 fix) so it is available on every
+ * page that loads notification-modal.js (base.html:160, base_admin.html:152,
+ * chat.html:711) instead of only on the chat page. Top-level global function,
+ * NOT a method on NotificationModal, so existing unqualified callers in
+ * chat.js and future PR 2 caller migrations in non-chat views keep working
+ * without having to qualify the call.
+ */
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 // Export for module systems

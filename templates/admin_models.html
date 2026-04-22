@@ -1,0 +1,712 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}Model Catalog Sync - AURVEK{% endblock %}
+
+{% block styles %}
+<style>
+    .catalog-provider-tab {
+        border: 0;
+        cursor: pointer;
+        font: inherit;
+    }
+    .catalog-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 12px 16px;
+        background: var(--bg-tertiary, #202225);
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
+    .catalog-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+    .catalog-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text-muted, #72767d);
+        font-size: 0.9rem;
+    }
+    .model-row.in-db {
+        background-color: rgba(25, 135, 84, 0.13) !important;
+    }
+    .model-row.pending {
+        background-color: rgba(255, 193, 7, 0.13) !important;
+    }
+    .model-row.to-disable {
+        background-color: rgba(220, 53, 69, 0.13) !important;
+    }
+    .model-row.local-only {
+        background-color: rgba(108, 117, 125, 0.12) !important;
+    }
+    .price-cell,
+    .token-cell {
+        font-family: monospace;
+        font-size: 0.85rem;
+        white-space: nowrap;
+    }
+    .source-badge {
+        font-size: 0.75rem;
+    }
+    .sync-spinner {
+        display: none;
+    }
+    .syncing .sync-spinner {
+        display: inline-block;
+    }
+    .syncing .sync-text {
+        display: none;
+    }
+</style>
+{% endblock %}
+
+{% block page_title %}LLM Model Catalog{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Discover, review and enable synchronized provider models</p>
+{% endblock %}
+
+{% block page_actions %}
+<div class="catalog-actions">
+    <button class="btn btn-outline-secondary" id="fetchProviderBtn" onclick="loadActiveProvider(true)">
+        <span class="sync-spinner spinner-border spinner-border-sm me-1"></span>
+        <span class="sync-text"><i class="fas fa-cloud-download-alt me-1"></i> Fetch Provider</span>
+    </button>
+    <button class="btn-primary-gold" id="syncAllBtn" onclick="syncAllProviders()">
+        <span class="sync-spinner spinner-border spinner-border-sm me-1"></span>
+        <span class="sync-text"><i class="fas fa-sync-alt me-1"></i> Sync All Providers</span>
+    </button>
+</div>
+{% endblock %}
+
+{% block tabs %}
+<div class="internal-tabs">
+    <a href="/admin/llms" class="internal-tab">All Models</a>
+    <a href="/admin/models" class="internal-tab active">
+        <i class="fas fa-sync me-1"></i> Provider Sync
+    </a>
+</div>
+{% endblock %}
+
+{% block alerts %}
+<div id="alertContainer">
+    {% if message %}
+    <div class="alert alert-success alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
+    {% if error %}
+    <div class="alert alert-danger alert-dismissible fade show" role="alert">
+        {{ error }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="stats-row">
+    <span class="stat-badge">
+        <i class="fas fa-database"></i> <strong id="catalogCount">{{ catalog_count }}</strong> Catalog
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-check-circle"></i> <strong id="enabledCount">{{ enabled_count }}</strong> Enabled
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-triangle-exclamation"></i> <strong id="needsReviewCount">{{ needs_review_count }}</strong> Needs Review
+    </span>
+    <span class="stat-badge">
+        <i class="fas fa-cloud"></i> <strong id="remoteCount">0</strong> Remote
+    </span>
+    <span class="stat-badge" id="statsFiltered" style="display: none;">
+        <i class="fas fa-filter"></i> <strong id="filteredCount">0</strong> Shown
+    </span>
+</div>
+
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-plug"></i> Providers
+    </div>
+    <div class="internal-tabs" id="providerTabs">
+        {% for provider in provider_tabs %}
+        {% set counts = provider_counts.get(provider.key, {}) %}
+        <button type="button"
+                class="internal-tab catalog-provider-tab{% if provider.key == active_provider %} active{% endif %}"
+                data-provider="{{ provider.key }}"
+                onclick="selectProvider('{{ provider.key }}')">
+            <i class="fas {{ provider.icon }} me-1"></i>{{ provider.label }}
+            <span class="badge bg-secondary ms-1">{{ counts.get('enabled', 0) }}/{{ counts.get('total', 0) }}</span>
+        </button>
+        {% endfor %}
+    </div>
+</div>
+
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-filter"></i> Filters
+    </div>
+    <div class="flex-row">
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label">Search</label>
+                <input type="text" class="form-control" id="searchFilter" placeholder="Model, display name or provider..." oninput="applyFilters()">
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label">Provider Family</label>
+                <select class="form-select" id="familyFilter" onchange="applyFilters()">
+                    <option value="">All Families</option>
+                </select>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label">Visibility</label>
+                <select class="form-select" id="statusFilter" onchange="applyFilters()">
+                    <option value="">All</option>
+                    <option value="enabled">Enabled</option>
+                    <option value="disabled">Disabled</option>
+                    <option value="new">New Remote</option>
+                    <option value="local-only">Local Only</option>
+                    <option value="needs-review">Needs Review</option>
+                </select>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
+                <label class="form-label">Vision</label>
+                <select class="form-select" id="visionFilter" onchange="applyFilters()">
+                    <option value="">All Models</option>
+                    <option value="yes">Vision</option>
+                    <option value="no">No Vision</option>
+                </select>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="catalog-toolbar">
+    <div>
+        <input type="checkbox" class="form-check-input me-2" id="selectAllVisible" onchange="toggleSelectAllVisible()">
+        <label class="form-check-label" for="selectAllVisible">Select all visible</label>
+    </div>
+    <div class="catalog-status" id="providerStatus">
+        <i class="fas fa-circle-info"></i>
+        <span>Provider catalog ready.</span>
+    </div>
+    <button class="btn-primary-gold" id="saveBtn" onclick="saveSelection()" disabled>
+        <span class="sync-spinner spinner-border spinner-border-sm me-1"></span>
+        <span class="sync-text"><i class="fas fa-save me-1"></i> Save Provider Selection</span>
+    </button>
+</div>
+
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-table"></i> Remote Catalog
+    </div>
+    <div class="table-wrapper">
+        <table class="table" id="modelsTable">
+            <thead>
+                <tr>
+                    <th style="width: 40px;"></th>
+                    <th>Provider</th>
+                    <th>Model</th>
+                    <th>Context</th>
+                    <th>Max Output</th>
+                    <th>Input Cost</th>
+                    <th>Output Cost</th>
+                    <th>Vision</th>
+                    <th>Sync</th>
+                    <th class="text-end">Visibility</th>
+                </tr>
+            </thead>
+            <tbody id="modelsTableBody">
+                <tr>
+                    <td colspan="10" class="text-center py-5 text-muted">
+                        <i class="fas fa-cloud-download-alt fa-3x mb-3 d-block"></i>
+                        Provider data not loaded.
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+    const providerTabs = {{ provider_tabs | tojson | safe }};
+    let activeProvider = {{ active_provider | tojson | safe }};
+    const providerState = {};
+
+    document.addEventListener('DOMContentLoaded', function() {
+        selectProvider(activeProvider);
+    });
+
+    function emptyProviderState() {
+        return {
+            loaded: false,
+            loading: false,
+            error: null,
+            remoteCount: 0,
+            models: [],
+            enabled: new Set(),
+            originalEnabled: new Set(),
+        };
+    }
+
+    function stateFor(provider) {
+        if (!providerState[provider]) {
+            providerState[provider] = emptyProviderState();
+        }
+        return providerState[provider];
+    }
+
+    function selectProvider(provider) {
+        activeProvider = provider;
+        document.querySelectorAll('.catalog-provider-tab').forEach(tab => {
+            tab.classList.toggle('active', tab.dataset.provider === provider);
+        });
+        const url = new URL(window.location.href);
+        url.searchParams.set('provider', provider);
+        window.history.replaceState({}, '', url.toString());
+        if (!stateFor(provider).loaded) {
+            loadProvider(provider, false);
+        } else {
+            renderProvider();
+        }
+    }
+
+    function loadActiveProvider(force) {
+        return loadProvider(activeProvider, force);
+    }
+
+    async function loadProvider(provider, force) {
+        const state = stateFor(provider);
+        if (state.loading) return;
+        if (state.loaded && !force) {
+            renderProvider();
+            return;
+        }
+
+        state.loading = true;
+        state.error = null;
+        setButtonLoading('fetchProviderBtn', true);
+        setProviderStatus('loading', 'Fetching ' + providerLabel(provider) + ' models...');
+
+        try {
+            const response = await fetch('/api/admin/llms/providers/' + encodeURIComponent(provider) + '/remote');
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Provider fetch failed');
+            }
+
+            state.models = (data.models || []).map(normalizeModel);
+            state.remoteCount = data.remote_count || state.models.filter(m => m.remote_available).length;
+            state.enabled = new Set(state.models.filter(m => m.enabled).map(m => m.id));
+            state.originalEnabled = new Set(state.enabled);
+            state.loaded = true;
+            state.loading = false;
+            populateFamilyFilter();
+            renderProvider();
+            showAlert('success', providerLabel(provider) + ' catalog loaded.');
+        } catch (error) {
+            state.error = error.message;
+            state.loaded = false;
+            state.loading = false;
+            renderProvider();
+            showAlert('danger', providerLabel(provider) + ': ' + error.message);
+        } finally {
+            setButtonLoading('fetchProviderBtn', false);
+        }
+    }
+
+    async function syncAllProviders() {
+        const btn = document.getElementById('syncAllBtn');
+        setButtonLoading('syncAllBtn', true);
+        btn.disabled = true;
+        setProviderStatus('loading', 'Syncing all providers...');
+
+        try {
+            const response = await fetch('/api/admin/llms/sync-all', { method: 'POST' });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Sync all failed');
+            }
+
+            providerTabs.forEach(provider => {
+                providerState[provider.key] = emptyProviderState();
+            });
+            const messages = Object.entries(data.results || {}).map(([provider, result]) => {
+                if (result.error) return providerLabel(provider) + ': ' + result.error;
+                return providerLabel(provider) + ': +' + (result.added || 0) + ', updated ' + (result.updated || 0) + ', stale ' + (result.stale || 0);
+            });
+            showAlert('success', messages.join(' | '));
+            await loadProvider(activeProvider, true);
+        } catch (error) {
+            showAlert('danger', 'Sync all providers failed: ' + error.message);
+            setProviderStatus('error', error.message);
+        } finally {
+            setButtonLoading('syncAllBtn', false);
+            btn.disabled = false;
+        }
+    }
+
+    async function saveSelection() {
+        const state = stateFor(activeProvider);
+        if (!state.loaded) return;
+
+        setButtonLoading('saveBtn', true);
+        document.getElementById('saveBtn').disabled = true;
+
+        try {
+            const remoteAvailableIds = new Set(
+                state.models.filter(m => m.remote_available && !m.local_only).map(m => m.id)
+            );
+            const selectedModelIds = Array.from(state.enabled).filter(id => remoteAvailableIds.has(id));
+            const disabledModelIds = Array.from(state.originalEnabled).filter(id => remoteAvailableIds.has(id) && !state.enabled.has(id));
+
+            const localOnlyChanges = state.models.filter(model => {
+                if (!model.local_only || !model.local_id) return false;
+                return state.enabled.has(model.id) !== state.originalEnabled.has(model.id);
+            });
+            for (const model of localOnlyChanges) {
+                const patchResponse = await fetch('/api/admin/llms/' + model.local_id + '/enabled', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: state.enabled.has(model.id) }),
+                });
+                const patchData = await patchResponse.json();
+                if (!patchResponse.ok || patchData.error) {
+                    throw new Error(patchData.error || 'Failed to update local-only model ' + model.id);
+                }
+            }
+
+            const response = await fetch('/api/admin/llms/providers/' + encodeURIComponent(activeProvider) + '/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    selected_model_ids: selectedModelIds,
+                    disabled_model_ids: disabledModelIds,
+                }),
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Provider sync failed');
+            }
+
+            showAlert('success', providerLabel(activeProvider) + ': added ' + data.added + ', updated ' + data.updated + ', disabled ' + data.disabled + '.');
+            await loadProvider(activeProvider, true);
+        } catch (error) {
+            showAlert('danger', 'Save failed: ' + error.message);
+        } finally {
+            setButtonLoading('saveBtn', false);
+            updateSaveButtonState();
+        }
+    }
+
+    function normalizeModel(model) {
+        const id = model.provider_model_id || model.id || model.model || '';
+        return {
+            id: id,
+            local_id: model.local_id || null,
+            provider_key: model.provider_key || activeProvider,
+            provider_label: providerFamily(model),
+            display_name: model.display_name || model.name || id,
+            description: model.description || '',
+            model: model.model || id,
+            context_window_tokens: numberOrNull(model.context_window_tokens || model.context_length),
+            max_output_tokens: numberOrNull(model.max_output_tokens),
+            input_token_cost: Number(model.input_token_cost || model.input_price || 0),
+            output_token_cost: Number(model.output_token_cost || model.output_price || 0),
+            vision: Boolean(model.vision),
+            enabled: Boolean(model.enabled),
+            sync_status: model.sync_status || model.local_sync_status || 'new',
+            metadata_source: model.metadata_source || model.sync_source || 'provider_api',
+            needs_review: Boolean(model.needs_review),
+            local_only: Boolean(model.local_only),
+            remote_available: model.remote_available !== false,
+            last_synced_at: model.last_synced_at || null,
+        };
+    }
+
+    function providerFamily(model) {
+        const id = model.provider_model_id || model.id || model.model || '';
+        if ((model.provider_key || activeProvider) === 'openrouter' && id.includes('/')) {
+            return id.split('/')[0];
+        }
+        return providerLabel(model.provider_key || activeProvider);
+    }
+
+    function renderProvider() {
+        const state = stateFor(activeProvider);
+        document.getElementById('remoteCount').textContent = state.remoteCount || 0;
+        updateSaveButtonState();
+
+        if (state.loading) {
+            renderMessageRow('Fetching models...');
+            return;
+        }
+        if (state.error) {
+            renderMessageRow(state.error);
+            setProviderStatus('error', state.error);
+            return;
+        }
+        if (!state.loaded) {
+            renderMessageRow('Provider data not loaded.');
+            setProviderStatus('idle', 'Ready to fetch ' + providerLabel(activeProvider) + '.');
+            return;
+        }
+
+        const filtered = getFilteredModels();
+        if (!filtered.length) {
+            renderMessageRow('No models match your filters.');
+            updateStats();
+            return;
+        }
+
+        const tbody = document.getElementById('modelsTableBody');
+        tbody.innerHTML = filtered.map(model => renderModelRow(model, state)).join('');
+        updateStats();
+        updateSelectAllState();
+        setProviderStatus('ok', providerLabel(activeProvider) + ': ' + state.models.length + ' catalog rows loaded.');
+    }
+
+    function renderModelRow(model, state) {
+        const isSelected = state.enabled.has(model.id);
+        const wasSelected = state.originalEnabled.has(model.id);
+        const rowClass = model.local_only ? 'local-only' : (
+            isSelected && wasSelected ? 'in-db' :
+            isSelected && !wasSelected ? 'pending' :
+            !isSelected && wasSelected ? 'to-disable' : ''
+        );
+        const disabledHint = model.remote_available ? '' : ' title="Remote model was not returned by the provider"';
+        return `
+            <tr class="model-row ${rowClass}" data-model-id="${escapeAttr(model.id)}">
+                <td>
+                    <input type="checkbox" class="form-check-input model-checkbox"
+                           data-model-id="${escapeAttr(model.id)}"
+                           ${isSelected ? 'checked' : ''}
+                           onchange="toggleModel('${escapeJs(model.id)}')">
+                </td>
+                <td><span class="badge provider-badge provider-OpenRouter">${escapeHtml(model.provider_label)}</span></td>
+                <td>
+                    <strong>${escapeHtml(model.display_name)}</strong>
+                    ${model.needs_review ? '<span class="badge bg-warning text-dark ms-1">Review</span>' : ''}
+                    ${model.local_only ? '<span class="badge bg-secondary ms-1"' + disabledHint + '>Local only</span>' : ''}
+                    <br><small class="text-muted">${escapeHtml(model.id)}</small>
+                </td>
+                <td class="token-cell">${formatTokens(model.context_window_tokens)}</td>
+                <td class="token-cell">${formatTokens(model.max_output_tokens)}</td>
+                <td class="price-cell">${formatCost(model.input_token_cost)}</td>
+                <td class="price-cell">${formatCost(model.output_token_cost)}</td>
+                <td>${model.vision ? '<span class="vision-badge"><i class="fas fa-eye me-1"></i>Vision</span>' : '-'}</td>
+                <td>
+                    ${syncStatusBadge(model)}
+                    <br><span class="badge bg-secondary source-badge">${escapeHtml(model.metadata_source)}</span>
+                </td>
+                <td class="text-end">${visibilityBadge(model, isSelected, wasSelected)}</td>
+            </tr>
+        `;
+    }
+
+    function renderMessageRow(message) {
+        document.getElementById('modelsTableBody').innerHTML = `
+            <tr>
+                <td colspan="10" class="text-center py-5 text-muted">${escapeHtml(message)}</td>
+            </tr>
+        `;
+    }
+
+    function getFilteredModels() {
+        const state = stateFor(activeProvider);
+        const search = document.getElementById('searchFilter').value.toLowerCase();
+        const family = document.getElementById('familyFilter').value;
+        const status = document.getElementById('statusFilter').value;
+        const vision = document.getElementById('visionFilter').value;
+
+        return state.models.filter(model => {
+            if (family && model.provider_label !== family) return false;
+            if (vision === 'yes' && !model.vision) return false;
+            if (vision === 'no' && model.vision) return false;
+            if (status === 'enabled' && !state.enabled.has(model.id)) return false;
+            if (status === 'disabled' && state.enabled.has(model.id)) return false;
+            if (status === 'new' && model.local_id) return false;
+            if (status === 'local-only' && !model.local_only) return false;
+            if (status === 'needs-review' && !model.needs_review) return false;
+            if (search) {
+                const haystack = [model.id, model.display_name, model.provider_label, model.metadata_source].join(' ').toLowerCase();
+                if (!haystack.includes(search)) return false;
+            }
+            return true;
+        });
+    }
+
+    function populateFamilyFilter() {
+        const state = stateFor(activeProvider);
+        const select = document.getElementById('familyFilter');
+        const families = [...new Set(state.models.map(m => m.provider_label).filter(Boolean))].sort();
+        select.innerHTML = '<option value="">All Families (' + families.length + ')</option>';
+        families.forEach(family => {
+            const count = state.models.filter(m => m.provider_label === family).length;
+            select.innerHTML += '<option value="' + escapeAttr(family) + '">' + escapeHtml(family) + ' (' + count + ')</option>';
+        });
+    }
+
+    function applyFilters() {
+        renderProvider();
+    }
+
+    function toggleModel(modelId) {
+        const state = stateFor(activeProvider);
+        if (state.enabled.has(modelId)) {
+            state.enabled.delete(modelId);
+        } else {
+            state.enabled.add(modelId);
+        }
+        renderProvider();
+    }
+
+    function toggleSelectAllVisible() {
+        const state = stateFor(activeProvider);
+        const checked = document.getElementById('selectAllVisible').checked;
+        getFilteredModels().forEach(model => {
+            if (checked) {
+                state.enabled.add(model.id);
+            } else {
+                state.enabled.delete(model.id);
+            }
+        });
+        renderProvider();
+    }
+
+    function updateSelectAllState() {
+        const state = stateFor(activeProvider);
+        const filtered = getFilteredModels();
+        document.getElementById('selectAllVisible').checked =
+            filtered.length > 0 && filtered.every(model => state.enabled.has(model.id));
+    }
+
+    function updateStats() {
+        const state = stateFor(activeProvider);
+        const filtered = getFilteredModels();
+        document.getElementById('enabledCount').textContent = state.loaded ? state.enabled.size : {{ enabled_count }};
+        document.getElementById('needsReviewCount').textContent = state.loaded ? state.models.filter(m => m.needs_review).length : {{ needs_review_count }};
+        const statsFiltered = document.getElementById('statsFiltered');
+        if (state.loaded && filtered.length !== state.models.length) {
+            statsFiltered.style.display = 'inline-flex';
+            document.getElementById('filteredCount').textContent = filtered.length;
+        } else {
+            statsFiltered.style.display = 'none';
+        }
+    }
+
+    function updateSaveButtonState() {
+        const state = stateFor(activeProvider);
+        const btn = document.getElementById('saveBtn');
+        if (!state.loaded || state.loading) {
+            btn.disabled = true;
+            return;
+        }
+        btn.disabled = !hasChanges(state);
+    }
+
+    function hasChanges(state) {
+        if (state.enabled.size !== state.originalEnabled.size) return true;
+        for (const id of state.enabled) {
+            if (!state.originalEnabled.has(id)) return true;
+        }
+        return false;
+    }
+
+    function visibilityBadge(model, isSelected, wasSelected) {
+        if (isSelected && wasSelected) return '<span class="badge bg-success">Enabled</span>';
+        if (isSelected && !wasSelected) return '<span class="badge bg-warning text-dark">Will Enable</span>';
+        if (!isSelected && wasSelected) return '<span class="badge bg-danger">Will Disable</span>';
+        if (!model.local_id) return '<span class="badge bg-secondary">New</span>';
+        return '<span class="badge bg-secondary">Disabled</span>';
+    }
+
+    function syncStatusBadge(model) {
+        const status = model.sync_status || 'new';
+        if (model.needs_review) return '<span class="badge bg-warning text-dark">' + escapeHtml(status) + '</span>';
+        if (status === 'synced' || status === 'legacy_synced') return '<span class="badge bg-success">' + escapeHtml(status) + '</span>';
+        if (status === 'stale' || model.local_only) return '<span class="badge bg-secondary">' + escapeHtml(status) + '</span>';
+        return '<span class="badge bg-info text-dark">' + escapeHtml(status) + '</span>';
+    }
+
+    function providerLabel(provider) {
+        const tab = providerTabs.find(item => item.key === provider);
+        return tab ? tab.label : provider;
+    }
+
+    function formatTokens(value) {
+        const n = numberOrNull(value);
+        if (!n) return '-';
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(0) + 'K';
+        return String(n);
+    }
+
+    function formatCost(value) {
+        const n = Number(value || 0);
+        if (!n) return '$0.0000';
+        return '$' + n.toFixed(4);
+    }
+
+    function numberOrNull(value) {
+        const n = Number(value || 0);
+        return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    function setButtonLoading(id, loading) {
+        const btn = document.getElementById(id);
+        if (!btn) return;
+        btn.classList.toggle('syncing', loading);
+        btn.disabled = loading;
+    }
+
+    function setProviderStatus(type, message) {
+        const status = document.getElementById('providerStatus');
+        const icon = type === 'error' ? 'fa-circle-exclamation' :
+            type === 'loading' ? 'fa-spinner fa-spin' :
+            type === 'ok' ? 'fa-circle-check' : 'fa-circle-info';
+        status.innerHTML = '<i class="fas ' + icon + '"></i><span>' + escapeHtml(message) + '</span>';
+    }
+
+    function showAlert(type, message) {
+        const normalized = type === 'danger' ? 'danger' : 'success';
+        if (window.NotificationModal && normalized === 'danger') {
+            NotificationModal.error('Model Catalog', message);
+        }
+        const icon = normalized === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle';
+        document.getElementById('alertContainer').innerHTML =
+            '<div class="alert alert-' + normalized + ' alert-dismissible fade show" role="alert">' +
+            '<i class="fas ' + icon + ' me-2"></i>' + escapeHtml(message) +
+            '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>' +
+            '</div>';
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, function(ch) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+        });
+    }
+
+    function escapeAttr(value) {
+        return escapeHtml(value);
+    }
+
+    function escapeJs(value) {
+        return String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+    }
+</script>
+{% endblock %}

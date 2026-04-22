@@ -954,21 +954,59 @@ function branchConversation(messageId, conversationId) {
 
 
 function formatCodeBlocks(html) {
-    const codeRegex = /<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g;
-    return html.replace(codeRegex, function(match, language, code) {
-        // Remove whitespace at start and end of code
-        code = code.trim();
-        // Remove common indentation
-        const lines = code.split('\n');
+    const template = document.createElement('template');
+    template.innerHTML = html;
+
+    template.content.querySelectorAll('pre > code').forEach(code => {
+        const pre = code.parentElement;
+        if (!pre || pre.closest('.code-block')) return;
+
+        let language = 'code';
+        const match = (code.className || '').match(/language-(\S+)/);
+        if (match) language = match[1];
+
+        const rawText = code.textContent || '';
+        const lines = rawText.replace(/^\n+|\n+$/g, '').split('\n');
         const commonIndent = lines.reduce((min, line) => {
-            const indent = line.match(/^\s*/)[0].length;
-            return line.trim() ? Math.min(min, indent) : min;
+            if (!line.trim()) return min;
+            return Math.min(min, line.match(/^\s*/)[0].length);
         }, Infinity);
-        const dedentedCode = lines.map(line => line.slice(commonIndent)).join('\n');
-        
-        // Create HTML without spaces or line breaks between tags
-        return `<div class="code-block"style="display:grid"><div class="code-header"><span class="code-language">${language}</span><button class="copy-button" onclick="copyCode(this)"><i class="fas fa-copy"></i></button></div><pre><code class="language-${language}">${dedentedCode}</code></pre></div>`;
+        if (commonIndent > 0 && commonIndent !== Infinity) {
+            code.textContent = lines.map(line => line.slice(commonIndent)).join('\n');
+        } else {
+            code.textContent = lines.join('\n');
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'code-block';
+
+        const header = document.createElement('div');
+        header.className = 'code-header';
+
+        const langSpan = document.createElement('span');
+        langSpan.className = 'code-language';
+        langSpan.textContent = language;
+
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'copy-button';
+        copyBtn.setAttribute('onclick', 'copyCode(this)');
+        copyBtn.setAttribute('aria-label', 'Copy code');
+        copyBtn.title = 'Copy code';
+
+        const copyIcon = document.createElement('i');
+        copyIcon.className = 'fas fa-copy';
+        copyBtn.appendChild(copyIcon);
+
+        header.appendChild(langSpan);
+        header.appendChild(copyBtn);
+        wrapper.appendChild(header);
+
+        pre.parentNode.insertBefore(wrapper, pre);
+        wrapper.appendChild(pre);
     });
+
+    return template.innerHTML;
 }
 
 function copyCode(button) {
@@ -1007,15 +1045,26 @@ function sendMessage(messageText) {
     // Check if user can send messages based on API key configuration
     if (!ApiKeyManager.canSendMessages()) {
         ApiKeyManager.handleApiKeyError({ error: 'api_keys_required', action: 'configure_api_keys' });
-        return;
+        return false;
     }
 
     if (currentConversationId === null) {
         console.error('No conversation selected');
-        return;
+        return false;
     }
+
+    // Block send while images are being compressed
+    if (compressionInProgress > 0) {
+        NotificationModal.toast('Images are being compressed, please wait...', 'info', 2000);
+        return false;
+    }
+
     if (!messageText.trim() && (!attachedFiles || attachedFiles.length === 0)) {
-        return;
+        return false;
+    }
+
+    if (window.ChatWarmup && typeof window.ChatWarmup.cancel === 'function') {
+        window.ChatWarmup.cancel();
     }
 
     // Reset auto-scroll state when user sends a message
@@ -1076,7 +1125,7 @@ function sendMessage(messageText) {
             removeLoadingIndicator();
             document.getElementById('message-text').disabled = false;
             document.getElementById('message-text').focus();
-            return;
+            return false;
         }
         formData.append('multi_ai_models', JSON.stringify(selectedMultiAiModels.map((model) => model.llm_id)));
     }
@@ -1705,6 +1754,8 @@ function sendMessage(messageText) {
             }
         }
     });
+
+    return true;
 }
 
 function updateMessageId(messageId, element) {
@@ -2616,6 +2667,10 @@ function loadMoreConversations() {
 
 function continueConversation(conversationId, chatName, machine, isInit = false, targetMessageId = null, conversationData = null) {
     removeOverlay();
+
+    if (window.ChatWarmup && typeof window.ChatWarmup.resetForConversation === 'function') {
+        window.ChatWarmup.resetForConversation(conversationId);
+    }
 
     // Check if this conversation is already loaded (compare with current conversation ID)
     if (currentConversationId &&
@@ -3980,14 +4035,6 @@ class ModelSelector {
     }
 }
 
-// Escape HTML to prevent XSS in dynamic content
-function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
 // Extension Level Selector functionality
 class ExtensionSelector {
     constructor() {
@@ -4587,10 +4634,12 @@ function initializeThinkingTokensControl() {
     const applyBtn = document.getElementById('thinking-tokens-apply');
     const presetBtns = document.querySelectorAll('.preset-btn');
     const badge = document.getElementById('thinking-tokens-badge');
+    const ANTHROPIC_THINKING_MIN = 1024;
 
     function isAdaptiveModel() {
         const model = (document.getElementById('chat-model')?.textContent || '').toLowerCase();
-        return model.includes('4-6') || model.includes('4.6');
+        return model.includes('4-6') || model.includes('4.6')
+            || model.includes('4-7') || model.includes('4.7');
     }
 
     function updateThinkingTokensVisibility() {
@@ -4630,6 +4679,25 @@ function initializeThinkingTokensControl() {
                         input.disabled = false;
                     }
                 }
+            }
+            // Opus 4.7 rejects manual thinking budget: lock UI to Off / Auto only
+            const isOpus47 = modelLower.includes('opus-4-7') || modelLower.includes('opus-4.7');
+            if (isOpus47) {
+                slider.disabled = true;
+                input.disabled = true;
+                presetBtns.forEach(btn => {
+                    const v = parseInt(btn.dataset.value);
+                    btn.disabled = v > 0;
+                    btn.classList.toggle('disabled', v > 0);
+                });
+                if (currentThinkingBudget > 0) {
+                    currentThinkingBudget = -1;
+                }
+            } else {
+                presetBtns.forEach(btn => {
+                    btn.disabled = false;
+                    btn.classList.remove('disabled');
+                });
             }
             updateDisplay(currentThinkingBudget);
         }
@@ -4686,6 +4754,7 @@ function initializeThinkingTokensControl() {
     presetBtns.forEach(btn => {
         btn.addEventListener('click', (e) => {
             e.preventDefault();
+            if (btn.disabled) return;
             const value = parseInt(btn.dataset.value);
             if (value === -1) {
                 currentThinkingBudget = -1;
@@ -4704,7 +4773,12 @@ function initializeThinkingTokensControl() {
     applyBtn.addEventListener('click', (e) => {
         e.preventDefault();
         if (currentThinkingBudget !== -1) {
-            currentThinkingBudget = parseInt(input.value) || 0;
+            const parsed = parseInt(input.value) || 0;
+            currentThinkingBudget = (parsed > 0 && parsed < ANTHROPIC_THINKING_MIN)
+                ? ANTHROPIC_THINKING_MIN
+                : parsed;
+            input.value = currentThinkingBudget;
+            slider.value = Math.min(currentThinkingBudget, parseInt(slider.max) || currentThinkingBudget);
         }
         popup.style.display = 'none';
         updateDisplay(currentThinkingBudget);

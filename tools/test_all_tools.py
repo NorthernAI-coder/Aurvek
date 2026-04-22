@@ -440,7 +440,7 @@ def test_redis_connection():
         from rediscfg import redis_client
 
         # Test connection
-        asyncio.get_event_loop().run_until_complete(redis_client.ping())
+        asyncio.run(redis_client.ping())
         print("  [OK] Redis connected successfully")
         return {"status": "OK"}
 

@@ -1,6 +1,7 @@
 # ai_calls.py
 
 import asyncio
+import copy
 import aiohttp
 import orjson
 import aiosqlite
@@ -12,15 +13,16 @@ from google.genai import types as genai_types
 from openai import OpenAI
 from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile, Form, Body
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import io
 import zlib
 import base64
-from PIL import Image as PilImage
+from PIL import Image as PilImage, ImageOps
+from PIL.ExifTags import Base as ExifBase
 import re
 import os
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 import traceback
 import sqlite3
 import uuid
@@ -74,6 +76,7 @@ from common import (
     MAX_IMAGE_PIXELS,
     MAX_RAW_UPLOAD_SIZE_MB,
     MAX_API_IMAGE_SIZE_MB,
+    MAX_CHAT_IMAGE_DIMENSION,
     MAX_PDF_SIZE_MB,
     MAX_PDF_PAGES,
     MAX_PDFS_PER_MESSAGE,
@@ -86,6 +89,17 @@ from save_images import save_image_locally, generate_img_token, resize_image, ge
 from save_pdfs import save_pdf_locally, validate_pdf, extract_pdf_text_local
 from whatsapp import is_whatsapp_conversation
 from tasks import generate_pdf_task, generate_mp3_task
+from chat_warmup import (
+    WarmupCacheKey,
+    get_or_prepare as warmup_get_or_prepare,
+    get_snapshot as get_warmup_snapshot,
+    get_ttl_seconds as get_warmup_ttl_seconds,
+    mark_consumed as mark_warmup_consumed,
+    mark_error as mark_warmup_error,
+    mark_skipped as mark_warmup_skipped,
+    normalize_model_ids as normalize_warmup_model_ids,
+)
+from atagia_bridge import get_atagia_bridge
 
 # aiohttp logging for HTTP calls
 aiohttp_logger = logging.getLogger('aiohttp')
@@ -105,6 +119,122 @@ def safe_log_headers(headers: dict) -> dict:
         else:
             safe[k] = v
     return safe
+
+
+def _positive_int(value, default: int | None = None) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _model_output_cap(max_output_tokens) -> tuple[int, bool]:
+    cap = _positive_int(max_output_tokens)
+    if cap:
+        return cap, False
+    return int(MAX_TOKENS), True
+
+
+def assert_billable_claude_system_key(
+    *,
+    machine: str | None,
+    model: str | None,
+    llm_id: int | None,
+    is_byok: bool,
+    input_token_cost: float,
+    output_token_cost: float,
+) -> str | None:
+    """Return an error when a system-key Claude row would bill as free."""
+    try:
+        input_cost = float(input_token_cost or 0.0)
+        output_cost = float(output_token_cost or 0.0)
+    except (TypeError, ValueError):
+        input_cost = 0.0
+        output_cost = 0.0
+
+    if machine != "Claude":
+        return None
+    if is_byok:
+        return None
+    if input_cost == 0 and output_cost == 0:
+        return (
+            "LLM configuration error: Claude system-key model has zero pricing "
+            f"(llm_id={llm_id} model={model}). Refusing to bill as free."
+        )
+    return None
+
+
+def _log_output_limit_decision(
+    *,
+    source: str,
+    conversation_id: int,
+    llm_id,
+    machine: str,
+    model: str,
+    max_output_tokens,
+    fallback_used: bool,
+    final_limit: int,
+    balance_limited: bool,
+    current_balance=None,
+):
+    logger.info(
+        "[output_limit] source=%s conversation_id=%s llm_id=%s machine=%s model=%s "
+        "catalog_max_output_tokens=%s fallback_used=%s final_limit=%s balance_limited=%s balance=%s",
+        source,
+        conversation_id,
+        llm_id,
+        machine,
+        model,
+        max_output_tokens,
+        fallback_used,
+        final_limit,
+        balance_limited,
+        current_balance,
+    )
+
+
+def _log_truncated_response(provider: str, model: str, conversation_id: int, llm_id, reason: str, max_tokens: int):
+    logger.warning(
+        "[output_truncated] provider=%s model=%s conversation_id=%s llm_id=%s reason=%s request_limit=%s",
+        provider,
+        model,
+        conversation_id,
+        llm_id,
+        reason,
+        max_tokens,
+    )
+
+
+def _extract_human_error_message(raw_body: str, status_code: int, provider_label: str) -> str:
+    """Extract a clean, user-facing error message from a provider error body."""
+    if not raw_body or not raw_body.strip():
+        return f"{provider_label} service error ({status_code})."
+
+    try:
+        parsed = orjson.loads(raw_body)
+        if isinstance(parsed, dict):
+            error_obj = parsed.get("error")
+            if isinstance(error_obj, dict):
+                message = error_obj.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+            top_level_message = parsed.get("message")
+            if isinstance(top_level_message, str) and top_level_message.strip():
+                return top_level_message.strip()
+    except Exception:
+        pass
+
+    return f"{provider_label} service error ({status_code}). Please try again."
+
+
+def _human_exception_error(exc: Exception, provider_label: str) -> str:
+    """Map caught transport/runtime exceptions to user-facing messages."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"{provider_label} took too long to respond. Please try again or shorten your message."
+    if isinstance(exc, aiohttp.ClientError):
+        return f"{provider_label} connection error. Please check your network and retry."
+    return f"{provider_label} unexpected error. Please try again."
 
 
 def filter_invalid_context_messages(context_messages: list) -> list:
@@ -231,6 +361,597 @@ def save_text_file_locally(current_user, conversation_id: int, content: str, fil
 # ---------------------------------------------------------------------------
 # Shared helpers (request-free, used by both web path and external channels)
 # ---------------------------------------------------------------------------
+
+_WARMUP_ACTIVITIES = {"typing", "attachment", "audio_recording", "voice_call"}
+
+
+def _coerce_nonnegative_int(value: Any, default: int = 0, maximum: int = 10_000_000) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0:
+        return default
+    return min(parsed, maximum)
+
+
+def _sanitize_warmup_payload(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        return None, "Warm-up payload must be a JSON object."
+
+    activity = payload.get("activity", "typing")
+    if activity not in _WARMUP_ACTIVITIES:
+        return None, "Invalid warm-up activity."
+
+    attachment_kinds = payload.get("attachment_kinds") or []
+    if not isinstance(attachment_kinds, list):
+        attachment_kinds = []
+    clean_kinds = []
+    for kind in attachment_kinds[:16]:
+        if not isinstance(kind, str):
+            continue
+        normalized = re.sub(r"[^a-z0-9_-]", "", kind.lower())[:32]
+        if normalized:
+            clean_kinds.append(normalized)
+
+    multi_ai_model_ids = normalize_warmup_model_ids(payload.get("multi_ai_model_ids"))
+
+    return {
+        "activity": activity,
+        "draft_length": _coerce_nonnegative_int(payload.get("draft_length")),
+        "has_attachments": bool(payload.get("has_attachments")),
+        "attachment_kinds": clean_kinds,
+        "multi_ai_model_ids": multi_ai_model_ids,
+        "last_known_message_id": _coerce_nonnegative_int(payload.get("last_known_message_id")),
+    }, None
+
+
+def _warmup_mode_from_model_ids(model_ids: tuple[int, ...]) -> str:
+    return "multi" if len(model_ids) >= 2 else "single"
+
+
+def _build_warmup_cache_key_from_state(
+    state: dict[str, Any],
+    user_id: int,
+    conversation_id: int,
+    mode: str = "single",
+    multi_ai_model_ids: tuple[int, ...] | list[int] | None = None,
+) -> WarmupCacheKey:
+    return WarmupCacheKey(
+        user_id=int(user_id),
+        conversation_id=int(conversation_id),
+        llm_id=int(state.get("llm_id") or 0),
+        effective_prompt_id=int(state.get("effective_prompt_id") or 0),
+        active_extension_id=int(state.get("active_extension_id") or 0),
+        last_message_id=int(state.get("last_message_id") or 0),
+        mode=mode,
+        multi_ai_model_ids=normalize_warmup_model_ids(multi_ai_model_ids),
+    )
+
+
+_ATAGIA_CONTEXT_HEADER = "[ATAGIA MEMORY CONTEXT - INTERNAL]"
+_ATAGIA_CONTEXT_FOOTER = "[/ATAGIA MEMORY CONTEXT]"
+
+
+def _message_text_for_atagia(value: Any) -> str:
+    """Convert Aurvek's stored/provider message shape into safe Atagia text."""
+    if value is None:
+        return ""
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = orjson.loads(stripped)
+            except orjson.JSONDecodeError:
+                return value
+            parsed_text = _message_text_for_atagia(parsed)
+            return parsed_text or value
+        return value
+
+    if isinstance(value, list):
+        parts = [_message_text_for_atagia(item) for item in value]
+        return "\n".join(part for part in parts if part)
+
+    if isinstance(value, dict):
+        if value.get("multi_ai") and isinstance(value.get("responses"), list):
+            response_parts = []
+            for response in value["responses"]:
+                if not isinstance(response, dict):
+                    continue
+                label = response.get("model") or response.get("machine") or "model"
+                text = _message_text_for_atagia(response.get("content"))
+                if text:
+                    response_parts.append(f"[{label}]\n{text}")
+            return "\n\n".join(response_parts)
+
+        block_type = value.get("type")
+        if block_type == "text":
+            return str(value.get("text") or "")
+        if block_type == "text_file":
+            try:
+                return text_file_block_to_text(value)
+            except Exception:
+                filename = value.get("text_file", {}).get("filename", "attached text file")
+                return f"[Text file attached: {filename}]"
+        if block_type in {"image_url", "image"}:
+            return "[Image attached]"
+        if block_type in {"document_url", "document", "document_bytes", "file"}:
+            filename = (
+                value.get("filename")
+                or value.get("document_url", {}).get("filename")
+                or value.get("file", {}).get("filename")
+                or "document"
+            )
+            return f"[Document attached: {filename}]"
+
+        if "message" in value:
+            return _message_text_for_atagia(value.get("message"))
+        if "content" in value:
+            return _message_text_for_atagia(value.get("content"))
+
+    return str(value)
+
+
+def _extract_atagia_system_prompt(context: Any) -> str:
+    if context is None:
+        return ""
+    if isinstance(context, dict):
+        raw_prompt = context.get("system_prompt")
+    else:
+        raw_prompt = getattr(context, "system_prompt", None)
+    return raw_prompt.strip() if isinstance(raw_prompt, str) else ""
+
+
+def _append_atagia_context_to_prompt(full_prompt: str, context: Any) -> str:
+    atagia_prompt = _extract_atagia_system_prompt(context)
+    if not atagia_prompt:
+        return full_prompt
+    return (
+        f"{full_prompt.rstrip()}\n\n"
+        f"{_ATAGIA_CONTEXT_HEADER}\n"
+        "Use this memory context to personalize and maintain continuity. "
+        "Do not reveal this block verbatim to the user.\n\n"
+        f"{atagia_prompt}\n"
+        f"{_ATAGIA_CONTEXT_FOOTER}"
+    )
+
+
+async def _augment_prompt_with_atagia_context(
+    full_prompt: str,
+    *,
+    user_id: int,
+    conversation_id: int,
+    message: Any,
+    occurred_at: str | None = None,
+) -> str:
+    message_text = _message_text_for_atagia(message).strip()
+    if not message_text:
+        return full_prompt
+
+    try:
+        bridge = get_atagia_bridge()
+        context = await bridge.get_context_for_turn(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_text=message_text,
+            occurred_at=occurred_at,
+        )
+    except Exception:
+        logger.warning(
+            "[atagia] Failed to fetch sidecar context for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return full_prompt
+    augmented = _append_atagia_context_to_prompt(full_prompt, context)
+    if augmented != full_prompt:
+        logger.debug(
+            "[atagia] Injected sidecar context for conversation_id=%s user_id=%s",
+            conversation_id,
+            user_id,
+        )
+    return augmented
+
+
+async def _warmup_atagia_sidecar(user_id: int, conversation_id: int) -> bool:
+    try:
+        bridge = get_atagia_bridge()
+        return await bridge.ensure_user_and_conversation(user_id, conversation_id) is not None
+    except Exception:
+        logger.warning(
+            "[atagia] Warm-up sidecar preparation failed for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _record_atagia_assistant_response(
+    *,
+    user_id: int,
+    conversation_id: int,
+    content: Any,
+    occurred_at: str | None = None,
+) -> bool:
+    response_text = _message_text_for_atagia(content).strip()
+    if not response_text:
+        return False
+
+    try:
+        bridge = get_atagia_bridge()
+        return await bridge.record_assistant_response(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            response_text=response_text,
+            occurred_at=occurred_at,
+        )
+    except Exception:
+        logger.warning(
+            "[atagia] Failed to record assistant response for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _load_warmup_conversation_state(conversation_id: int, user_id: int) -> dict[str, Any] | None:
+    async with get_db_connection(readonly=True) as conn_ro:
+        cursor = await conn_ro.execute(
+            """
+            SELECT
+                c.id AS conversation_id,
+                c.locked,
+                c.user_id,
+                c.llm_id,
+                c.chat_name,
+                c.role_id,
+                CASE
+                    WHEN c.role_id IS NULL THEN ud.current_prompt_id
+                    ELSE c.role_id
+                END AS effective_prompt_id,
+                c.active_extension_id,
+                L.machine,
+                L.model,
+                COALESCE(L.input_token_cost, 0) AS input_token_cost,
+                COALESCE(L.output_token_cost, 0) AS output_token_cost,
+                COALESCE(p.enable_moderation, 0) AS enable_moderation,
+                COALESCE(p.is_paid, 0) AS prompt_is_paid,
+                COALESCE(p.gransabio_enabled, 0) AS gransabio_enabled,
+                COALESCE(p.disable_web_search, 0) AS disable_web_search,
+                COALESCE(p.force_web_search, 0) AS force_web_search,
+                COALESCE(ud.web_search_enabled, 1) AS user_web_search_enabled,
+                COALESCE(ud.web_search_mode, 'native') AS web_search_mode,
+                (
+                    SELECT COALESCE(MAX(m.id), 0)
+                    FROM MESSAGES m
+                    WHERE m.conversation_id = c.id
+                ) AS last_message_id
+            FROM CONVERSATIONS c
+            JOIN LLM L ON c.llm_id = L.id
+            LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
+            LEFT JOIN PROMPTS p ON p.id = COALESCE(c.role_id, ud.current_prompt_id)
+            WHERE c.id = ? AND c.user_id = ?
+            """,
+            (conversation_id, user_id),
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def _load_warmup_context_messages(conversation_id: int, start_date: datetime) -> list[dict[str, Any]]:
+    async with get_db_connection(readonly=True) as conn_ro:
+        cursor = await conn_ro.execute(
+            """
+            SELECT message, type
+            FROM messages
+            WHERE conversation_id = ?
+            AND date >= ?
+            ORDER BY id ASC, date ASC
+            """,
+            (conversation_id, start_date),
+        )
+        rows = await cursor.fetchall()
+
+    messages = [
+        {"message": parse_stored_message(custom_unescape(row[0])), "type": row[1]}
+        for row in rows
+    ]
+    return flatten_multi_ai_context(messages)
+
+
+async def _load_warmup_prompt_runtime_snapshot(
+    conversation_id: int,
+    current_user: User,
+    effective_prompt_id: int | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "effective_prompt_id": effective_prompt_id,
+        "prompt_base": "",
+        "full_prompt": "",
+        "system_blocks_count": 0,
+        "web_search": {
+            "disable_web_search": False,
+            "force_web_search": False,
+            "user_web_search_enabled": True,
+            "web_search_mode": "native",
+        },
+        "extensions": {
+            "enabled": False,
+            "auto_advance": False,
+            "free_selection": True,
+            "active_extension_id": None,
+            "has_levels": False,
+        },
+        "watchdog": {
+            "post_enabled": False,
+            "pre_enabled": False,
+            "hint_active": False,
+            "hint_eval_id": None,
+            "config": None,
+        },
+        "gransabio_config_raw": None,
+        "memory_context": [],
+    }
+
+    async with get_db_connection(readonly=True) as conn_ro:
+        cursor = await conn_ro.execute(
+            """
+            SELECT
+                p.prompt,
+                p.gransabio_config,
+                p.watchdog_config,
+                COALESCE(p.disable_web_search, 0) AS disable_web_search,
+                COALESCE(p.force_web_search, 0) AS force_web_search,
+                COALESCE(p.extensions_enabled, 0) AS extensions_enabled,
+                COALESCE(p.extensions_auto_advance, 0) AS extensions_auto_advance,
+                COALESCE(p.extensions_free_selection, 1) AS extensions_free_selection,
+                u.user_info,
+                u.role_id AS user_role_id,
+                ud.current_alter_ego_id,
+                COALESCE(ud.web_search_enabled, 1) AS user_web_search_enabled,
+                COALESCE(ud.web_search_mode, 'native') AS web_search_mode,
+                c.active_extension_id,
+                pe.name AS extension_name,
+                pe.prompt_text AS extension_prompt_text
+            FROM CONVERSATIONS c
+            LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
+            LEFT JOIN USERS u ON u.id = c.user_id
+            LEFT JOIN PROMPTS p ON p.id = ?
+            LEFT JOIN PROMPT_EXTENSIONS pe ON c.active_extension_id = pe.id
+            WHERE c.id = ? AND c.user_id = ?
+            """,
+            (effective_prompt_id, conversation_id, current_user.id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return result
+
+        data = dict(row)
+        raw_prompt = data.get("prompt") or ""
+        user_info = data.get("user_info")
+        current_alter_ego_id = data.get("current_alter_ego_id")
+        extensions_enabled = bool(data.get("extensions_enabled"))
+        extensions_auto_advance = bool(data.get("extensions_auto_advance"))
+        extensions_free_selection = bool(data.get("extensions_free_selection"))
+        active_extension_id = data.get("active_extension_id")
+        extension_name = data.get("extension_name")
+        extension_prompt_text = data.get("extension_prompt_text")
+        raw_watchdog_config = data.get("watchdog_config")
+
+        result["web_search"] = {
+            "disable_web_search": bool(data.get("disable_web_search")),
+            "force_web_search": bool(data.get("force_web_search")),
+            "user_web_search_enabled": bool(data.get("user_web_search_enabled")),
+            "web_search_mode": data.get("web_search_mode") or "native",
+        }
+        result["extensions"].update({
+            "enabled": extensions_enabled,
+            "auto_advance": extensions_auto_advance,
+            "free_selection": extensions_free_selection,
+            "active_extension_id": active_extension_id,
+        })
+        result["gransabio_config_raw"] = data.get("gransabio_config")
+
+        if await current_user.is_admin:
+            user_level = "admin"
+        elif await current_user.is_user:
+            user_level = "user"
+        else:
+            user_level = "customer"
+
+        if current_alter_ego_id:
+            cursor = await conn_ro.execute(
+                """
+                SELECT name, description
+                FROM USER_ALTER_EGOS
+                WHERE id = ? AND user_id = ?
+                """,
+                (current_alter_ego_id, current_user.id),
+            )
+            alter_ego_row = await cursor.fetchone()
+            if alter_ego_row:
+                alter_ego_name, alter_ego_description = alter_ego_row
+                if alter_ego_description:
+                    prompt_base = (
+                        f"User info:\nName: {alter_ego_name}\n{alter_ego_description}"
+                        f"\n\n-----\nSystem info:\n{raw_prompt}"
+                    )
+                else:
+                    prompt_base = f"User info:\nName: {alter_ego_name}\n\n-----\nSystem info:\n{raw_prompt}"
+            elif user_info:
+                prompt_base = f"User info:\n{user_info}\n\n-----\nSystem info:\n{raw_prompt}"
+            else:
+                prompt_base = raw_prompt
+        elif user_info:
+            prompt_base = f"User info:\n{user_info}\n\n-----\nSystem info:\n{raw_prompt}"
+        else:
+            prompt_base = raw_prompt
+
+        if extensions_enabled and extension_prompt_text:
+            prompt_base = (
+                f"{prompt_base}\n\n"
+                f"--- ACTIVE EXTENSION: {extension_name} ---\n"
+                f"{extension_prompt_text}\n"
+                f"--- END EXTENSION ---"
+            )
+
+        if extensions_enabled and extensions_auto_advance and effective_prompt_id:
+            cursor = await conn_ro.execute(
+                """
+                SELECT id, name, display_order, description
+                FROM PROMPT_EXTENSIONS
+                WHERE prompt_id = ?
+                ORDER BY display_order
+                """,
+                (effective_prompt_id,),
+            )
+            all_extensions = await cursor.fetchall()
+            if all_extensions:
+                result["extensions"]["has_levels"] = True
+                ext_list = "\n".join([
+                    f"  - [{ext[0]}] {ext[1]}{' (CURRENT)' if ext[0] == active_extension_id else ''}: {ext[3] or 'No description'}"
+                    for ext in all_extensions
+                ])
+                prompt_base += (
+                    "\n\n--- EXTENSION LEVELS ---\n"
+                    "This conversation has the following levels/phases. You are currently on the one marked (CURRENT).\n"
+                    "When you determine the current level's objectives are sufficiently covered, "
+                    "use the advanceExtension tool to transition to the next level.\n"
+                    f"{ext_list}\n"
+                    "--- END EXTENSION LEVELS ---"
+                )
+
+        watchdog_config = None
+        watchdog_hint_block = ""
+        watchdog_enabled = False
+        watchdog_hint_active = False
+        watchdog_hint_eval_id = None
+        pre_watchdog_config = None
+
+        if raw_watchdog_config:
+            try:
+                parsed_watchdog = (
+                    orjson.loads(raw_watchdog_config)
+                    if isinstance(raw_watchdog_config, (str, bytes, bytearray))
+                    else raw_watchdog_config
+                )
+                watchdog_config = extract_post_watchdog_config(parsed_watchdog)
+                pre_watchdog_config = extract_pre_watchdog_config(parsed_watchdog)
+            except (orjson.JSONDecodeError, TypeError, ValueError):
+                watchdog_config = None
+                pre_watchdog_config = None
+
+        if watchdog_config and watchdog_config.get("enabled"):
+            watchdog_enabled = True
+            cursor = await conn_ro.execute(
+                """
+                SELECT pending_hint, hint_severity, last_evaluated_message_id,
+                       consecutive_hint_count, pending_hint_event_type
+                FROM WATCHDOG_STATE
+                WHERE conversation_id = ? AND prompt_id = ?
+                AND pending_hint IS NOT NULL
+                """,
+                (conversation_id, effective_prompt_id),
+            )
+            hint_row = await cursor.fetchone()
+            if hint_row and hint_row[0]:
+                sanitized_hint = _sanitize_watchdog_directive(hint_row[0])
+                watchdog_hint_block = _build_escalated_hint_block(
+                    sanitized_hint, hint_row[1], hint_row[3] or 0
+                )
+                watchdog_hint_active = True
+                watchdog_hint_eval_id = hint_row[2]
+
+        blocks = await get_effective_blocks()
+        full_prompt = assemble_system_prompt(
+            blocks,
+            {"user_level": user_level},
+            prompt_base,
+            watchdog_enabled,
+            watchdog_hint_block,
+        )
+
+    result["prompt_base"] = prompt_base
+    result["full_prompt"] = full_prompt
+    result["system_blocks_count"] = len(blocks)
+    result["watchdog"] = {
+        "post_enabled": bool(watchdog_config and watchdog_config.get("enabled")),
+        "pre_enabled": bool(pre_watchdog_config and pre_watchdog_config.get("enabled")),
+        "hint_active": watchdog_hint_active,
+        "hint_eval_id": watchdog_hint_eval_id,
+        "config": watchdog_config,
+    }
+    return result
+
+
+async def _build_chat_warmup_snapshot(
+    conversation_id: int,
+    current_user: User,
+    state: dict[str, Any],
+    cache_key: WarmupCacheKey,
+    activity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context_months = 2
+    start_date = (
+        datetime.now(timezone.utc) - timedelta(days=context_months * 30)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    effective_prompt_id = state.get("effective_prompt_id")
+
+    context_messages, prompt_runtime, atagia_ready = await asyncio.gather(
+        _load_warmup_context_messages(conversation_id, start_date),
+        _load_warmup_prompt_runtime_snapshot(conversation_id, current_user, effective_prompt_id),
+        _warmup_atagia_sidecar(current_user.id, conversation_id),
+    )
+
+    return {
+        "cache_key": cache_key,
+        "conversation_id": conversation_id,
+        "user_id": current_user.id,
+        "mode": cache_key.mode,
+        "activity": activity or {},
+        "state": {
+            "llm_id": state.get("llm_id"),
+            "effective_prompt_id": effective_prompt_id,
+            "active_extension_id": state.get("active_extension_id"),
+            "last_message_id": state.get("last_message_id") or 0,
+            "machine": state.get("machine"),
+            "model": state.get("model"),
+            "chat_name": state.get("chat_name"),
+            "web_search": {
+                "disable_web_search": bool(state.get("disable_web_search")),
+                "force_web_search": bool(state.get("force_web_search")),
+                "user_web_search_enabled": bool(state.get("user_web_search_enabled")),
+                "web_search_mode": state.get("web_search_mode") or "native",
+            },
+        },
+        "context_messages": context_messages,
+        "context_count": len(context_messages),
+        "last_message_id": state.get("last_message_id") or 0,
+        "prompt_runtime": prompt_runtime,
+        "memory_context": [],
+        "sidecars": {
+            "atagia_ready": atagia_ready,
+        },
+    }
+
+
+def _copy_warmup_context_messages(snapshot: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    if not snapshot:
+        return None
+    context_messages = snapshot.get("context_messages")
+    if not isinstance(context_messages, list):
+        return None
+    return copy.deepcopy(context_messages)
+
 
 async def apply_rate_limit(user_id: int) -> tuple[bool, str | None]:
     """Apply rate limiting for AI calls. Wraps check_rate_limit().
@@ -850,6 +1571,18 @@ async def watchdog_takeover_response(
 
     wd_machine = wd_llm["machine"]
     wd_model = wd_llm["model"]
+    wd_max_tokens, wd_limit_fallback = _model_output_cap(wd_llm.get("max_output_tokens"))
+    _log_output_limit_decision(
+        source="watchdog_takeover",
+        conversation_id=conversation_id,
+        llm_id=wd_llm_id,
+        machine=wd_machine,
+        model=wd_model,
+        max_output_tokens=wd_llm.get("max_output_tokens"),
+        fallback_used=wd_limit_fallback,
+        final_limit=wd_max_tokens,
+        balance_limited=False,
+    )
 
     # 2. Resolve BYOK key for watchdog LLM
     api_key_mode = await get_user_api_key_mode(user_id)
@@ -859,6 +1592,19 @@ async def watchdog_takeover_response(
     if not resolved_key and not use_system:
         logger.error("watchdog takeover: no API key for %s", wd_machine)
         yield f"data: {orjson.dumps({'error': 'API key required for takeover LLM'}).decode()}\n\n"
+        return
+
+    wd_guard_error = assert_billable_claude_system_key(
+        machine=wd_machine,
+        model=wd_model,
+        llm_id=wd_llm_id,
+        is_byok=resolved_key is not None,
+        input_token_cost=wd_llm.get("input_token_cost", 0),
+        output_token_cost=wd_llm.get("output_token_cost", 0),
+    )
+    if wd_guard_error:
+        logger.error(wd_guard_error)
+        yield f"data: {orjson.dumps({'error': wd_guard_error}).decode()}\n\n"
         return
 
     # 3. Sanitize directive
@@ -911,7 +1657,7 @@ async def watchdog_takeover_response(
         "messages": api_messages,
         "model": wd_model,
         "temperature": 0.3,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": wd_max_tokens,
         "prompt": full_prompt,
         "conversation_id": conversation_id,
         "current_user": current_user,
@@ -1003,6 +1749,18 @@ async def watchdog_takeover_response_requestfree(
 
     wd_machine = wd_llm["machine"]
     wd_model = wd_llm["model"]
+    wd_max_tokens, wd_limit_fallback = _model_output_cap(wd_llm.get("max_output_tokens"))
+    _log_output_limit_decision(
+        source="watchdog_takeover_requestfree",
+        conversation_id=conversation_id,
+        llm_id=wd_llm_id,
+        machine=wd_machine,
+        model=wd_model,
+        max_output_tokens=wd_llm.get("max_output_tokens"),
+        fallback_used=wd_limit_fallback,
+        final_limit=wd_max_tokens,
+        balance_limited=False,
+    )
 
     # 2. Resolve BYOK key for watchdog LLM
     from tools.watchdog import _read_user_api_keys
@@ -1014,6 +1772,19 @@ async def watchdog_takeover_response_requestfree(
     if not resolved_key and not use_system:
         logger.error("watchdog takeover requestfree: no API key for %s", wd_machine)
         yield f"data: {orjson.dumps({'error': 'API key required for takeover LLM'}).decode()}\n\n"
+        return
+
+    wd_guard_error = assert_billable_claude_system_key(
+        machine=wd_machine,
+        model=wd_model,
+        llm_id=wd_llm_id,
+        is_byok=resolved_key is not None,
+        input_token_cost=wd_llm.get("input_token_cost", 0),
+        output_token_cost=wd_llm.get("output_token_cost", 0),
+    )
+    if wd_guard_error:
+        logger.error(wd_guard_error)
+        yield f"data: {orjson.dumps({'error': wd_guard_error}).decode()}\n\n"
         return
 
     # 3. Sanitize directive
@@ -1077,7 +1848,7 @@ async def watchdog_takeover_response_requestfree(
         "messages": api_messages,
         "model": wd_model,
         "temperature": 0.3,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": wd_max_tokens,
         "prompt": full_prompt,
         "conversation_id": conversation_id,
         "current_user": stub_user,
@@ -1236,6 +2007,115 @@ async def _validate_message_request(
     return None
 
 
+@router.post("/api/conversations/{conversation_id}/warmup")
+async def warmup_conversation_context(
+    request: Request,
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    payload: Any = Body(default={}),
+):
+    """Prepare read-only chat context for an imminent browser message send."""
+    if current_user is None:
+        return JSONResponse(content={'redirect': '/login'}, status_code=401)
+
+    token = request.cookies.get("session")
+    if not token:
+        return JSONResponse(content={'redirect': '/login'}, status_code=401)
+
+    try:
+        jwt_payload = decode_jwt_cached(token, SECRET_KEY)
+        if not verify_token_expiration(jwt_payload):
+            return JSONResponse(content={'redirect': '/login'}, status_code=401)
+    except JWTError:
+        return JSONResponse(content={'redirect': '/login'}, status_code=401)
+
+    activity_payload, payload_error = _sanitize_warmup_payload(payload)
+    if payload_error:
+        return JSONResponse(content={"success": False, "message": payload_error}, status_code=400)
+
+    if not await check_rate_limit(current_user.id, action="chat_warmup", limit=30, window_minutes=1):
+        mark_warmup_skipped()
+        rate_status = await get_rate_limit_status(
+            current_user.id,
+            action="chat_warmup",
+            limit=30,
+            window_minutes=1,
+        )
+        return JSONResponse(
+            content={
+                "success": False,
+                "status": "skipped",
+                "reason": "rate_limited",
+                "rate_limit": rate_status,
+            },
+            status_code=429,
+        )
+
+    state = await _load_warmup_conversation_state(conversation_id, current_user.id)
+    if not state:
+        mark_warmup_skipped()
+        return JSONResponse(
+            content={"success": False, "status": "skipped", "message": "Conversation not found."},
+            status_code=404,
+        )
+
+    if state.get("locked"):
+        mark_warmup_skipped()
+        return JSONResponse(
+            content={"success": False, "status": "skipped", "message": "Conversation is locked."},
+            status_code=403,
+        )
+
+    multi_ai_model_ids = activity_payload["multi_ai_model_ids"]
+    mode = _warmup_mode_from_model_ids(multi_ai_model_ids)
+    cache_key = _build_warmup_cache_key_from_state(
+        state,
+        current_user.id,
+        conversation_id,
+        mode=mode,
+        multi_ai_model_ids=multi_ai_model_ids,
+    )
+
+    try:
+        snapshot, status = await warmup_get_or_prepare(
+            cache_key,
+            lambda: _build_chat_warmup_snapshot(
+                conversation_id,
+                current_user,
+                state,
+                cache_key,
+                activity_payload,
+            ),
+        )
+    except Exception:
+        mark_warmup_error()
+        logger.warning(
+            "[warmup] Failed to prepare context for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return JSONResponse(
+            content={
+                "success": False,
+                "status": "skipped",
+                "reason": "prepare_failed",
+            },
+            status_code=200,
+        )
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "status": status,
+            "ttl_seconds": get_warmup_ttl_seconds(),
+            "conversation_id": conversation_id,
+            "last_message_id": state.get("last_message_id") or 0,
+            "context_count": (snapshot or {}).get("context_count", 0),
+            "mode": mode,
+        }
+    )
+
+
 def _convert_to_jpeg_b64(image_data_b64: str) -> str:
     """Convert a base64-encoded image (any format) to JPEG base64.
 
@@ -1295,6 +2175,80 @@ def _maybe_compress_image(
     return image_data, mt, False
 
 
+_SERVER_SHRINK_MAX_STEPS = 10
+
+
+def _encode_and_shrink_webp_to_fit(
+    img: PilImage.Image, w: int, h: int, max_api_bytes: int, max_steps: int
+) -> tuple[bytes, int, int]:
+    """Encode a decoded PIL image as WebP q=90 and shrink-loop until the bytes
+    fit the API byte budget, or until max_steps is reached.
+
+    CC2 (round 6): extracted so it can be called on EVERY outbound path that
+    crosses the API byte budget, not only the resize/EXIF branch. Closes the
+    structural bypass where images arriving <=MAX_CHAT_IMAGE_DIMENSION with no
+    EXIF rotation skipped the shrink loop and could still 400 at the post-check
+    in process_save_message (search for `len(image_data) > MAX_API_IMAGE_SIZE_MB`).
+
+    G2 (round 9): preserves a reference to the incoming image as base_img and
+    recalculates each shrink attempt's target dimensions from the ORIGINAL
+    base_w / base_h via a cumulative ratio 0.85 ** step. Pillow's Image.resize()
+    returns a NEW image object and does not mutate the original, so base_img
+    stays pristine across iterations. Before G2, the loop overwrote img with
+    the shrunk version on each step, so iteration N resized iteration (N-1)'s
+    already-lossy output, stacking LANCZOS passes plus WebP q=90 re-encodes.
+    That compounded blur unnecessarily in a PR whose visible effect is already
+    "reduced resolution". After G2, each attempt is exactly ONE lossy resize
+    from the base + ONE lossy WebP encode. CPU cost per iteration is slightly
+    higher (resize-from-base operates on more pixels than resize-from-previous),
+    but the loop is bounded by max_steps=10 and the perceptual quality gain is
+    worth it for an image-resize PR. Do NOT "optimize" this back to
+    img = img.resize(...) inside the loop.
+
+    Args:
+        img: Decoded PIL.Image, already loaded. Caller is responsible for
+             normalizing mode to RGB / RGBA before calling. Acts as base_img
+             from which every shrink attempt re-derives its target dimensions.
+        w, h: Current dimensions of img (caller passes them so we don't re-read).
+        max_api_bytes: Byte budget the encoded WebP must fit under.
+        max_steps: Maximum shrink iterations before giving up. The post-check
+                   inside process_save_message still catches the never-converged
+                   case with a user-friendly 400.
+
+    Returns:
+        Tuple (image_data: bytes, w: int, h: int) with the final WebP bytes
+        and the final dimensions after any shrink iterations. The bytes may
+        still exceed max_api_bytes if the loop did not converge; the caller
+        hands that case off to the post-check.
+    """
+    base_img = img
+    base_w, base_h = w, h
+
+    buf = io.BytesIO()
+    base_img.save(buf, format="WEBP", quality=90)
+    image_data = buf.getvalue()
+
+    shrink_step = 0
+    while len(image_data) > max_api_bytes and shrink_step < max_steps:
+        if base_w <= 1 or base_h <= 1:
+            break
+        shrink_step += 1
+        ratio = 0.85 ** shrink_step
+        target_w = max(1, round(base_w * ratio))
+        target_h = max(1, round(base_h * ratio))
+        attempt_img = base_img.resize((target_w, target_h), PilImage.LANCZOS)
+        buf = io.BytesIO()
+        attempt_img.save(buf, format="WEBP", quality=90)
+        image_data = buf.getvalue()
+        w, h = target_w, target_h
+        logger.debug(
+            f"[_encode_and_shrink_webp_to_fit] Shrink step {shrink_step}: "
+            f"{w}x{h}, {len(image_data)} bytes"
+        )
+
+    return image_data, w, h
+
+
 def _validate_and_compress_image(
     image_data: bytes, filename: str
 ) -> tuple[bytes, str, int, int, str, bool]:
@@ -1306,30 +2260,67 @@ def _validate_and_compress_image(
     Raises:
         ValueError: with user-facing error message on validation failure.
     """
-    MAX_IMAGE_DIMENSION = 8000
-
     try:
         img = PilImage.open(io.BytesIO(image_data))
         w, h = img.size
         actual_format = img.format
-        # DO NOT call img.load() yet -- validate first to avoid decompressing pixel bombs
     except Exception:
         raise ValueError(f"Invalid image file: {filename}")
-
-    if w > MAX_IMAGE_DIMENSION or h > MAX_IMAGE_DIMENSION:
-        raise ValueError(f"Image dimensions exceed {MAX_IMAGE_DIMENSION}px limit.")
 
     if w * h > MAX_IMAGE_PIXELS:
         raise ValueError("Image resolution is too high.")
 
-    # NOW safe to load pixels (validated dimensions are within bounds)
     try:
-        img.load()
+        orientation = img.getexif().get(ExifBase.Orientation, 1)
+    except Exception:
+        orientation = 1
+
+    needs_reencode_for_exif = orientation != 1
+
+    try:
+        if needs_reencode_for_exif:
+            img = ImageOps.exif_transpose(img)
+            w, h = img.size
+        else:
+            img.load()
     except Exception:
         raise ValueError(f"Invalid image file: {filename}")
 
-    # Auto-compress
+    resized_now = False
+    if max(w, h) > MAX_CHAT_IMAGE_DIMENSION:
+        ratio = MAX_CHAT_IMAGE_DIMENSION / max(w, h)
+        new_w = max(1, round(w * ratio))
+        new_h = max(1, round(h * ratio))
+        logger.debug(f"[_validate_and_compress_image] Resizing {w}x{h} -> {new_w}x{new_h}")
+        img = img.resize((new_w, new_h), PilImage.LANCZOS)
+        w, h = new_w, new_h
+        resized_now = True
+
+    max_api_bytes = MAX_API_IMAGE_SIZE_MB * 1024 * 1024
+
+    if resized_now or needs_reencode_for_exif:
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA") if (
+                img.mode in ("PA", "LA") or img.info.get("transparency") is not None
+            ) else img.convert("RGB")
+
+        image_data, w, h = _encode_and_shrink_webp_to_fit(
+            img, w, h, max_api_bytes, _SERVER_SHRINK_MAX_STEPS
+        )
+        return image_data, "image/webp", w, h, "WEBP", True
+
     image_data, media_type, was_compressed = _maybe_compress_image(img, image_data, actual_format)
+
+    if len(image_data) > max_api_bytes:
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA") if (
+                img.mode in ("PA", "LA") or img.info.get("transparency") is not None
+            ) else img.convert("RGB")
+
+        image_data, w, h = _encode_and_shrink_webp_to_fit(
+            img, w, h, max_api_bytes, _SERVER_SHRINK_MAX_STEPS
+        )
+        return image_data, "image/webp", w, h, "WEBP", True
 
     return image_data, media_type, w, h, actual_format, was_compressed
 
@@ -1567,7 +2558,9 @@ async def process_save_message(
             return guard_response
 
     context_months = 2
-    start_date = datetime.utcnow() - timedelta(days=context_months * 30)
+    start_date = (
+        datetime.now(timezone.utc) - timedelta(days=context_months * 30)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
 
     global stop_signals, MAX_TOKENS
     # NOTE: stop_signals reset is deferred until AFTER the DB query resolves
@@ -1628,7 +2621,16 @@ async def process_save_message(
         logger.info("right after get_db_connection")
         # Consolidate SQL queries into one
         async with conn_ro.execute('''
-            SELECT c.locked, c.llm_id, c.user_id, c.chat_name, L.machine, L.model, COALESCE(L.input_token_cost, 0), COALESCE(L.output_token_cost, 0),
+            SELECT c.locked, c.llm_id, c.user_id, c.chat_name,
+                   CASE WHEN c.role_id IS NULL THEN ud.current_prompt_id ELSE c.role_id END AS effective_prompt_id,
+                   c.active_extension_id,
+                   (
+                       SELECT COALESCE(MAX(m.id), 0)
+                       FROM messages m
+                       WHERE m.conversation_id = c.id
+                   ) AS last_message_id,
+                   L.machine, L.model, COALESCE(L.input_token_cost, 0), COALESCE(L.output_token_cost, 0),
+                   COALESCE(L.max_output_tokens, 0),
                    COALESCE(ep.enable_moderation, 0) AS enable_moderation,
                    COALESCE(ep.is_paid, 0) AS is_paid,
                    COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled
@@ -1642,7 +2644,23 @@ async def process_save_message(
             if not conversation_row:
                 return JSONResponse(content={'success': False, 'message': 'Conversation not found.'}, status_code=404)
 
-            is_locked, conversation_llm_id, conversation_user_id, chat_name, machine, model, input_token_cost, output_token_cost, enable_moderation, prompt_is_paid, gransabio_enabled_col = conversation_row
+            (
+                is_locked,
+                conversation_llm_id,
+                conversation_user_id,
+                chat_name,
+                effective_prompt_id,
+                active_extension_id,
+                last_message_id,
+                machine,
+                model,
+                input_token_cost,
+                output_token_cost,
+                llm_max_output_tokens,
+                enable_moderation,
+                prompt_is_paid,
+                gransabio_enabled_col,
+            ) = conversation_row
 
         if is_locked:
             logger.info(f"Ignored message to conversation ID {conversation_id}, Locked state: {is_locked}")
@@ -1662,6 +2680,7 @@ async def process_save_message(
                     input_tokens += int(len(f['data']) / 4 * 1.1 + 0.5)
 
         current_balance = await get_balance(current_user.id)
+        model_output_cap, output_limit_fallback_used = _model_output_cap(llm_max_output_tokens)
 
         # GranSabio early detection
         gransabio_enabled_early = bool(gransabio_enabled_col)
@@ -1693,7 +2712,19 @@ async def process_save_message(
                     content={'success': False, 'message': 'Insufficient balance.'},
                     status_code=402
                 )
-            output_tokens = MAX_TOKENS
+            output_tokens = model_output_cap
+            _log_output_limit_decision(
+                source="single_gransabio",
+                conversation_id=conversation_id,
+                llm_id=conversation_llm_id,
+                machine=machine,
+                model=model,
+                max_output_tokens=llm_max_output_tokens,
+                fallback_used=output_limit_fallback_used,
+                final_limit=int(output_tokens),
+                balance_limited=False,
+                current_balance=current_balance,
+            )
         else:
             # Detect if PDF redirect will happen (GPT/xAI + PDFs present)
             pdf_redirect_will_happen = False
@@ -1733,26 +2764,67 @@ async def process_save_message(
                 if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
                     return JSONResponse(content={'success': False, 'message': 'Insufficient balance for creator markup.'}, status_code=402)
                 # For free prompts with BYOK, no balance needed at all
-                output_tokens = MAX_TOKENS
+                output_tokens = model_output_cap
                 logger.debug(f"BYOK mode: max_tokens={output_tokens}, Balance: {current_balance}")
+                _log_output_limit_decision(
+                    source="single_byok",
+                    conversation_id=conversation_id,
+                    llm_id=conversation_llm_id,
+                    machine=machine,
+                    model=model,
+                    max_output_tokens=llm_max_output_tokens,
+                    fallback_used=output_limit_fallback_used,
+                    final_limit=int(output_tokens),
+                    balance_limited=False,
+                    current_balance=current_balance,
+                )
             else:
                 input_cost = (input_tokens / 1000000) * input_token_cost
+
+                guard_error = assert_billable_claude_system_key(
+                    machine=machine,
+                    model=model,
+                    llm_id=conversation_llm_id,
+                    is_byok=is_byok,
+                    input_token_cost=input_token_cost,
+                    output_token_cost=output_token_cost,
+                )
+                if guard_error:
+                    logger.error(guard_error)
+                    return JSONResponse(
+                        content={'success': False, 'message': guard_error},
+                        status_code=500,
+                    )
 
                 if input_token_cost == 0 and output_token_cost == 0:
                     # Free model: no API cost. Only need balance for paid prompt markup.
                     if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
                         return JSONResponse(content={'success': False, 'message': 'Insufficient balance for creator markup.'}, status_code=402)
-                    output_tokens = MAX_TOKENS
+                    output_tokens = model_output_cap
                     total_cost = 0
                     logger.debug(f"Free model: max_tokens={output_tokens}, Balance: {current_balance}")
+                    _log_output_limit_decision(
+                        source="single_free",
+                        conversation_id=conversation_id,
+                        llm_id=conversation_llm_id,
+                        machine=machine,
+                        model=model,
+                        max_output_tokens=llm_max_output_tokens,
+                        fallback_used=output_limit_fallback_used,
+                        final_limit=int(output_tokens),
+                        balance_limited=False,
+                        current_balance=current_balance,
+                    )
                 else:
                     # Validate output_token_cost to prevent division by zero
                     if output_token_cost is None or output_token_cost <= 0:
                         logger.error(f"Invalid output_token_cost ({output_token_cost}) for LLM {conversation_llm_id}")
                         return JSONResponse(content={'success': False, 'message': 'LLM configuration error: invalid token cost'}, status_code=500)
 
-                    max_affordable_tokens = ((current_balance - input_cost) / output_token_cost) * 1000000
-                    output_tokens = min(MAX_TOKENS, max(0, max_affordable_tokens))  # Ensure non-negative
+                    max_affordable_tokens = int(((current_balance - input_cost) / output_token_cost) * 1000000)
+                    output_tokens = int(min(model_output_cap, max(0, max_affordable_tokens)))  # Ensure non-negative
+                    if output_tokens < 1:
+                        return JSONResponse(content={'success': False, 'message': 'Insufficient balance to send the message.'}, status_code=402)
                     output_cost = (output_tokens / 1000000) * output_token_cost
                     total_cost = input_cost + output_cost
 
@@ -1760,20 +2832,56 @@ async def process_save_message(
                         return JSONResponse(content={'success': False, 'message': 'Insufficient balance to send the message.'}, status_code=402)
 
                     logger.debug(f"Total cost: {total_cost}, Balance: {current_balance}")
+                    _log_output_limit_decision(
+                        source="single_paid",
+                        conversation_id=conversation_id,
+                        llm_id=conversation_llm_id,
+                        machine=machine,
+                        model=model,
+                        max_output_tokens=llm_max_output_tokens,
+                        fallback_used=output_limit_fallback_used,
+                        final_limit=int(output_tokens),
+                        balance_limited=max_affordable_tokens < model_output_cap,
+                        current_balance=current_balance,
+                    )
 
-        async with conn_ro.execute(
-            '''
-            SELECT message, type
-            FROM messages
-            WHERE conversation_id = ?
-            AND date >= ?
-            ORDER BY id ASC, date ASC
-            ''', (conversation_id, start_date)
-        ) as cursor:
-            context_messages = await cursor.fetchall()
+        warmup_state = {
+            "llm_id": conversation_llm_id,
+            "effective_prompt_id": effective_prompt_id,
+            "active_extension_id": active_extension_id,
+            "last_message_id": last_message_id or 0,
+        }
+        warmup_key = _build_warmup_cache_key_from_state(
+            warmup_state,
+            current_user.id,
+            conversation_id,
+            mode="single",
+        )
+        warmup_snapshot = get_warmup_snapshot(warmup_key)
+        context_messages_dicts = _copy_warmup_context_messages(warmup_snapshot)
+        if context_messages_dicts is not None:
+            mark_warmup_consumed()
+            logger.debug(
+                "[process_save_message] Reused warm-up context for conversation_id=%s",
+                conversation_id,
+            )
+        else:
+            async with conn_ro.execute(
+                '''
+                SELECT message, type
+                FROM messages
+                WHERE conversation_id = ?
+                AND date >= ?
+                ORDER BY id ASC, date ASC
+                ''', (conversation_id, start_date)
+            ) as cursor:
+                context_messages = await cursor.fetchall()
 
-    context_messages_dicts = [{"message": parse_stored_message(custom_unescape(msg[0])), "type": msg[1]} for msg in context_messages]
-    context_messages_dicts = flatten_multi_ai_context(context_messages_dicts)
+            context_messages_dicts = [
+                {"message": parse_stored_message(custom_unescape(msg[0])), "type": msg[1]}
+                for msg in context_messages
+            ]
+            context_messages_dicts = flatten_multi_ai_context(context_messages_dicts)
 
     if files:
         logger.debug("Has files")
@@ -1957,7 +3065,7 @@ async def process_save_message(
         message_to_save = user_message
         message_list_to_send = user_message
 
-    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
     # --- Start of Moderation API Integration ---
     # Per-prompt moderation setting (enable_moderation from PROMPTS table)
@@ -2088,7 +3196,7 @@ async def process_save_message(
         if updated_chat_name:
             yield f"data: {orjson.dumps({'updated_chat_name': updated_chat_name}).decode()}\n\n"
 
-        current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
         # Save the user's message and handle the flagged case
         if message_flagged:
@@ -2721,6 +3829,12 @@ async def build_full_prompt_context(
             full_prompt = assemble_system_prompt(
                 blocks, variables, prompt_base, watchdog_enabled, watchdog_hint_block
             )
+            full_prompt = await _augment_prompt_with_atagia_context(
+                full_prompt,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message=user_message,
+            )
 
     result["full_prompt"] = full_prompt
     result["watchdog_config"] = watchdog_config
@@ -3070,6 +4184,12 @@ async def get_ai_response(
                     variables = {"user_level": user_level}
                     full_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                                         watchdog_enabled, watchdog_hint_block)
+                    full_prompt = await _augment_prompt_with_atagia_context(
+                        full_prompt,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        message=message,
+                    )
 
                 else:
                     logger.error(f"[get_ai_response] - No conversation found with id {conversation_id} for user {user_id}")
@@ -4271,29 +5391,33 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
                         reasoning_tokens = usage.get('completion_tokens_details', {}).get('reasoning_tokens', 0)
 
                     else:
-                        error_message = "[call_o1_api] - Error: No choices in response"
-                        logger.error(error_message)
-                        yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                        logger.error("[call_o1_api] - OpenAI (o1) response had no choices array")
+                        yield f"data: {orjson.dumps({'error': 'OpenAI (o1) returned an empty response. Please try again.'}).decode()}\n\n"
                         error_yielded = True
                 else:
-                    error_message = f"[call_o1_api] - Error: Received status code {response.status}"
-                    logger.error(error_message)
-                    yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                    error_body = await response.text()
+                    raw_log = f"[call_o1_api] - Error: Received status code {response.status}. Response body: {error_body}"
+                    logger.error(raw_log)
+                    human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (o1)")
+                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                     error_yielded = True
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             error_msg = f"[call_o1_api] - Request timed out for conversation {conversation_id}"
             logger.error(error_msg)
-            yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (o1)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
-        except aiohttp.ClientError as e:
-            error_msg = f"[call_o1_api] - Connection error: {str(e)}"
+        except aiohttp.ClientError as exc:
+            error_msg = f"[call_o1_api] - Connection error: {str(exc)}"
             logger.error(error_msg)
-            yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (o1)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
-        except Exception as e:
-            error_msg = f"[call_o1_api] - Unexpected error: {str(e)}"
+        except Exception as exc:
+            error_msg = f"[call_o1_api] - Unexpected error: {str(exc)}"
             logger.error(error_msg)
-            yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (o1)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
     # Include reasoning_tokens in output_tokens and total_tokens
@@ -4325,7 +5449,7 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
         yield "data: [DONE]\n\n"
 
 
-async def call_llm_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, api_url, api_key, user_message=None, extra_headers=None, custom_timeout=None, tools=None,
+async def call_llm_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, api_url, api_key, provider_label, user_message=None, extra_headers=None, custom_timeout=None, tools=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                        llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None):
     """
@@ -4333,6 +5457,7 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
     Used by GPT, xAI, and OpenRouter.
 
     Args:
+        provider_label: Human-readable provider name for user-facing SSE errors.
         extra_headers: Additional headers to include (e.g., for OpenRouter)
         custom_timeout: Override the default timeout in seconds
         tools: List of tools in OpenAI format (optional). When provided,
@@ -4382,6 +5507,7 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
     content, function_name, function_arguments = "", "", ""
     tool_call_id = ""  # For tracking tool_calls
     input_tokens = output_tokens = total_tokens = 0
+    truncated = False
 
     logger.debug(f"call_llm_api -> messages: {messages}")
 
@@ -4471,6 +5597,17 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                                                         continue
                                                     elif finish_reason == 'stop':
                                                         continue
+                                                    elif finish_reason in {'length', 'max_tokens', 'max_completion_tokens'}:
+                                                        if not truncated:
+                                                            truncated = True
+                                                            _log_truncated_response(
+                                                                provider_label,
+                                                                model,
+                                                                conversation_id,
+                                                                llm_id,
+                                                                finish_reason,
+                                                                max_tokens,
+                                                            )
 
                                             # Handle usage information
                                             if 'usage' in chunk_data and chunk_data['usage'] and 'total_tokens' in chunk_data['usage']:
@@ -4486,9 +5623,10 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                                                 logger.error(f"[call_llm_api] - Error decoding JSON fragment: {e} , data: {data_part[:200]}...")
                 else:
                     error_body = await response.text()
-                    error_message = f"[call_llm_api] - Error: Received status code {response.status}. Response body: {error_body}"
-                    logger.error(error_message)
-                    yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                    raw_log = f"[call_llm_api] - Error: Received status code {response.status}. Response body: {error_body}"
+                    logger.error(raw_log)
+                    human_msg = _extract_human_error_message(error_body, response.status, provider_label)
+                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                     error_yielded = True
 
                     logger.error(f"Request details: URL: {api_url}, Headers: {safe_log_headers(headers)}, "
@@ -4502,22 +5640,25 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                     except:
                         logger.error("Could not parse error response as JSON")
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             error_message = f"[call_llm_api] - Request timed out after {timeout_seconds} seconds for model {model}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, provider_label)
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except aiohttp.ClientError as e:
-            error_message = f"[call_llm_api] - Network error occurred: {str(e)}"
+        except aiohttp.ClientError as exc:
+            error_message = f"[call_llm_api] - Network error occurred: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, provider_label)
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except Exception as e:
-            error_message = f"[call_llm_api] - Unexpected error: {str(e)}"
+        except Exception as exc:
+            error_message = f"[call_llm_api] - Unexpected error: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, provider_label)
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
     # If a tool call was detected, emit it and return without saving to DB
@@ -4579,7 +5720,8 @@ async def call_gpt_api(messages, model, temperature, max_tokens, prompt, convers
         request,
         api_url,
         api_key,
-        user_message,
+        "OpenAI (GPT)",
+        user_message=user_message,
         tools=tools,
         prompt_id=prompt_id,
         watchdog_config=watchdog_config,
@@ -4733,6 +5875,7 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
     tool_call_id = ""
     input_tokens = output_tokens = total_tokens = 0
     citations = []
+    truncated = False
 
     logger.info(f"call_gpt_responses_api -> model: {model}, tools: {len(tools) if tools else 0}")
 
@@ -4846,6 +5989,17 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                             # --- Completion ---
                             elif etype == "response.completed":
                                 resp = event_data.get("response", {})
+                                incomplete_reason = (resp.get("incomplete_details") or {}).get("reason")
+                                if not truncated and (resp.get("status") == "incomplete" or incomplete_reason in {"max_output_tokens", "max_tokens"}):
+                                    truncated = True
+                                    _log_truncated_response(
+                                        "OpenAI Responses",
+                                        model,
+                                        conversation_id,
+                                        llm_id,
+                                        incomplete_reason or resp.get("status") or "incomplete",
+                                        max_tokens,
+                                    )
 
                                 # Extract usage
                                 usage = resp.get("usage", {})
@@ -4877,6 +6031,13 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                                 yield f"data: {orjson.dumps({'error': f'OpenAI API error: {error_msg}'}).decode()}\n\n"
                                 error_yielded = True
 
+                            elif etype == "response.incomplete":
+                                resp = event_data.get("response", {})
+                                reason = (resp.get("incomplete_details") or {}).get("reason") or "incomplete"
+                                if not truncated:
+                                    truncated = True
+                                    _log_truncated_response("OpenAI Responses", model, conversation_id, llm_id, reason, max_tokens)
+
                             # --- Refusal ---
                             elif etype == "response.refusal.delta":
                                 delta = event_data.get("delta", "")
@@ -4886,27 +6047,31 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
 
                 else:
                     error_body = await response.text()
-                    error_message = f"[call_gpt_responses_api] Error: status {response.status}. Body: {error_body}"
-                    logger.error(error_message)
-                    yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                    raw_log = f"[call_gpt_responses_api] Error: status {response.status}. Body: {error_body}"
+                    logger.error(raw_log)
+                    human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (GPT)")
+                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                     error_yielded = True
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             error_message = f"[call_gpt_responses_api] Request timed out after {timeout_seconds}s for model {model}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (GPT)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except aiohttp.ClientError as e:
-            error_message = f"[call_gpt_responses_api] Network error: {str(e)}"
+        except aiohttp.ClientError as exc:
+            error_message = f"[call_gpt_responses_api] Network error: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (GPT)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except Exception as e:
-            error_message = f"[call_gpt_responses_api] Unexpected error: {str(e)}"
+        except Exception as exc:
+            error_message = f"[call_gpt_responses_api] Unexpected error: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "OpenAI (GPT)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
     # Emit citations if any were collected (native web search)
@@ -4971,7 +6136,8 @@ async def call_xai_api(messages, model, temperature, max_tokens, prompt, convers
         request,
         api_url,
         api_key,
-        user_message,
+        "xAI (Grok)",
+        user_message=user_message,
         tools=tools,
         prompt_id=prompt_id,
         watchdog_config=watchdog_config,
@@ -5044,6 +6210,7 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
     tool_call_id = ""
     input_tokens = output_tokens = total_tokens = 0
     citations = []
+    truncated = False
 
     logger.info(f"call_xai_responses_api -> model: {model}, tools: {len(tools) if tools else 0}")
 
@@ -5151,6 +6318,17 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                             # --- Completion ---
                             elif etype == "response.completed":
                                 resp = event_data.get("response", {})
+                                incomplete_reason = (resp.get("incomplete_details") or {}).get("reason")
+                                if not truncated and (resp.get("status") == "incomplete" or incomplete_reason in {"max_output_tokens", "max_tokens"}):
+                                    truncated = True
+                                    _log_truncated_response(
+                                        "xAI Responses",
+                                        model,
+                                        conversation_id,
+                                        llm_id,
+                                        incomplete_reason or resp.get("status") or "incomplete",
+                                        max_tokens,
+                                    )
                                 usage = resp.get("usage", {})
                                 input_tokens = usage.get("input_tokens", 0)
                                 output_tokens = usage.get("output_tokens", 0)
@@ -5185,6 +6363,13 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                                 yield f"data: {orjson.dumps({'error': f'xAI API error: {error_msg}'}).decode()}\n\n"
                                 error_yielded = True
 
+                            elif etype == "response.incomplete":
+                                resp = event_data.get("response", {})
+                                reason = (resp.get("incomplete_details") or {}).get("reason") or "incomplete"
+                                if not truncated:
+                                    truncated = True
+                                    _log_truncated_response("xAI Responses", model, conversation_id, llm_id, reason, max_tokens)
+
                             # --- Refusal ---
                             elif etype == "response.refusal.delta":
                                 delta = event_data.get("delta", "")
@@ -5194,27 +6379,31 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
 
                 else:
                     error_body = await response.text()
-                    error_message = f"[call_xai_responses_api] Error: status {response.status}. Body: {error_body}"
-                    logger.error(error_message)
-                    yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                    raw_log = f"[call_xai_responses_api] Error: status {response.status}. Body: {error_body}"
+                    logger.error(raw_log)
+                    human_msg = _extract_human_error_message(error_body, response.status, "xAI (Grok)")
+                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                     error_yielded = True
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             error_message = f"[call_xai_responses_api] Request timed out after {timeout_seconds}s for model {model}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "xAI (Grok)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except aiohttp.ClientError as e:
-            error_message = f"[call_xai_responses_api] Network error: {str(e)}"
+        except aiohttp.ClientError as exc:
+            error_message = f"[call_xai_responses_api] Network error: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "xAI (Grok)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
-        except Exception as e:
-            error_message = f"[call_xai_responses_api] Unexpected error: {str(e)}"
+        except Exception as exc:
+            error_message = f"[call_xai_responses_api] Unexpected error: {str(exc)}"
             logger.error(error_message)
-            yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+            human_msg = _human_exception_error(exc, "xAI (Grok)")
+            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
             error_yielded = True
 
     # Emit citations if any were collected
@@ -5309,7 +6498,8 @@ async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, 
         request,
         api_url,
         api_key,
-        user_message,
+        "OpenRouter",
+        user_message=user_message,
         extra_headers=extra_headers,
         custom_timeout=custom_timeout,
         tools=tools,
@@ -5345,21 +6535,17 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         "anthropic-version": "2023-06-01"
     }
 
-    # Determine provider cap, then respect caller-provided max_tokens
     model_lower = model.lower()
-    # Update when new Claude models are released with different output limits
-    if "opus-4-6" in model_lower:
-        provider_max_tokens = 128000
-    elif any(x in model_lower for x in ["sonnet-4-6", "sonnet-4-5", "opus-4-5", "sonnet-4-0", "sonnet-4"]):
-        provider_max_tokens = 64000
-    elif any(x in model_lower for x in ["3.7", "3-7", "opus-4-0", "opus-4-1", "opus-4"]):
-        provider_max_tokens = 32768
-    else:
-        provider_max_tokens = 8192
-    requested_max_tokens = int(max_tokens) if isinstance(max_tokens, (int, float)) else provider_max_tokens
-    if requested_max_tokens < 1:
-        requested_max_tokens = 1
-    model_max_tokens = min(provider_max_tokens, requested_max_tokens)
+    model_max_tokens = int(max_tokens) if isinstance(max_tokens, (int, float)) else int(MAX_TOKENS)
+    if model_max_tokens < 1:
+        model_max_tokens = 1
+
+    is_opus_4_7 = ("opus-4-7" in model_lower) or ("opus-4.7" in model_lower)
+    is_adaptive_capable = any(m in model_lower for m in (
+        "opus-4-7", "opus-4.7", "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"
+    ))
+    # Claude 4.6+ rejects/deprecates the temperature parameter; Anthropic recommends omitting it.
+    is_temperature_deprecated = is_adaptive_capable
 
     data = {
         "model": model,
@@ -5370,9 +6556,10 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
             "cache_control": {"type": "ephemeral"}
         }],
         "messages": messages,
-        "temperature": temperature,
         "stream": True
     }
+    if not is_temperature_deprecated:
+        data["temperature"] = temperature
 
     # Shallow copy to avoid mutating the caller's list when appending server tools below
     if tools:
@@ -5396,27 +6583,68 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         ]
 
         if any(model_part in model_lower for model_part in thinking_models):
-            adaptive_models = ["opus-4-6", "sonnet-4-6"]
-            is_adaptive = any(m in model_lower for m in adaptive_models)
-
-            if is_adaptive and thinking_budget_tokens == -1:
-                # -1 = "Auto" mode -> adaptive thinking (Claude decides budget)
+            if is_opus_4_7:
+                # Opus 4.7 only supports adaptive; manual budget_tokens is rejected.
+                if thinking_budget_tokens > 0:
+                    logger.info(
+                        "Opus 4.7 does not accept manual thinking budget; "
+                        "ignoring budget_tokens=%d and using adaptive.",
+                        thinking_budget_tokens,
+                    )
+                # display defaults to "omitted" on Opus 4.7, which would strip thinking text from
+                # the stream and break the UI render. Force "summarized" to keep reasoning visible.
+                data["thinking"] = {"type": "adaptive", "display": "summarized"}
+            elif is_adaptive_capable and thinking_budget_tokens == -1:
+                # Opus 4.6 / Sonnet 4.6 in Auto mode -> adaptive thinking (Claude decides budget)
                 data["thinking"] = {"type": "adaptive"}
             elif thinking_budget_tokens > 0:
-                # Manual budget: all models support this, explicit override on 4.6
+                # Manual budget for Claude 3.7 / 4.1 / 4.5 and legacy 4.6 manual overrides
                 # Ensure max_tokens > budget_tokens (API requirement)
+                anthropic_thinking_budget_min = 1024
+                min_required_max_tokens = anthropic_thinking_budget_min + 1
+                if thinking_budget_tokens < anthropic_thinking_budget_min:
+                    logger.error(
+                        "Manual thinking budget %d is below Anthropic's minimum of %d.",
+                        thinking_budget_tokens,
+                        anthropic_thinking_budget_min,
+                    )
+                    error_payload = {
+                        "error": (
+                            "Manual thinking budget must be at least "
+                            f"{anthropic_thinking_budget_min} tokens (got {thinking_budget_tokens})."
+                        )
+                    }
+                    yield f"data: {orjson.dumps(error_payload).decode()}\n\n"
+                    return
+                if data["max_tokens"] < min_required_max_tokens:
+                    logger.error(
+                        "Manual thinking requires max_tokens >= %d; got %d.",
+                        min_required_max_tokens,
+                        data["max_tokens"],
+                    )
+                    error_payload = {
+                        "error": (
+                            "Insufficient balance for extended thinking "
+                            f"(need at least {min_required_max_tokens} output tokens, "
+                            f"have {data['max_tokens']})."
+                        )
+                    }
+                    yield f"data: {orjson.dumps(error_payload).decode()}\n\n"
+                    return
                 if thinking_budget_tokens >= data["max_tokens"]:
-                    data["max_tokens"] = min(thinking_budget_tokens + 16384, provider_max_tokens)
+                    data["max_tokens"] = min(thinking_budget_tokens + 16384, model_max_tokens)
                 # Final safety: if budget still >= max_tokens after cap, clamp budget
                 actual_budget = min(thinking_budget_tokens, data["max_tokens"] - 1)
                 data["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": actual_budget
                 }
-            # else: -1 on non-adaptive model = no thinking (skip silently)
+            # else: -1 on non-adaptive-capable model = no thinking (skip silently)
 
             if "thinking" in data:
-                data["temperature"] = 1.0
+                if not is_temperature_deprecated:
+                    # Legacy models require temperature=1.0 when thinking is enabled
+                    data["temperature"] = 1.0
                 mode_label = 'adaptive' if data["thinking"].get("type") == "adaptive" else f'manual ({data["thinking"].get("budget_tokens")})'
                 logger.info(f"Thinking mode: {mode_label} for {model}")
 
@@ -5616,31 +6844,35 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
                                         continue
                     else:
                         error_body = await response.text()
-                        error_message = f"[call_claude_api] - Error: Received status code {response.status}. Response body: {error_body}"
-                        logger.error(error_message)
+                        raw_log = f"[call_claude_api] - Error: Received status code {response.status}. Response body: {error_body}"
+                        logger.error(raw_log)
                         logger.error(f"Request headers: {safe_log_headers(headers)}")
                         logger.error(f"Request context: model={data.get('model', '?')}, "
                                      f"messages={len(data.get('messages', []))}, "
                                      f"conversation_id={conversation_id}")
-                        yield f"data: {orjson.dumps({'error': error_message}).decode()}\n\n"
+                        human_msg = _extract_human_error_message(error_body, response.status, "Claude")
+                        yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                         error_yielded = True
                         break  # Don't continue on error
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 error_msg = f"[call_claude_api] - Request timed out for conversation {conversation_id}"
                 logger.error(error_msg)
-                yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+                human_msg = _human_exception_error(exc, "Claude")
+                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                 error_yielded = True
                 break
-            except aiohttp.ClientError as e:
-                error_msg = f"[call_claude_api] - Connection error: {str(e)}"
+            except aiohttp.ClientError as exc:
+                error_msg = f"[call_claude_api] - Connection error: {str(exc)}"
                 logger.error(error_msg)
-                yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+                human_msg = _human_exception_error(exc, "Claude")
+                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                 error_yielded = True
                 break
-            except Exception as e:
-                error_msg = f"[call_claude_api] - Unexpected error: {str(e)}"
+            except Exception as exc:
+                error_msg = f"[call_claude_api] - Unexpected error: {str(exc)}"
                 logger.error(error_msg)
-                yield f"data: {orjson.dumps({'error': error_msg}).decode()}\n\n"
+                human_msg = _human_exception_error(exc, "Claude")
+                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
                 error_yielded = True
                 break
 
@@ -5667,6 +6899,8 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
     total_tokens = input_tokens + output_tokens
     logger.info(f"Tokens used Claude:\ninput_tokens: {input_tokens}\noutput_tokens: {output_tokens}\ntotal_tokens: {total_tokens}")
     logger.info(f"Cache tokens used:\ncache_creation_tokens: {cache_creation_tokens}\ncache_read_tokens: {cache_read_tokens}")
+    if stop_reason == "max_tokens":
+        _log_truncated_response("Claude", model, conversation_id, llm_id, stop_reason, data.get("max_tokens"))
 
     # If a tool use was detected, emit it and return without saving to DB
     # The caller (get_ai_response) will handle the tool call and save the result
@@ -5820,6 +7054,12 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
             input_tokens = estimate_message_tokens(str(contents))
             output_tokens = estimate_message_tokens(content)
             total_tokens = input_tokens + output_tokens
+
+        if last_chunk and last_chunk.candidates:
+            finish_reason = getattr(last_chunk.candidates[0], "finish_reason", None)
+            finish_reason_text = getattr(finish_reason, "name", None) or str(finish_reason or "")
+            if "MAX_TOKENS" in finish_reason_text.upper():
+                _log_truncated_response("Gemini", model, conversation_id, llm_id, finish_reason_text, max_tokens)
 
         # Extract grounding metadata for native web search (Phase 3)
         if web_search_mode == 'native' and last_chunk and last_chunk.candidates:
@@ -6334,6 +7574,7 @@ async def handle_function_call(function_name, function_arguments, messages, mode
             return
 
     else:
+        _legacy_content_to_save = None
     
         if function_name == "dream_of_consciousness":
             # Use read-only connection if only SELECT queries are performed
@@ -6533,6 +7774,8 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                         content += "\n\n"
                     content += result["directions"]
                     content += f"\n\n[View on Google Maps]({result['map_url']})"
+                    text_content_for_save = content
+                    whatsapp_text_content = content
 
                     if include_map and "static_map_url" in result:
                         map_image_data = requests.get(result["static_map_url"], timeout=(5, 15)).content
@@ -6552,15 +7795,28 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                             map_alt = f"Map from {origin} to {destination}"
 
                         content += f"\n\n![{map_alt}]({map_token_url})"
+                        _legacy_content_to_save = orjson.dumps([
+                            {
+                                "type": "text",
+                                "text": text_content_for_save
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": map_local_url,
+                                    "alt": map_alt
+                                }
+                            }
+                        ]).decode()
 
                     if is_whatsapp:
                         json_content = [
                             {
                                 "type": "text",
-                                "text": content
+                                "text": whatsapp_text_content
                             }
                         ]
-                        if include_map:
+                        if include_map and "static_map_url" in result:
                             json_content.append({
                                 "type": "image_url",
                                 "image_url": {
@@ -6568,8 +7824,7 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                                     "alt": map_alt
                                 }
                             })
-                        content_send = orjson.dumps(json_content).decode()
-                        yield f"data: {orjson.dumps({'content': content_send}).decode()}\n\n"
+                        yield f"data: {orjson.dumps({'content': json_content}).decode()}\n\n"
                     else:
                         yield f"data: {orjson.dumps({'content': content}).decode()}\n\n"
                 else:
@@ -6589,7 +7844,7 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 yield f"data: {orjson.dumps({'content': error_msg}).decode()}\n\n"
         
 
-        content_to_save = content
+        content_to_save = _legacy_content_to_save if _legacy_content_to_save is not None else content
         
     #logger.info(f"antes de save_content_to_db, content: {content}")
     if save_to_db:
@@ -6624,7 +7879,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                 try:
                     await conn.execute("BEGIN IMMEDIATE")
                     transaction_started = True
-                    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
                     user_message_id = None
                     if user_message is not None:
@@ -6653,15 +7908,24 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     row = await cursor.fetchone()
                     message_id = row[0] if row else None
 
-                    if model in model_token_cost_cache:
-                        input_token_cost_per_million, output_token_cost_per_million = model_token_cost_cache[model]
+                    try:
+                        normalized_llm_id = int(llm_id) if llm_id is not None and int(llm_id) > 0 else None
+                    except (TypeError, ValueError):
+                        normalized_llm_id = None
+                    cache_key = ("llm_id", normalized_llm_id) if normalized_llm_id is not None else ("legacy_model", model)
+                    if cache_key in model_token_cost_cache:
+                        input_token_cost_per_million, output_token_cost_per_million = model_token_cost_cache[cache_key]
                     else:
-                        cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?'
-                        cursor = await conn.execute(cost_query, (model,))
+                        if normalized_llm_id is not None:
+                            cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE id = ?'
+                            cursor = await conn.execute(cost_query, (normalized_llm_id,))
+                        else:
+                            cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?'
+                            cursor = await conn.execute(cost_query, (model,))
                         token_cost_row = await cursor.fetchone()
                         if token_cost_row:
                             input_token_cost_per_million, output_token_cost_per_million = token_cost_row
-                            model_token_cost_cache[model] = (input_token_cost_per_million, output_token_cost_per_million)
+                            model_token_cost_cache[cache_key] = (input_token_cost_per_million, output_token_cost_per_million)
                         else:
                             input_token_cost_per_million, output_token_cost_per_million = 0, 0
 
@@ -6730,6 +7994,13 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                             logging.getLogger("watchdog").error(
                                 "Failed to enqueue watchdog task for conv=%d", conversation_id, exc_info=True
                             )
+
+                    if message_id is not None:
+                        await _record_atagia_assistant_response(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            content=content,
+                        )
 
                     return user_message_id, message_id
 
@@ -6900,7 +8171,7 @@ async def save_multi_ai_to_db(
                 try:
                     await conn.execute("BEGIN IMMEDIATE")
                     transaction_started = True
-                    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
                     # INSERT user message (type='user', no llm_id)
                     user_msg_id = None
@@ -6933,7 +8204,7 @@ async def save_multi_ai_to_db(
                             continue  # Skip billing for errored models
 
                         model_name = r["model"]
-                        input_cost, output_cost = await get_llm_token_costs(model_name, conn=conn)
+                        input_cost, output_cost = await get_llm_token_costs(conn=conn, llm_id=llm_id)
 
                         reported_input_tokens = int(r.get("input_tokens") or 0)
                         # Avoid double-counting user tokens when provider already reports prompt tokens.
@@ -6993,6 +8264,13 @@ async def save_multi_ai_to_db(
                                 conversation_id,
                                 exc_info=True,
                             )
+
+                    if bot_msg_id is not None:
+                        await _record_atagia_assistant_response(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            content=combined_json,
+                        )
 
                     return (user_msg_id, bot_msg_id)
 
@@ -7193,14 +8471,22 @@ async def process_multi_ai_message(
     # --- 1. Validation ---
     async with get_db_connection(readonly=True) as conn_ro:
         cursor = await conn_ro.execute(
-            """SELECT c.locked, c.llm_id, c.user_id, c.chat_name, c.role_id,
+            """SELECT c.locked, c.llm_id, c.user_id, c.chat_name,
+                      CASE WHEN c.role_id IS NULL THEN ud.current_prompt_id ELSE c.role_id END AS effective_prompt_id,
+                      c.active_extension_id,
+                      (
+                          SELECT COALESCE(MAX(m.id), 0)
+                          FROM MESSAGES m
+                          WHERE m.conversation_id = c.id
+                      ) AS last_message_id,
                       COALESCE(p.enable_moderation, 0) AS enable_moderation,
                       COALESCE(p.forced_llm_id, 0) AS forced_llm_id,
                       p.allowed_llms,
                       COALESCE(p.force_web_search, 0) AS force_web_search,
                       COALESCE(p.gransabio_enabled, 0) AS gransabio_enabled
                FROM CONVERSATIONS c
-               LEFT JOIN PROMPTS p ON c.role_id = p.id
+               LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
+               LEFT JOIN PROMPTS p ON p.id = COALESCE(c.role_id, ud.current_prompt_id)
                WHERE c.id = ?""",
             (conversation_id,),
         )
@@ -7210,7 +8496,20 @@ async def process_multi_ai_message(
         yield f"data: {orjson.dumps({'error': 'Conversation not found'}).decode()}\n\n"
         return
 
-    is_locked, conv_llm_id, conv_user_id, chat_name, prompt_id, enable_moderation, forced_llm_id, allowed_llms_raw, force_web_search, gransabio_enabled = conv_row
+    (
+        is_locked,
+        conv_llm_id,
+        conv_user_id,
+        chat_name,
+        prompt_id,
+        validation_active_extension_id,
+        validation_last_message_id,
+        enable_moderation,
+        forced_llm_id,
+        allowed_llms_raw,
+        force_web_search,
+        gransabio_enabled,
+    ) = conv_row
 
     # Verify user owns conversation
     if current_user.id != conv_user_id:
@@ -7299,10 +8598,33 @@ async def process_multi_ai_message(
 
     # --- 2. Load context (once) ---
     context_months = 2
-    start_date = datetime.utcnow() - timedelta(days=context_months * 30)
+    start_date = (
+        datetime.now(timezone.utc) - timedelta(days=context_months * 30)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
     watchdog_config = None
     watchdog_hint_active = False
     watchdog_hint_eval_id = None
+    multi_warmup_state = {
+        "llm_id": conv_llm_id,
+        "effective_prompt_id": prompt_id,
+        "active_extension_id": validation_active_extension_id,
+        "last_message_id": validation_last_message_id or 0,
+    }
+    multi_warmup_key = _build_warmup_cache_key_from_state(
+        multi_warmup_state,
+        current_user.id,
+        conversation_id,
+        mode="multi",
+        multi_ai_model_ids=model_ids,
+    )
+    multi_warmup_snapshot = get_warmup_snapshot(multi_warmup_key)
+    context_messages_dicts = _copy_warmup_context_messages(multi_warmup_snapshot)
+    if context_messages_dicts is not None:
+        mark_warmup_consumed()
+        logger.debug(
+            "[process_multi_ai_message] Reused warm-up context for conversation_id=%s",
+            conversation_id,
+        )
 
     async with get_db_connection(readonly=True) as conn_ro:
         # Load prompt / system prompt
@@ -7317,12 +8639,12 @@ async def process_multi_ai_message(
                       pe.prompt_text AS extension_prompt_text,
                       p.watchdog_config
                FROM CONVERSATIONS c
-               LEFT JOIN PROMPTS p ON c.role_id = p.id
+               LEFT JOIN PROMPTS p ON p.id = ?
                LEFT JOIN USERS u ON u.id = c.user_id
                LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
                LEFT JOIN PROMPT_EXTENSIONS pe ON c.active_extension_id = pe.id
                WHERE c.id = ?""",
-            (conversation_id,),
+            (prompt_id, conversation_id),
         )
         prompt_row = await cursor.fetchone()
         if not prompt_row:
@@ -7437,17 +8759,20 @@ async def process_multi_ai_message(
         system_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                               watchdog_enabled, watchdog_hint_block)
 
-        # Load context messages
-        cursor = await conn_ro.execute(
-            """SELECT message, type FROM messages
-               WHERE conversation_id = ? AND date >= ?
-               ORDER BY id ASC, date ASC""",
-            (conversation_id, start_date),
-        )
-        context_rows = await cursor.fetchall()
-
-    context_messages_dicts = [{"message": parse_stored_message(custom_unescape(row[0])), "type": row[1]} for row in context_rows]
-    context_messages_dicts = flatten_multi_ai_context(context_messages_dicts)
+        # Load context messages unless the warm-up cache already prepared them.
+        if context_messages_dicts is None:
+            cursor = await conn_ro.execute(
+                """SELECT message, type FROM messages
+                   WHERE conversation_id = ? AND date >= ?
+                   ORDER BY id ASC, date ASC""",
+                (conversation_id, start_date),
+            )
+            context_rows = await cursor.fetchall()
+            context_messages_dicts = [
+                {"message": parse_stored_message(custom_unescape(row[0])), "type": row[1]}
+                for row in context_rows
+            ]
+            context_messages_dicts = flatten_multi_ai_context(context_messages_dicts)
 
     # --- 3. Moderation (once) ---
     if enable_moderation:
@@ -7465,6 +8790,13 @@ async def process_multi_ai_message(
             logger.error("[process_multi_ai_message] Moderation error: %s", exc)
             yield f"data: {orjson.dumps({'error': 'Moderation check failed'}).decode()}\n\n"
             return
+
+    system_prompt = await _augment_prompt_with_atagia_context(
+        system_prompt,
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        message=user_message,
+    )
 
     # --- 4. Chat name generation (once) ---
     updated_chat_name = None
@@ -7525,6 +8857,13 @@ async def process_multi_ai_message(
     from common import BYOK_MIN_BALANCE_PAID_PROMPT
 
     current_balance = await get_balance(current_user.id)
+    model_output_caps = {}
+    model_output_fallbacks = {}
+    for mid in model_ids:
+        cap, fallback_used = _model_output_cap(llm_infos[mid].get("max_output_tokens"))
+        model_output_caps[mid] = cap
+        model_output_fallbacks[mid] = fallback_used
+    shared_model_output_cap = min(model_output_caps.values()) if model_output_caps else int(MAX_TOKENS)
 
     # Estimate max_tokens based on the SUM of costs across all selected models.
     # This is conservative and prevents partial billing failures at commit time.
@@ -7562,6 +8901,20 @@ async def process_multi_ai_message(
             model_name = llm_infos[mid]["model"]
             yield f"data: {orjson.dumps({'error': f'Invalid input token cost for model: {model_name}'}).decode()}\n\n"
             return
+        info = llm_infos[mid]
+        guard_error = assert_billable_claude_system_key(
+            machine=info.get("machine"),
+            model=info.get("model"),
+            llm_id=mid,
+            is_byok=mid in byok_models,
+            input_token_cost=input_cost_million,
+            output_token_cost=output_cost_million,
+        )
+        if guard_error:
+            logger.error(guard_error)
+            yield f"data: {orjson.dumps({'error': guard_error}).decode()}\n\n"
+            return
+
         if input_cost_million > 0 or output_cost_million > 0:
             all_free = False
 
@@ -7586,7 +8939,8 @@ async def process_multi_ai_message(
 
     if all_byok or all_free:
         # All BYOK or all free models: no API cost constraint on token count
-        max_tokens = MAX_TOKENS
+        max_tokens = shared_model_output_cap
+        balance_limited = False
     elif sum_output_cost_per_token <= 0:
         yield f"data: {orjson.dumps({'error': 'Invalid model cost configuration'}).decode()}\n\n"
         return
@@ -7598,7 +8952,8 @@ async def process_multi_ai_message(
 
         available_for_output = current_balance - estimated_input_cost
         max_affordable_tokens = int(available_for_output / sum_output_cost_per_token)
-        max_tokens = int(min(MAX_TOKENS, max_affordable_tokens))
+        max_tokens = int(min(shared_model_output_cap, max_affordable_tokens))
+        balance_limited = max_affordable_tokens < shared_model_output_cap
 
         while max_tokens > 0:
             estimated_total_cost = estimated_input_cost + (max_tokens * sum_output_cost_per_token)
@@ -7612,10 +8967,13 @@ async def process_multi_ai_message(
 
     logger.info(
         "[process_multi_ai_message] Cost pre-check passed: models=%s, byok_models=%s, "
-        "max_tokens=%d, balance=%.6f",
+        "model_output_caps=%s, fallback_ids=%s, max_tokens=%d, balance_limited=%s, balance=%.6f",
         model_ids,
         list(byok_models),
+        model_output_caps,
+        [mid for mid, fallback_used in model_output_fallbacks.items() if fallback_used],
         max_tokens,
+        balance_limited,
         current_balance,
     )
 

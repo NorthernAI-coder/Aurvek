@@ -513,7 +513,7 @@
                     tbody.appendChild(tr);
                 }
                 if (typeof packItemsGroup !== 'undefined') packItemsGroup.markClean();
-                NotificationModal.toast('"' + escapeHtml(prompt.name) + '" added to pack', 'success');
+                NotificationModal.toast('"' + prompt.name + '" added to pack', 'success');
             } else {
                 NotificationModal.toast(result.detail || 'Failed to add prompt', 'danger');
             }

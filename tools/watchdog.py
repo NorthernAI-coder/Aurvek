@@ -62,6 +62,12 @@ if _expected != VALID_EVENT_TYPES:
 # (post-watchdog uses config.get("max_hint_chars", 500) from watchdog_config)
 PRE_WATCHDOG_MAX_HINT_CHARS = 500
 
+
+def _assert_billable_claude_system_key(**kwargs):
+    from ai_calls import assert_billable_claude_system_key
+
+    return assert_billable_claude_system_key(**kwargs)
+
 # Default steering prompts per mode (used when watchdog_config.steering_prompt is empty)
 DEFAULT_STEERING_PROMPTS = {
     "interview": (
@@ -306,6 +312,25 @@ async def run_watchdog_evaluation(
                 user_message_id,
                 bot_message_id,
                 f"API key required for provider {llm_info['machine']} (user mode: own_only)",
+            )
+            return
+
+        wd_guard_error = _assert_billable_claude_system_key(
+            machine=llm_info["machine"],
+            model=llm_info["model"],
+            llm_id=llm_info.get("id"),
+            is_byok=resolved_key is not None,
+            input_token_cost=llm_info.get("input_token_cost", 0),
+            output_token_cost=llm_info.get("output_token_cost", 0),
+        )
+        if wd_guard_error:
+            logger.error(wd_guard_error)
+            await _persist_error_event(
+                conversation_id,
+                prompt_id,
+                user_message_id,
+                bot_message_id,
+                wd_guard_error,
             )
             return
 
@@ -879,6 +904,19 @@ async def _judge_lock_decision(
         fallback = analysis[:2000] if analysis else f"Address the {event_type} issue flagged by the monitoring system."
         return (False, f"No API key for lock judge provider {llm_info['machine']}", fallback)
 
+    wd_guard_error = _assert_billable_claude_system_key(
+        machine=llm_info["machine"],
+        model=llm_info["model"],
+        llm_id=llm_info.get("id"),
+        is_byok=resolved_key is not None,
+        input_token_cost=llm_info.get("input_token_cost", 0),
+        output_token_cost=llm_info.get("output_token_cost", 0),
+    )
+    if wd_guard_error:
+        logger.error(wd_guard_error)
+        fallback = analysis[:2000] if analysis else f"Address the {event_type} issue flagged by the monitoring system."
+        return (False, wd_guard_error, fallback)
+
     # Build judge prompt
     judge_user_prompt = f"""Evaluator analysis: {analysis}
 Event type: {event_type}
@@ -1314,6 +1352,18 @@ async def run_pre_watchdog_evaluation(
         raise ValueError(
             f"API key required for provider {llm_info['machine']} (user mode: own_only)"
         )
+
+    wd_guard_error = _assert_billable_claude_system_key(
+        machine=llm_info["machine"],
+        model=llm_info["model"],
+        llm_id=llm_info.get("id"),
+        is_byok=resolved_key is not None,
+        input_token_cost=llm_info.get("input_token_cost", 0),
+        output_token_cost=llm_info.get("output_token_cost", 0),
+    )
+    if wd_guard_error:
+        logger.error(wd_guard_error)
+        raise ValueError(wd_guard_error)
 
     # 3. Build evaluation prompt
     objectives = pre_config.get("objectives", [])

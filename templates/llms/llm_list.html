@@ -27,8 +27,8 @@
 {% block tabs %}
 <div class="internal-tabs">
     <a href="/admin/llms" class="internal-tab active">All Models</a>
-    <a href="/admin/openrouter" class="internal-tab">
-        <i class="fas fa-sync me-1"></i> OpenRouter Sync
+    <a href="/admin/models" class="internal-tab">
+        <i class="fas fa-sync me-1"></i> Provider Sync
     </a>
 </div>
 {% endblock %}
@@ -42,9 +42,13 @@
     <span class="stat-badge" id="statsFiltered" style="display: none;">
         <i class="fas fa-filter"></i> <strong id="filteredCount">0</strong> Shown
     </span>
-    {% set vision_count = llms|selectattr('5')|list|length %}
+    {% set vision_count = llms|selectattr('vision')|list|length %}
     <span class="stat-badge">
         <i class="fas fa-eye"></i> <strong>{{ vision_count }}</strong> Vision Models
+    </span>
+    {% set enabled_count = llms|selectattr('enabled')|list|length %}
+    <span class="stat-badge">
+        <i class="fas fa-toggle-on"></i> <strong>{{ enabled_count }}</strong> Enabled
     </span>
     <span class="stat-badge" id="statsSelected" style="display: none;">
         <i class="fas fa-check-square"></i> <strong id="selectedCount">0</strong> Selected
@@ -86,6 +90,16 @@
         </div>
         <div class="flex-column">
             <div class="mb-3">
+                <label class="form-label">Availability</label>
+                <select class="form-select" id="enabledFilter" onchange="applyFilters()">
+                    <option value="">All</option>
+                    <option value="yes">Enabled</option>
+                    <option value="no">Disabled</option>
+                </select>
+            </div>
+        </div>
+        <div class="flex-column">
+            <div class="mb-3">
                 <label class="form-label">Sort By</label>
                 <select class="form-select" id="sortBy" onchange="applyFilters()">
                     <option value="model">Model Name (A-Z)</option>
@@ -119,48 +133,70 @@
                     <th style="width: 40px;">
                         <input type="checkbox" id="selectAllCheckbox" onclick="toggleSelectAll()" style="display:none; cursor:pointer; transform: scale(1.2);">
                     </th>
+                    <th>Enabled</th>
                     <th>Provider</th>
                     <th>Model</th>
+                    <th>Context</th>
+                    <th>Max Output</th>
                     <th>Input Cost ($/1M)</th>
                     <th>Output Cost ($/1M)</th>
                     <th>Vision</th>
+                    <th>Status</th>
                     <th class="text-end">Actions</th>
                 </tr>
             </thead>
             <tbody id="llmTableBody">
                 {% for llm in llms %}
                 <tr class="llm-row"
-                    data-provider="{{ llm[1] }}"
-                    data-model="{{ llm[2]|lower }}"
-                    data-vision="{{ 'yes' if llm[5] else 'no' }}"
-                    data-input-price="{{ llm[3] }}"
-                    data-output-price="{{ llm[4] }}"
-                    data-id="{{ llm[0] }}">
+                    data-provider="{{ llm.machine }}"
+                    data-model="{{ (llm.display_name or llm.model)|lower }}"
+                    data-vision="{{ 'yes' if llm.vision else 'no' }}"
+                    data-enabled="{{ 'yes' if llm.enabled else 'no' }}"
+                    data-input-price="{{ llm.input_token_cost }}"
+                    data-output-price="{{ llm.output_token_cost }}"
+                    data-id="{{ llm.id }}">
                     <td>
-                        {% if llm[1] == 'OpenRouter' %}
-                        <input type="checkbox" class="llm-checkbox" value="{{ llm[0] }}" disabled title="Manage via OpenRouter Sync" style="display:none; cursor:not-allowed; transform: scale(1.2); opacity: 0.4;">
+                        {% if llm.sync_managed %}
+                        <input type="checkbox" class="llm-checkbox" value="{{ llm.id }}" disabled title="Disable synced models instead of bulk deleting them" style="display:none; cursor:not-allowed; transform: scale(1.2); opacity: 0.4;">
                         {% else %}
-                        <input type="checkbox" class="llm-checkbox" value="{{ llm[0] }}" onclick="event.stopPropagation(); updateSelectedCount();" style="display:none; cursor:pointer; transform: scale(1.2);">
+                        <input type="checkbox" class="llm-checkbox" value="{{ llm.id }}" onclick="event.stopPropagation(); updateSelectedCount();" style="display:none; cursor:pointer; transform: scale(1.2);">
                         {% endif %}
                     </td>
                     <td>
-                        <span class="badge provider-badge provider-{{ llm[1] }}">{{ llm[1] }}</span>
+                        <button type="button"
+                                class="btn btn-sm {{ 'btn-outline-success' if llm.enabled else 'btn-outline-secondary' }}"
+                                onclick="toggleLlmEnabled({{ llm.id }}, {{ 'false' if llm.enabled else 'true' }})"
+                                title="{{ 'Disable' if llm.enabled else 'Enable' }}"
+                                data-bs-toggle="tooltip">
+                            <i class="fas {{ 'fa-toggle-on' if llm.enabled else 'fa-toggle-off' }}"></i>
+                        </button>
                     </td>
-                    <td><strong>{{ llm[2] }}</strong></td>
-                    <td class="price-cell">${{ "%.4f"|format(llm[3]) }}</td>
-                    <td class="price-cell">${{ "%.4f"|format(llm[4]) }}</td>
                     <td>
-                        {% if llm[5] %}
+                        <span class="badge provider-badge provider-{{ llm.machine }}">{{ llm.machine }}</span>
+                    </td>
+                    <td>
+                        <strong>{{ llm.display_name or llm.model }}</strong>
+                        {% if llm.display_name and llm.display_name != llm.model %}
+                        <br><small class="text-muted">{{ llm.model }}</small>
+                        {% endif %}
+                    </td>
+                    <td>{{ "{:,}".format(llm.context_window_tokens) if llm.context_window_tokens else '-' }}</td>
+                    <td>{{ "{:,}".format(llm.max_output_tokens) if llm.max_output_tokens else '-' }}</td>
+                    <td class="price-cell">${{ "%.4f"|format(llm.input_token_cost) }}</td>
+                    <td class="price-cell">${{ "%.4f"|format(llm.output_token_cost) }}</td>
+                    <td>
+                        {% if llm.vision %}
                         <span class="vision-badge"><i class="fas fa-eye me-1"></i>Vision</span>
                         {% else %}
                         <span class="text-muted">-</span>
                         {% endif %}
                     </td>
+                    <td><span class="badge bg-secondary">{{ llm.sync_status or 'manual' }}</span></td>
                     <td class="text-end table-actions">
-                        <a href="/admin/llm/edit/{{ llm[0] }}" class="btn btn-sm btn-outline-primary" title="Edit" data-bs-toggle="tooltip">
+                        <a href="/admin/llm/edit/{{ llm.id }}" class="btn btn-sm btn-outline-primary" title="Edit" data-bs-toggle="tooltip">
                             <i class="fas fa-edit"></i>
                         </a>
-                        <button onclick="deleteLlm({{ llm[0] }})" class="btn btn-sm btn-outline-danger" title="Delete" data-bs-toggle="tooltip">
+                        <button onclick="deleteLlm({{ llm.id }})" class="btn btn-sm btn-outline-danger" title="Delete" data-bs-toggle="tooltip">
                             <i class="fas fa-trash"></i>
                         </button>
                     </td>
@@ -175,7 +211,7 @@
 {% block scripts_inline %}
 <script>
     // --- Helper: transition modal in-place (avoids backdrop stacking) ---
-    function transitionModal(type, title, message) {
+    function transitionModal(type, title, message, allowHtml = false) {
         const el = NotificationModal._modalElement;
         el.classList.remove('modal-success', 'modal-error', 'modal-warning', 'modal-info', 'modal-confirm');
         el.classList.add(`modal-${type}`);
@@ -185,7 +221,8 @@
             message: message,
             showCancel: false,
             showConfirm: true,
-            confirmText: 'OK'
+            confirmText: 'OK',
+            allowHtml: allowHtml
         });
         const btn = document.getElementById('notificationModalConfirmBtn');
         const newBtn = btn.cloneNode(true);
@@ -231,10 +268,10 @@
 
         NotificationModal.confirm(
             'Delete Selected',
-            `Are you sure you want to delete <strong>${idsToDelete.length}</strong> selected model(s)? This action cannot be undone.`,
+            `Are you sure you want to delete ${idsToDelete.length} selected model(s)? This action cannot be undone.`,
             () => {
                 // Transition to loading state in-place (same modal, no new backdrop)
-                transitionModal('info', 'Deleting...', '<div class="text-center py-3"><i class="fas fa-spinner fa-spin fa-2x"></i><div class="mt-2">Deleting selected models...</div></div>');
+                transitionModal('info', 'Deleting...', '<div class="text-center py-3"><i class="fas fa-spinner fa-spin fa-2x"></i><div class="mt-2">Deleting selected models...</div></div>', true);
                 const confirmBtn = document.getElementById('notificationModalConfirmBtn');
                 confirmBtn.style.display = 'none';
 
@@ -338,6 +375,7 @@
         const providerFilter = document.getElementById('providerFilter').value;
         const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
         const visionFilter = document.getElementById('visionFilter').value;
+        const enabledFilter = document.getElementById('enabledFilter').value;
         const sortBy = document.getElementById('sortBy').value;
 
         const rows = Array.from(document.querySelectorAll('.llm-row'));
@@ -347,11 +385,13 @@
             const provider = row.dataset.provider;
             const model = row.dataset.model;
             const vision = row.dataset.vision;
+            const enabled = row.dataset.enabled;
 
             let visible = true;
             if (providerFilter && provider !== providerFilter) visible = false;
             if (searchFilter && !model.includes(searchFilter)) visible = false;
             if (visionFilter && vision !== visionFilter) visible = false;
+            if (enabledFilter && enabled !== enabledFilter) visible = false;
 
             row.style.display = visible ? '' : 'none';
             if (visible) visibleCount++;
@@ -398,6 +438,23 @@
         const rows = document.querySelectorAll('.llm-row');
         document.getElementById('totalCount').textContent = rows.length;
         applyFilters();
+    }
+
+    async function toggleLlmEnabled(llmId, enabled) {
+        try {
+            const response = await fetch(`/api/admin/llms/${llmId}/enabled`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled })
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || data.detail || 'Failed to update model');
+            }
+            window.location.reload();
+        } catch (error) {
+            NotificationModal.error('Update Failed', error.message);
+        }
     }
 
     // Initialize

@@ -152,8 +152,13 @@ async def _call_claude_security_check(model: str, user_input: str) -> str:
                 "content": SECURITY_GUARD_USER_PROMPT.format(user_input=user_input)
             }
         ],
-        "temperature": 0.0  # Deterministic for security checks
     }
+    model_lower = model.lower()
+    is_temperature_deprecated = any(m in model_lower for m in (
+        "opus-4-7", "opus-4.7", "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"
+    ))
+    if not is_temperature_deprecated:
+        data["temperature"] = 0.0  # Deterministic for security checks on legacy models
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=data) as response:

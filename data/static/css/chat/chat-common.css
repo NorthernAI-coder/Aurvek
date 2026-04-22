@@ -786,6 +786,77 @@ pre.code-block-collapsed {
 }
 
 /* =============================================
+   Message Content Overflow Containment
+   ============================================= */
+
+.message,
+.message-content-container,
+.message-content {
+    min-width: 0;
+}
+
+.message-content > p,
+.message-content p,
+.message-content li,
+.message-content blockquote,
+.message-content h1,
+.message-content h2,
+.message-content h3,
+.message-content h4,
+.message-content h5,
+.message-content h6 {
+    overflow-wrap: anywhere;
+}
+
+.message-content a,
+.message-content :not(pre) > code {
+    overflow-wrap: anywhere;
+}
+
+.message-content .code-block,
+.message-content .code-block pre,
+.message-content .code-block code,
+.message-content table,
+.message-content table code,
+.message-content th,
+.message-content td {
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.message-content .code-block {
+    max-width: 100%;
+    box-sizing: border-box;
+}
+
+.message-content .code-block pre {
+    max-width: 100%;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.message-content pre:not(.code-block pre):not(.thinking-content) {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-wrap: normal;
+    word-break: normal;
+    white-space: pre-wrap;
+    box-sizing: border-box;
+}
+
+.message-content pre:not(.code-block pre):not(.thinking-content) code {
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.message-content table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    box-sizing: border-box;
+}
+
+/* =============================================
    Message Highlight (scroll-to target)
    ============================================= */
 .message.highlight,

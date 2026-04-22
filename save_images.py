@@ -144,7 +144,7 @@ async def save_image_locally(
         image_link_base_fullsize = f"{CLOUDFLARE_BASE_URL}{base_url_fullsize}"
     else:
         # Generate local tokens
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc)
         new_expiration = current_time + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
 
         token_256 = generate_img_token(base_url_256, new_expiration, current_user)
@@ -185,20 +185,24 @@ def generate_img_token(string_to_use: str, expiration: datetime, current_user: U
 
 async def get_or_generate_img_token(current_user: User = Depends(get_current_user)):
     user_id = current_user.id
-    current_time = datetime.utcnow()
+    current_time = datetime.now(timezone.utc).replace(tzinfo=None)
     new_expiration = current_time + timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+    token_lifetime = timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS)
+    min_remaining = timedelta(minutes=10)
 
     if USE_REDIS:
         redis_key = f"img_token:{user_id}"
         token = redis_client.get(redis_key)
 
         if token:
-            return token
+            remaining_ttl = redis_client.ttl(redis_key)
+            if remaining_ttl > int(min_remaining.total_seconds()):
+                return token
 
         new_token = generate_img_token(f"new token for {user_id}", new_expiration, current_user)
         redis_client.setex(
             redis_key,
-            timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS),
+            token_lifetime,
             new_token
         )
         return new_token
@@ -210,13 +214,16 @@ async def get_or_generate_img_token(current_user: User = Depends(get_current_use
         if row:
             last_access, token = row
             last_access = datetime.strptime(last_access, '%Y-%m-%d %H:%M:%S')
-            if current_time - last_access < timedelta(hours=MEDIA_TOKEN_EXPIRE_HOURS):
+            token_age = current_time - last_access
+            if token_age < timedelta(0):
+                token_age = token_lifetime
+            if token_age < token_lifetime - min_remaining:
                 return token
 
         new_token = generate_img_token(f"new token for {user_id}", new_expiration, current_user)
         await cursor_mem.execute(
             "INSERT OR REPLACE INTO last_access (user_id, last_access, token) VALUES (?, ?, ?)",
-            (user_id, new_expiration.strftime('%Y-%m-%d %H:%M:%S'), new_token)
+            (user_id, current_time.strftime('%Y-%m-%d %H:%M:%S'), new_token)
         )
         await conn_mem.commit()
         return new_token

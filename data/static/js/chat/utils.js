@@ -329,14 +329,16 @@ function toggleSendButton(state) {
 function handleSendButtonClick(event) {
     event.preventDefault();
     const messageText = document.getElementById('message-text').value;
-    
+
     // Check session before sending message (force check for critical action)
     SessionManager.validateSession(true).then((isValid) => {
         if (isValid) {
             // Session is valid, send message and clear form
-            sendMessage(messageText);
-            document.getElementById('message-text').value = '';
-            Config.attachedFiles = [];
+            const didSend = sendMessage(messageText);
+            if (didSend) {
+                document.getElementById('message-text').value = '';
+                Config.attachedFiles = [];
+            }
         } else {
             // Session invalid, modal already shown by validateSession
             // Don't clear the form so user can copy their message
@@ -380,7 +382,8 @@ function removeLoadingIndicator() {
 function showInsufficientBalancePopup(failedAction) {
     NotificationModal.warning(
         'Insufficient Balance!',
-        `Unable to perform ${failedAction} due to insufficient balance.<br>Reload your balance <a href="/">here</a>.`
+        `Unable to perform ${escapeHtml(failedAction)} due to insufficient balance.<br>Reload your balance <a href="/">here</a>.`,
+        { allowHtml: true }
     );
 }
 

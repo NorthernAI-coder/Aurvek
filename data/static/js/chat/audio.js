@@ -429,6 +429,9 @@ function startAudioRecording() {
                 showAudioRecordingControls();
                 startRecording();
                 isCanceled = false;
+                if (window.ChatWarmup && typeof window.ChatWarmup.signal === 'function') {
+                    window.ChatWarmup.signal('audio_recording', {});
+                }
             };
             Config.mediaRecorder.onstop = handleAudioStop;
 

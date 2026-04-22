@@ -913,6 +913,7 @@ document.getElementById('deleteAccountBtn').addEventListener('click', (e) => {
         </ul>
         <p>Are you sure you want to continue?</p>
     `, {
+        allowHtml: true,
         confirmText: 'Continue',
         cancelText: 'Cancel',
         showCancel: true,
@@ -926,7 +927,8 @@ document.getElementById('deleteAccountBtn').addEventListener('click', (e) => {
                         <p>Please type "DELETE" below to confirm you want to permanently delete your account:</p>
                         <input type="text" class="form-control" id="deleteConfirmInput" placeholder="Type DELETE">
                     `,
-                    confirmText: 'Delete Account'
+                    confirmText: 'Delete Account',
+                    allowHtml: true
                 });
             } else {
                 const confirmInput = document.getElementById('deleteConfirmInput');
@@ -948,8 +950,9 @@ document.getElementById('deleteAccountBtn').addEventListener('click', (e) => {
                         }
                     } catch (error) {
                         modal.update({
-                            message: `<p class="text-danger">Error: ${error.message}</p>`,
-                            showConfirm: false
+                            message: `<p class="text-danger">Error: ${escapeHtml(error.message)}</p>`,
+                            showConfirm: false,
+                            allowHtml: true
                         });
                     }
                 } else {
@@ -959,7 +962,8 @@ document.getElementById('deleteAccountBtn').addEventListener('click', (e) => {
                             <p>Please type "DELETE" below to confirm you want to permanently delete your account:</p>
                             <input type="text" class="form-control" id="deleteConfirmInput" placeholder="Type DELETE">
                             <p class="text-danger mt-2">Please type "DELETE" correctly to confirm.</p>
-                        `
+                        `,
+                        allowHtml: true
                     });
                 }
             }

@@ -543,7 +543,7 @@ async def _do_cache_cleanup():
     """Delete cached TTS files older than CACHE_MAX_AGE_DAYS. Runs in executor to avoid blocking event loop."""
     global _cleanup_running
     try:
-        deleted = await asyncio.get_event_loop().run_in_executor(None, _cleanup_sync)
+        deleted = await asyncio.get_running_loop().run_in_executor(None, _cleanup_sync)
         logger.info("Cache cleanup: deleted %d files older than %d days", deleted, CACHE_MAX_AGE_DAYS)
     except Exception as e:
         logger.error("Cache cleanup failed: %s", e)

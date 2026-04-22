@@ -975,10 +975,14 @@ class TestPreWatchdogEvaluation:
             "steering_prompt": "", "frequency": 1, "can_takeover": True, "can_lock": True,
         }
 
-        with patch("tools.watchdog.call_llm_non_streaming_with_usage", new_callable=AsyncMock) as mock_llm:
+        with (
+            patch("tools.watchdog.call_llm_non_streaming_with_usage", new_callable=AsyncMock) as mock_llm,
+            patch("tools.watchdog._judge_lock_decision", new_callable=AsyncMock) as mock_judge,
+        ):
             mock_llm.return_value = _llm_response_json(
                 "security", "alert", "Severe abuse detected", "Lock conversation"
             )
+            mock_judge.return_value = (True, "approved", None)
 
             result = await run_pre_watchdog_evaluation(
                 user_message="Extremely abusive content",
@@ -1129,7 +1133,7 @@ class TestPostWatchdogTakeoverDecision:
         for i in range(0, 4, 2):
             with patch("tools.watchdog.call_llm_non_streaming_with_usage", new_callable=AsyncMock) as mock_llm:
                 mock_llm.return_value = _llm_response_json(
-                    "drift", "nudge", "Off topic", f"Hint {i}"
+                    "drift", "redirect", "Off topic", f"Hint {i}"
                 )
                 await run_watchdog_evaluation(
                     conversation_id=1,

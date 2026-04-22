@@ -157,7 +157,12 @@ const ThemeManager = {
                 }
             };
 
-            document.head.appendChild(link);
+            const commonLink = document.querySelector('link[href*="chat-common.css"]');
+            if (commonLink) {
+                document.head.insertBefore(link, commonLink);
+            } else {
+                document.head.appendChild(link);
+            }
         });
     },
 

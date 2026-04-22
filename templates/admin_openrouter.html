@@ -15,7 +15,7 @@
     .model-row.pending {
         background-color: rgba(255, 193, 7, 0.15) !important;
     }
-    .model-row.to-remove {
+    .model-row.to-disable {
         background-color: rgba(220, 53, 69, 0.15) !important;
         opacity: 0.7;
     }
@@ -258,8 +258,8 @@
                 statusBadge = '<span class="badge bg-warning text-dark">Pending</span>';
                 rowClass = 'model-row pending';
             } else if (!isSelected && wasInDb) {
-                statusBadge = '<span class="badge bg-danger">To Remove</span>';
-                rowClass = 'model-row to-remove';
+                statusBadge = '<span class="badge bg-danger">Will Disable</span>';
+                rowClass = 'model-row to-disable';
             } else {
                 statusBadge = '<span class="badge bg-secondary">-</span>';
                 rowClass = 'model-row';
@@ -356,7 +356,7 @@
         const isSelected = enabledModels.has(modelId);
         const wasInDb = originalEnabled.has(modelId);
 
-        row.classList.remove('in-db', 'pending', 'to-remove');
+        row.classList.remove('in-db', 'pending', 'to-disable');
 
         let statusBadge;
         if (isSelected && wasInDb) {
@@ -366,8 +366,8 @@
             row.classList.add('pending');
             statusBadge = '<span class="badge bg-warning text-dark">Pending</span>';
         } else if (!isSelected && wasInDb) {
-            row.classList.add('to-remove');
-            statusBadge = '<span class="badge bg-danger">To Remove</span>';
+            row.classList.add('to-disable');
+            statusBadge = '<span class="badge bg-danger">Will Disable</span>';
         } else {
             statusBadge = '<span class="badge bg-secondary">-</span>';
         }
@@ -431,15 +431,22 @@
                     input_price: m.input_price,
                     output_price: m.output_price,
                     vision: m.vision,
-                    context_length: m.context_length
+                    context_length: m.context_length,
+                    max_output_tokens: m.max_output_tokens
                 }));
+            const availableIds = new Set(allModels.map(m => m.id));
+            const disabledModelIds = Array.from(originalEnabled)
+                .filter(id => availableIds.has(id) && !enabledModels.has(id));
 
             const response = await fetch('/api/openrouter/sync', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ models: modelsToSave })
+                body: JSON.stringify({
+                    models: modelsToSave,
+                    disabled_model_ids: disabledModelIds
+                })
             });
 
             const data = await response.json();

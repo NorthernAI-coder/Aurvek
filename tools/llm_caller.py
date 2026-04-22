@@ -134,8 +134,13 @@ async def _call_claude(
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_message}],
-        "temperature": 0.0,
     }
+    model_lower = model.lower()
+    is_temperature_deprecated = any(m in model_lower for m in (
+        "opus-4-7", "opus-4.7", "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"
+    ))
+    if not is_temperature_deprecated:
+        data["temperature"] = 0.0
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
