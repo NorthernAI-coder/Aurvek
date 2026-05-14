@@ -19,7 +19,7 @@ import sqlite3
 from fastapi.templating import Jinja2Templates
 from datetime import date, datetime, timezone, timedelta
 
-from urllib.parse import urlencode, quote, urlparse
+from urllib.parse import urlencode, quote, urlparse, unquote
 import hmac
 import ipaddress
 
@@ -204,7 +204,7 @@ MAX_CHAT_IMAGE_DIMENSION = 1568
 
 # PDF upload limits
 MAX_PDF_SIZE_MB = int(os.getenv('MAX_PDF_SIZE_MB', 25))        # Under Claude's 32MB request limit
-MAX_PDF_PAGES = int(os.getenv('MAX_PDF_PAGES', 100))           # Claude's limit; Gemini supports 1000
+MAX_PDF_PAGES = 1000                                           # Hard product cap; providers may reject lower limits
 MAX_PDFS_PER_MESSAGE = int(os.getenv('MAX_PDFS_PER_MESSAGE', 3))
 
 # Text file upload limits
@@ -851,16 +851,51 @@ async def load_service_costs():
         finally:
             await conn.close()
 
-def text_file_block_to_text(block: dict) -> str:
+def text_file_block_to_text(
+    block: dict,
+    owner_username: str | None = None,
+    conversation_id: int | None = None,
+) -> str:
     """Read a stored text_file block from disk and convert to text string for providers."""
     tf = block.get('text_file', {})
     filename = tf.get('filename', 'file.txt')
     lines = tf.get('lines', 0)
+    attachment_ref = tf.get('attachment_ref')
+    if attachment_ref:
+        return f"[Attached file: {filename} -- content unavailable]"
     url = tf.get('url', '')
 
-    file_path = os.path.join('data', url.lstrip('/'))
+    if not owner_username:
+        return f"[Attached file: {filename} -- content unavailable]"
+
+    raw = unquote(str(url).split('?', 1)[0])
+    if CLOUDFLARE_BASE_URL and raw.startswith(CLOUDFLARE_BASE_URL):
+        raw = raw[len(CLOUDFLARE_BASE_URL):]
+    parsed = urlparse(raw)
+    if parsed.scheme in {'http', 'https'}:
+        raw = parsed.path
+    if parsed.scheme and parsed.scheme not in {'http', 'https'}:
+        return f"[Attached file: {filename} -- content unavailable]"
+
+    raw = raw.lstrip('/')
+    file_path = Path(raw) if raw.startswith('data/') else Path('data') / raw
+
+    h1, h2, user_hash = generate_user_hash(owner_username)
+    user_root = (Path(users_directory) / h1 / h2 / user_hash).resolve()
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        resolved_path = file_path.resolve()
+        if not resolved_path.is_relative_to(user_root):
+            return f"[Attached file: {filename} -- content unavailable]"
+        if conversation_id is not None:
+            conv = f"{int(conversation_id):07d}"
+            text_root = (user_root / "files" / conv[:3] / conv[3:] / "txt").resolve()
+            if not resolved_path.is_relative_to(text_root):
+                return f"[Attached file: {filename} -- content unavailable]"
+    except (OSError, RuntimeError, ValueError):
+        return f"[Attached file: {filename} -- content unavailable]"
+
+    try:
+        with open(resolved_path, 'r', encoding='utf-8') as f:
             content = f.read()
     except (FileNotFoundError, IOError):
         return f"[Attached file: {filename} -- content unavailable]"

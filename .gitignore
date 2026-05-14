@@ -2,7 +2,7 @@ AURVEK.git/
 SPARK.git/
 CLAUDE.md
 data/cache/
-# User data (runtime-generated, not tracked)
+# User data (runtime-generated attachments, prompt exports, and profiles)
 data/users/
 __pycache__/
 tst/
@@ -76,3 +76,19 @@ testing_*.py
 
 # Sync tool output (generated files)
 tools/sync_github/output/
+
+# Ruff lint cache
+.ruff_cache/
+
+# Codex internal working dir
+.codex
+
+# Local benchmark experiment (not shipped)
+semi_agentic_demo/
+
+# Local Python version pin
+.python-version
+
+# Untracked local reference files
+aurvek_public_landing_urls.md
+talent_visa_screener_prompt.txt

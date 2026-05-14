@@ -1077,10 +1077,13 @@ textarea {
 .new-chat-settings .form-select { margin-top: 5px; background-color: var(--sidebar-bg-color); color: var(--ks-cream); border: 1px solid var(--sidebar-border-color); }
 .new-chat-settings .dropdown-divider, .sidebar-user .dropdown-divider { border-top-color: var(--sidebar-border-color); }
 
+.new-chat-settings .dropdown-item,
 .sidebar-user .dropdown-item,
 .dropdown-menu.theme-submenu .dropdown-item { color: var(--ks-gold-highlight); padding: 8px 16px; }
+.new-chat-settings .dropdown-item:hover,
 .sidebar-user .dropdown-item:hover,
 .dropdown-menu.theme-submenu .dropdown-item:hover { background-color: rgba(191, 161, 106, 0.2); color: var(--ks-white); }
+.new-chat-settings .dropdown-item.active,
 .sidebar-user .dropdown-item.active,
 .dropdown-menu.theme-submenu .dropdown-item.active { background-color: var(--ks-gold-muted); color: var(--ks-navy-deep); }
 

@@ -415,14 +415,14 @@ function showInsufficientBalancePopup(failedAction) {
             const images = document.querySelectorAll('#chat-messages-container .message-content img');
             images.forEach(img => {
                 if (!img.dataset.initialized) {
-                    img.dataset.fullsize = img.src.replace('_256.webp', '_fullsize.webp');
-                    img.onclick = () => this.showFullsize(img.dataset.fullsize, img.dataset.messageId);
+                    img.dataset.fullsize = img.dataset.fullsize || img.src.replace('_256.webp', '_fullsize.webp');
+                    img.onclick = () => this.showFullsize(img.dataset.fullsize, img.dataset.messageId, img.dataset.attachmentRef);
                     img.dataset.initialized = 'true';
                 }
             });
         },
 		
-		showFullsize: function(url, messageId) {
+		showFullsize: function(url, messageId, attachmentRef) {
 			const fullsizeContainer = document.getElementById('fullsizeContainer');
 			const fullsizeImage = document.getElementById('fullsizeImage');
 			const downloadButton = document.getElementById('downloadButton');
@@ -483,7 +483,7 @@ function showInsufficientBalancePopup(failedAction) {
 
 			deleteButton.onclick = () => {
 				if (messageId) {
-					this.deleteImage(messageId);
+					this.deleteImage(messageId, attachmentRef);
 				} else {
 					NotificationModal.warning('Cannot Delete', 'This image cannot be deleted.');
 				}
@@ -516,12 +516,15 @@ function showInsufficientBalancePopup(failedAction) {
             document.body.removeChild(link);
         },
 
-		deleteImage: function(messageId) {
+		deleteImage: function(messageId, attachmentRef) {
 			NotificationModal.confirm(
 				'Confirm Deletion',
 				'Are you sure you want to delete this image?',
 				() => {
-					fetch(`/api/delete-image/${messageId}`, {
+					const url = attachmentRef
+						? `/api/delete-image/${messageId}?attachment_ref=${encodeURIComponent(attachmentRef)}`
+						: `/api/delete-image/${messageId}`;
+					fetch(url, {
 						method: 'DELETE',
 					})
 					.then(response => response.json())
@@ -580,8 +583,8 @@ function showInsufficientBalancePopup(failedAction) {
     function initializeNewImages(container) {
         const images = container.querySelectorAll('.message-content img:not([data-initialized])');
         images.forEach(img => {
-            img.dataset.fullsize = img.src.replace('_256.webp', '_fullsize.webp');
-            img.onclick = () => imageHandler.showFullsize(img.dataset.fullsize, img.dataset.messageId);
+            img.dataset.fullsize = img.dataset.fullsize || img.src.replace('_256.webp', '_fullsize.webp');
+            img.onclick = () => imageHandler.showFullsize(img.dataset.fullsize, img.dataset.messageId, img.dataset.attachmentRef);
             img.dataset.initialized = 'true';
         });
     }

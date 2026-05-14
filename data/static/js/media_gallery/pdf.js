@@ -9,7 +9,9 @@ let currentPdfPage = 1;
  * @param {string} path - Path of the PDF file
  */
 function openPdf(path) {
-    const baseUrl = window.cdnFilesUrl || window.location.origin;
+    const baseUrl = path.startsWith('/api/attachments/')
+        ? window.location.origin
+        : (window.cdnFilesUrl || window.location.origin);
     const url = new URL(path, baseUrl);
     if (window.pdfToken) {
         url.searchParams.append('token', window.pdfToken);
@@ -22,7 +24,9 @@ function openPdf(path) {
  * @param {string} path - Path of the PDF file
  */
 function downloadPdf(path) {
-    const baseUrl = window.cdnFilesUrl || window.location.origin;
+    const baseUrl = path.startsWith('/api/attachments/')
+        ? window.location.origin
+        : (window.cdnFilesUrl || window.location.origin);
     const url = new URL(path, baseUrl);
     if (window.pdfToken) {
         url.searchParams.append('token', window.pdfToken);
@@ -35,10 +39,33 @@ function downloadPdf(path) {
  * Deletes a single PDF from the server
  * @param {string} encodedPath - URL-encoded path of the PDF to delete
  */
-function deletePdf(encodedPath) {
+function deletePdf(encodedPath, attachmentRef = '') {
     const path = decodeURIComponent(encodedPath);
 
     NotificationModal.confirm('Delete PDF', 'Are you sure you want to delete this PDF?', () => {
+        if (attachmentRef) {
+            fetch(`/api/attachments/${encodeURIComponent(attachmentRef)}`, {
+                method: 'DELETE'
+            })
+            .then(async response => {
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                NotificationModal.info('PDF Deleted', data.message || 'PDF deleted');
+                allPdfs = allPdfs.filter(pdf => pdf.attachment_ref !== attachmentRef);
+                renderPdfPage(currentPdfPage);
+            })
+            .catch((error) => {
+                console.error('Error deleting PDF:', error);
+                NotificationModal.error('Delete Error', `Error deleting PDF: ${error.message}`);
+            });
+            return;
+        }
+
         const payload = {
             pdf_path: path.startsWith('data/') ? path : `data${path}`
         };
@@ -87,14 +114,38 @@ function deleteSelectedPdfs() {
     }
 
     NotificationModal.confirm('Delete PDFs', `Are you sure you want to delete ${selectedPdfs.length} selected PDFs?`, () => {
-        const pdfPaths = Array.from(selectedPdfs).map(checkbox => decodeURIComponent(checkbox.dataset.path));
+        const attachmentRefs = Array.from(selectedPdfs)
+            .map(checkbox => checkbox.dataset.attachmentRef)
+            .filter(Boolean);
+        const pdfPaths = Array.from(selectedPdfs)
+            .filter(checkbox => !checkbox.dataset.attachmentRef)
+            .map(checkbox => decodeURIComponent(checkbox.dataset.path));
+
+        if (attachmentRefs.length > 0 && pdfPaths.length === 0) {
+            Promise.all(attachmentRefs.map(ref =>
+                fetch(`/api/attachments/${encodeURIComponent(ref)}`, { method: 'DELETE' })
+            ))
+            .then(async responses => {
+                const failed = responses.filter(response => !response.ok).length;
+                if (failed) {
+                    throw new Error(`${failed} PDF(s) could not be deleted`);
+                }
+                NotificationModal.info('PDFs Deleted', `Successfully deleted: ${attachmentRefs.length}, Failed: 0`);
+                location.reload();
+            })
+            .catch(error => {
+                console.error('Error deleting PDFs:', error);
+                NotificationModal.error('Delete Error', error.message);
+            });
+            return;
+        }
 
         fetch('/delete-pdfs', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ pdf_paths: pdfPaths })
+            body: JSON.stringify({ pdf_paths: pdfPaths, attachment_refs: attachmentRefs })
         })
         .then(async response => {
             if (!response.ok) {
@@ -140,27 +191,67 @@ function renderPdfPage(page) {
     const pageData = paginationUtils.getCurrentPageData(allPdfs, page, ITEMS_PER_PAGE);
     const container = document.getElementById('pdfContainer');
 
-    container.innerHTML = pageData.map(pdf => `
-        <div class="pdf-container">
-            <div class="pdf-wrapper">
-                <input type="checkbox" class="pdf-checkbox" data-path="${encodeURIComponent(pdf.path)}" title="Select for bulk delete">
-                <div class="pdf-icon" onclick="openPdf('${pdf.nginx_path}')" title="Click to open PDF">
-                    <i class="fas fa-file-pdf"></i>
-                </div>
-            </div>
-            <div class="pdf-info">
-                <div class="pdf-name" title="${pdf.name}">${pdf.name}</div>
-            </div>
-            <div class="pdf-controls">
-                <button onclick="downloadPdf('${pdf.nginx_path}')" class="btn btn-sm btn-primary" title="Download PDF">
-                    <i class="fas fa-download"></i> Download
-                </button>
-                <button onclick="deletePdf('${encodeURIComponent(pdf.path)}')" class="btn btn-sm btn-danger" title="Delete PDF">
-                    <i class="fas fa-trash"></i> Delete
-                </button>
-            </div>
-        </div>
-    `).join('');
+    container.innerHTML = '';
+    const fragment = document.createDocumentFragment();
+
+    pageData.forEach(pdf => {
+        const pdfContainer = document.createElement('div');
+        pdfContainer.className = 'pdf-container';
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'pdf-wrapper';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'pdf-checkbox';
+        checkbox.dataset.path = encodeURIComponent(pdf.path || '');
+        checkbox.dataset.attachmentRef = pdf.attachment_ref || '';
+        checkbox.title = 'Select for bulk delete';
+        wrapper.appendChild(checkbox);
+
+        const icon = document.createElement('div');
+        icon.className = 'pdf-icon';
+        icon.title = 'Click to open PDF';
+        icon.addEventListener('click', () => openPdf(pdf.nginx_path));
+        const iconInner = document.createElement('i');
+        iconInner.className = 'fas fa-file-pdf';
+        icon.appendChild(iconInner);
+        wrapper.appendChild(icon);
+
+        const info = document.createElement('div');
+        info.className = 'pdf-info';
+        const name = document.createElement('div');
+        name.className = 'pdf-name';
+        name.title = pdf.name || '';
+        name.textContent = pdf.name || '';
+        info.appendChild(name);
+
+        const controls = document.createElement('div');
+        controls.className = 'pdf-controls';
+
+        const downloadButton = document.createElement('button');
+        downloadButton.className = 'btn btn-sm btn-primary';
+        downloadButton.title = 'Download PDF';
+        downloadButton.innerHTML = '<i class="fas fa-download"></i> Download';
+        downloadButton.addEventListener('click', () => downloadPdf(pdf.nginx_path));
+        controls.appendChild(downloadButton);
+
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'btn btn-sm btn-danger';
+        deleteButton.title = 'Delete PDF';
+        deleteButton.innerHTML = '<i class="fas fa-trash"></i> Delete';
+        deleteButton.addEventListener('click', () => {
+            deletePdf(encodeURIComponent(pdf.path || ''), pdf.attachment_ref || '');
+        });
+        controls.appendChild(deleteButton);
+
+        pdfContainer.appendChild(wrapper);
+        pdfContainer.appendChild(info);
+        pdfContainer.appendChild(controls);
+        fragment.appendChild(pdfContainer);
+    });
+
+    container.appendChild(fragment);
 
     // Update pagination controls
     const paginationElement = document.getElementById('pagination-pdfs');

@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS LLM (
     output_token_cost REAL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS USERS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT,
+    role_id INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS CONVERSATIONS (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -171,8 +177,29 @@ def db_path(tmp_path_factory):
 def _clean_tables(db_path):
     """Wipe all data between tests (keeps schema)."""
     conn = sqlite3.connect(db_path)
-    for table in ("WATCHDOG_STATE", "WATCHDOG_EVENTS", "MESSAGES", "CONVERSATIONS", "PROMPTS", "LLM", "USER_DETAILS", "SYSTEM_CONFIG", "USAGE_DAILY"):
-        conn.execute(f"DELETE FROM {table}")
+    for table in (
+        "ATAGIA_SYNC_STATE",
+        "ATAGIA_SYNC_RUNS",
+        "ATAGIA_MESSAGE_LINKS",
+        "WATCHDOG_STATE",
+        "WATCHDOG_EVENTS",
+        "FILE_LEGACY_CLEANUP_CANDIDATES",
+        "FILE_ATTACHMENTS",
+        "FILE_BLOB_VARIANTS",
+        "FILE_BLOBS",
+        "MESSAGES",
+        "CONVERSATIONS",
+        "USERS",
+        "PROMPTS",
+        "LLM",
+        "USER_DETAILS",
+        "SYSTEM_CONFIG",
+        "USAGE_DAILY",
+    ):
+        try:
+            conn.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 

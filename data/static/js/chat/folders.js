@@ -1263,11 +1263,12 @@ function setupNewChatIntegration() {
     };
     
     // Override startNewConversation to support folders
-    window.startNewConversation = function(promptId = null) {
+    window.startNewConversation = function(promptId = null, options = {}) {
+        const incognito = options && options.incognito === true;
         
         // If no folder selected, use original function
-        if (!currentSelectedFolderId && typeof window.originalStartNewConversation === 'function') {
-            return window.originalStartNewConversation(promptId);
+        if ((!currentSelectedFolderId || incognito) && typeof window.originalStartNewConversation === 'function') {
+            return window.originalStartNewConversation(promptId, options);
         }
         
         // Admin check
@@ -1275,7 +1276,7 @@ function setupNewChatIntegration() {
             return Promise.resolve();
         }
 
-        if (!isFirstCall && isCurrentConversationEmpty) {
+        if (!incognito && !isFirstCall && isCurrentConversationEmpty) {
             return Promise.resolve();
         }
         
@@ -1283,18 +1284,28 @@ function setupNewChatIntegration() {
         if (promptId !== null) {
             body.prompt_id = promptId;
         }
+        if (incognito) {
+            body.incognito = true;
+        }
         
         // Add folder_id if a folder is selected
-        if (currentSelectedFolderId) {
+        if (currentSelectedFolderId && !incognito) {
             body.folder_id = currentSelectedFolderId;
         }
         
-        return secureFetch('/api/conversations/new', {
+        const beforeCreate = typeof maybeCloseCurrentIncognitoBeforeLeaving === 'function'
+            ? maybeCloseCurrentIncognitoBeforeLeaving()
+            : Promise.resolve(true);
+
+        return beforeCreate.then(canContinue => {
+            if (!canContinue) return Promise.resolve();
+            return secureFetch('/api/conversations/new', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify(body)
+            });
         })
         .then(response => {
             if (!response) {

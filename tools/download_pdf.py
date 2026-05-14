@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import html
 import markdown2
 import emoji
+from pathlib import Path
 from bs4 import BeautifulSoup, NavigableString, Tag
 import xml.sax.saxutils
 from reportlab.lib.pagesizes import letter
@@ -40,6 +41,7 @@ from dotenv import load_dotenv
 # Own libraries
 from database import get_db_connection
 from common import generate_user_hash, text_file_block_to_text
+from file_storage import get_attachment_local_path_sync, read_attachment_bytes_sync
 
 # =============================
 # Logging Configuration
@@ -304,6 +306,37 @@ def process_p_tag(element, styles, hash_prefixes):
             flowables.extend(process_element(child, styles, hash_prefixes))
     return flowables
 
+
+def image_file_to_flowables(full_image_path: str):
+    elements = []
+    if os.path.exists(full_image_path):
+        logger.debug(f"Image found at path: {full_image_path}")
+        try:
+            with PilImage.open(full_image_path) as img:
+                width, height = img.size
+                if width > max_width or height > max_height:
+                    img.thumbnail((max_width, max_height))
+                    image_bytes = BytesIO()
+                    img.save(image_bytes, format="PNG")
+                    image_bytes.seek(0)
+                    img_rl = RLImage(image_bytes)
+                else:
+                    img_rl = RLImage(full_image_path)
+                img_rl.hAlign = "LEFT"
+                elements.append(img_rl)
+        except Exception as e:
+            logger.error(f"Failed to load image: {e}")
+    else:
+        logger.warning(f"Image not found: {full_image_path}")
+        if os.path.exists(image_not_found_path):
+            img_rl = RLImage(image_not_found_path, width=3 * inch, height=3 * inch)
+        else:
+            logger.error(f"Image not found placeholder does not exist: {image_not_found_path}")
+            img_rl = Spacer(1, 3 * inch)
+        img_rl.hAlign = "LEFT"
+        elements.append(img_rl)
+    return elements
+
 def process_element(element, styles, hash_prefixes):
     """
     Process a BeautifulSoup element and convert it into a list of ReportLab flowables.
@@ -401,47 +434,29 @@ def process_element(element, styles, hash_prefixes):
                 # Replace with '_fullsize.webp'
                 src = src.replace("_256.webp", "_fullsize.webp")
 
-            # Parse URL to extract path
+            # Parse URL to extract path. Never accept raw local filesystem paths
+            # from message HTML; attachments are rendered through a separate
+            # scoped path lookup before reaching this legacy branch.
             parsed_url = urlparse(src)
-            # Remove '/sk/' from beginning of path if it exists
             if parsed_url.path.startswith("/sk/"):
                 relative_image_path = parsed_url.path[len("/sk/"):]
             else:
                 relative_image_path = parsed_url.path.lstrip("/")
             logger.info(f"Relative image path extracted: {relative_image_path}")
 
-            # Generate full path using hash prefixes
             hash_prefix1, hash_prefix2, user_hash = hash_prefixes
-            full_image_path = os.path.join(BASE_DIR, hash_prefix1, hash_prefix2, user_hash, relative_image_path)
+            user_root = Path(BASE_DIR, hash_prefix1, hash_prefix2, user_hash).resolve()
+            try:
+                full_image_path = (user_root / relative_image_path).resolve()
+                if not full_image_path.is_relative_to(user_root):
+                    logger.warning("Rejected image path outside user directory: %s", relative_image_path)
+                    full_image_path = Path(image_not_found_path)
+            except (OSError, RuntimeError):
+                logger.warning("Rejected invalid image path: %s", relative_image_path)
+                full_image_path = Path(image_not_found_path)
 
             logger.debug(f"Full image path: {full_image_path}")
-
-            if os.path.exists(full_image_path):
-                logger.debug(f"Image found at path: {full_image_path}")
-                try:
-                    with PilImage.open(full_image_path) as img:
-                        width, height = img.size
-                        if width > max_width or height > max_height:
-                            img.thumbnail((max_width, max_height))
-                            image_bytes = BytesIO()
-                            img.save(image_bytes, format="PNG")
-                            image_bytes.seek(0)
-                            img_rl = RLImage(image_bytes)
-                        else:
-                            img_rl = RLImage(full_image_path)
-                        img_rl.hAlign = "LEFT"
-                        elements.append(img_rl)
-                except Exception as e:
-                    logger.error(f"Failed to load image: {e}")
-            else:
-                logger.warning(f"Image not found: {full_image_path}")
-                if os.path.exists(image_not_found_path):
-                    img_rl = RLImage(image_not_found_path, width=3 * inch, height=3 * inch)
-                else:
-                    logger.error(f"Image not found placeholder does not exist: {image_not_found_path}")
-                    img_rl = Spacer(1, 3 * inch)  # Blank space if replacement image doesn't exist
-                img_rl.hAlign = "LEFT"
-                elements.append(img_rl)
+            elements.extend(image_file_to_flowables(str(full_image_path)))
             return elements
         else:
             for child in element.contents:
@@ -501,7 +516,8 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
     async with get_db_connection(readonly=True) as conn:
         # Verify permissions and conversation existence
         query_convo = """
-            SELECT c.id, u.username, llm.machine, llm.model, p.name AS prompt_name
+            SELECT c.id, c.user_id AS owner_user_id, u.username,
+                   llm.machine, llm.model, p.name AS prompt_name
             FROM conversations c
             JOIN users u ON c.user_id = u.id
             LEFT JOIN llm ON c.llm_id = llm.id
@@ -533,6 +549,7 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
 
     # Calculate hash prefixes
     username = conversation["username"]
+    owner_user_id = int(conversation["owner_user_id"])
     hash_prefixes = generate_user_hash(username)
     logger.debug(f"Hash Prefixes for '{username}': {hash_prefixes}")
 
@@ -616,14 +633,56 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
                         elements.append(Spacer(1, 0.05 * inch))
                         elements.append(Paragraph(date_str, styles["small_italic"]))
                     elif element_json.get("type") == "text_file":
-                        file_text = text_file_block_to_text(element_json)
+                        text_info = element_json.get("text_file", {})
+                        attachment_ref = text_info.get("attachment_ref")
+                        if attachment_ref:
+                            attachment_result = read_attachment_bytes_sync(
+                                attachment_ref,
+                                user_id=owner_user_id,
+                                conversation_id=conversation_id,
+                                message_id=message["id"],
+                                require_kind="text",
+                            )
+                            if attachment_result:
+                                file_data, _ = attachment_result
+                                filename = text_info.get("filename", "file.txt")
+                                lines = text_info.get("lines", 0)
+                                content = file_data.decode("utf-8", errors="replace")
+                                file_text = f"[Content of uploaded file: {filename} ({lines} lines)]\n\n{content}"
+                            else:
+                                file_text = text_file_block_to_text(
+                                    element_json,
+                                    owner_username=username,
+                                    conversation_id=conversation_id,
+                                )
+                        else:
+                            file_text = text_file_block_to_text(
+                                element_json,
+                                owner_username=username,
+                                conversation_id=conversation_id,
+                            )
                         html_text = markdown_to_html(file_text)
                         message_elements = html_to_reportlab(html_text, styles, hash_prefixes)
                         elements.extend(message_elements)
                         elements.append(Spacer(1, 0.05 * inch))
                         elements.append(Paragraph(date_str, styles["small_italic"]))
                     elif element_json.get("type") == "image_url":
-                        image_url = element_json.get("image_url", {}).get("url")
+                        image_info = element_json.get("image_url", {})
+                        attachment_ref = image_info.get("attachment_ref")
+                        image_url = image_info.get("url")
+                        if attachment_ref:
+                            attachment_path = get_attachment_local_path_sync(
+                                attachment_ref,
+                                user_id=owner_user_id,
+                                conversation_id=conversation_id,
+                                message_id=message["id"],
+                                require_kind="image",
+                            )
+                            if attachment_path:
+                                elements.extend(image_file_to_flowables(str(attachment_path)))
+                                elements.append(Spacer(1, 0.05 * inch))
+                                elements.append(Paragraph(date_str, styles["small_italic"]))
+                                continue
                         if image_url:
                             img_tag = f'<img src="{image_url}" alt="Image"/>'
                             html_text = markdown_to_html(img_tag)
@@ -631,6 +690,13 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
                             elements.extend(message_elements)
                             elements.append(Spacer(1, 0.05 * inch))
                             elements.append(Paragraph(date_str, styles["small_italic"]))
+                    elif element_json.get("type") == "document_url":
+                        doc_info = element_json.get("document_url", {})
+                        filename = html.escape(str(doc_info.get("filename") or "document.pdf"))
+                        pages = doc_info.get("pages") or 0
+                        elements.append(Paragraph(f"[PDF attached: {filename} ({pages} pages)]", styles["small_italic"]))
+                        elements.append(Spacer(1, 0.05 * inch))
+                        elements.append(Paragraph(date_str, styles["small_italic"]))
 
             else:
                 # Normal text message, possibly with Markdown

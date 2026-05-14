@@ -17,6 +17,62 @@
     min-width: 0;
 }
 
+.chat-title-main-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.chat-title-main-row h4 {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.incognito-chat-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex: 0 0 auto;
+    min-height: 24px;
+    padding: 3px 8px;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.16));
+    border-radius: 6px;
+    color: var(--text-primary, #fff);
+    background: rgba(18, 18, 24, 0.18);
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1;
+}
+
+.btn-close-incognito {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.16));
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary, #b9bbbe);
+    cursor: pointer;
+}
+
+.btn-close-incognito:hover {
+    color: var(--text-primary, #fff);
+    background: var(--sidebar-btn-hover-bg, rgba(128, 128, 128, 0.25));
+}
+
+.new-chat-settings .dropdown-item i {
+    width: 18px;
+    margin-right: 6px;
+    text-align: center;
+}
+
 /* =============================================
    Sidebar Collapse/Expand
    ============================================= */

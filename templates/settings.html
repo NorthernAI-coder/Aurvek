@@ -275,6 +275,89 @@
     .settings-tabs { margin-bottom: 0; }
     .tab-pane { padding-top: 0.5rem; }
 
+    /* --- Memory section --- */
+    .memory-settings-card {
+        padding: 18px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary);
+    }
+    .memory-settings-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+    }
+    .memory-settings-copy h5 {
+        margin: 0 0 6px;
+        color: var(--text-primary);
+        font-size: 1rem;
+    }
+    .memory-settings-copy p {
+        margin: 0 0 8px;
+        color: var(--text-muted);
+        max-width: 680px;
+    }
+    .memory-settings-switch {
+        flex: 0 0 auto;
+        margin: 0;
+        min-width: 118px;
+    }
+    .memory-settings-switch .form-check-input {
+        cursor: pointer;
+    }
+    .memory-privacy-mode {
+        margin-top: 14px;
+        padding-top: 14px;
+        border-top: 1px solid var(--border-color);
+    }
+    .memory-privacy-title {
+        margin: 0 0 10px;
+        color: var(--text-primary);
+        font-weight: 600;
+    }
+    .memory-mode-options {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .memory-mode-option {
+        display: flex;
+        gap: 10px;
+        min-height: 92px;
+        padding: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-secondary);
+        cursor: pointer;
+    }
+    .memory-mode-option input {
+        margin-top: 4px;
+        flex: 0 0 auto;
+    }
+    .memory-mode-option strong {
+        display: block;
+        color: var(--text-primary);
+        font-size: 0.95rem;
+        line-height: 1.2;
+    }
+    .memory-mode-option span {
+        display: block;
+        margin-top: 4px;
+        color: var(--text-muted);
+        font-size: 0.86rem;
+        line-height: 1.35;
+    }
+    @media (max-width: 768px) {
+        .memory-settings-row {
+            align-items: flex-start;
+            flex-direction: column;
+        }
+        .memory-mode-options {
+            grid-template-columns: 1fr;
+        }
+    }
+
     /* --- Web Search section --- */
     .ws-engine-options { display: flex; flex-direction: column; gap: 8px; }
     .ws-engine-option {
@@ -317,6 +400,11 @@
     <li class="nav-item" role="presentation">
         <button class="nav-link" id="usage-tab" data-bs-toggle="tab" data-bs-target="#usage" type="button" role="tab" aria-controls="usage" aria-selected="false">
             <i class="fas fa-chart-bar me-1"></i> Usage & Billing
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" id="memory-tab" data-bs-toggle="tab" data-bs-target="#memory" type="button" role="tab" aria-controls="memory" aria-selected="false">
+            <i class="fas fa-brain me-1"></i> Memory
         </button>
     </li>
     <li class="nav-item" role="presentation">
@@ -672,6 +760,49 @@
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
                         <button type="button" class="btn btn-primary" id="saveAlterEgo">Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== Memory Tab ==================== -->
+    <div class="tab-pane fade" id="memory" role="tabpanel" aria-labelledby="memory-tab">
+        <div class="section-container">
+            <div class="section-title">
+                <i class="fas fa-brain me-2"></i>System Memory
+            </div>
+
+            <div class="memory-settings-card">
+                <div class="memory-settings-row">
+                    <div class="memory-settings-copy">
+                        <h5>Cross-chat memory</h5>
+                        <p>Allow Atagia to use memories from your other chats when building context for a normal conversation.</p>
+                        <small id="memoryPrefsStatus" class="text-muted">Loading memory settings...</small>
+                    </div>
+                    <div class="form-check form-switch memory-settings-switch">
+                        <input class="form-check-input" type="checkbox" id="memoryCrossChatToggle" checked>
+                        <label class="form-check-label" for="memoryCrossChatToggle">Enabled</label>
+                    </div>
+                </div>
+
+                <div class="memory-privacy-mode">
+                    <div class="memory-privacy-title">Privacy mode</div>
+                    <div class="memory-mode-options">
+                        <label class="memory-mode-option" for="memoryPrivacyBalanced">
+                            <input type="radio" name="memoryPrivacyMode" id="memoryPrivacyBalanced" value="balanced" checked>
+                            <div>
+                                <strong>Balanced</strong>
+                                <span>Review sensitive memories before they become broadly available.</span>
+                            </div>
+                        </label>
+                        <label class="memory-mode-option" for="memoryPrivacyTrusted">
+                            <input type="radio" name="memoryPrivacyMode" id="memoryPrivacyTrusted" value="trusted_private">
+                            <div>
+                                <strong>Trusted private</strong>
+                                <span>Use explicit broad consent for private Aurvek memory on this account.</span>
+                            </div>
+                        </label>
                     </div>
                 </div>
             </div>
@@ -1133,6 +1264,92 @@
         }
     });
     {% endif %}
+
+    // --- Atagia memory settings ---
+    (async function initMemorySettings() {
+        const toggle = document.getElementById('memoryCrossChatToggle');
+        const status = document.getElementById('memoryPrefsStatus');
+        const privacyInputs = Array.from(document.querySelectorAll('input[name="memoryPrivacyMode"]'));
+        if (!toggle || !status) return;
+
+        const setStatus = (text, muted = true) => {
+            status.textContent = text;
+            status.classList.toggle('text-muted', muted);
+            status.classList.toggle('text-danger', !muted);
+        };
+        const setControlsDisabled = (disabled) => {
+            toggle.disabled = disabled;
+            privacyInputs.forEach(input => { input.disabled = disabled; });
+        };
+        const setPrivacyMode = (mode) => {
+            const normalized = mode === 'trusted_private' ? 'trusted_private' : 'balanced';
+            privacyInputs.forEach(input => {
+                input.checked = input.value === normalized;
+            });
+        };
+
+        try {
+            const response = await fetch('/api/user/memory-preferences');
+            const data = await response.json();
+            toggle.checked = data.remember_across_chats !== false;
+            setPrivacyMode(data.memory_privacy_mode);
+            setControlsDisabled(data.available === false);
+            setStatus(
+                data.available === false
+                    ? (data.message || 'Atagia memory is not available right now.')
+                    : 'Saved in Atagia.',
+                data.available !== false
+            );
+        } catch (error) {
+            console.error('Failed to load memory preferences', error);
+            setControlsDisabled(true);
+            setStatus('Could not load memory settings.', false);
+        }
+
+        const savePreferences = async (payload, restore) => {
+            setControlsDisabled(true);
+            setStatus('Saving...', true);
+            try {
+                const response = await fetch('/api/user/memory-preferences', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok || data.available === false) {
+                    throw new Error(data.message || 'Atagia memory is not available.');
+                }
+                toggle.checked = data.remember_across_chats !== false;
+                setPrivacyMode(data.memory_privacy_mode);
+                setStatus('Saved in Atagia.', true);
+            } catch (error) {
+                console.error('Failed to save memory preferences', error);
+                restore();
+                setStatus(error.message || 'Could not save memory settings.', false);
+            } finally {
+                setControlsDisabled(false);
+            }
+        };
+
+        toggle.addEventListener('change', function() {
+            const previous = !this.checked;
+            savePreferences(
+                { remember_across_chats: this.checked },
+                () => { this.checked = previous; }
+            );
+        });
+
+        privacyInputs.forEach(input => {
+            input.addEventListener('change', function() {
+                if (!this.checked) return;
+                const previous = this.value === 'trusted_private' ? 'balanced' : 'trusted_private';
+                savePreferences(
+                    { memory_privacy_mode: this.value },
+                    () => setPrivacyMode(previous)
+                );
+            });
+        });
+    })();
 
     // --- Web Search settings (load + UI interactions, save triggered by edit_profile.js on form submit) ---
     (async function initWebSearchSettings() {

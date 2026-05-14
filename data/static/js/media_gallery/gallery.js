@@ -13,16 +13,27 @@ function renderImages(imageSet, containerId) {
 
     const fragment = document.createDocumentFragment();
     imagesToRender.forEach((image, index) => {
+        const fullsizeUrl = image.fullsize_url || image.url;
         const div = document.createElement('div');
         div.className = 'image-container';
-        div.innerHTML = `
-            <input type="checkbox" class="image-checkbox" data-id="${image.id}">
-            <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-                 data-src="${image.url}"
-                 alt="${image.type} image"
-                 class="gallery-image lazy"
-                 onclick="FullsizeViewer.show('${image.url}', ${startIndex + index})">
-        `;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'image-checkbox';
+        checkbox.dataset.id = String(image.id);
+        checkbox.dataset.attachmentRef = image.attachment_ref || '';
+        div.appendChild(checkbox);
+
+        const img = document.createElement('img');
+        img.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+        img.dataset.src = image.url || '';
+        img.alt = `${image.type || ''} image`;
+        img.className = 'gallery-image lazy';
+        img.addEventListener('click', () => {
+            FullsizeViewer.show(fullsizeUrl, startIndex + index);
+        });
+        div.appendChild(img);
+
         fragment.appendChild(div);
     });
     container.appendChild(fragment);
@@ -91,22 +102,41 @@ function renderImagesForCurrentTab(tabId = currentTab) {
     renderPagination(filteredImages.length, tabId);
 
     // Update FullsizeViewer with current images
-    FullsizeViewer.setImages(filteredImages);
+    FullsizeViewer.setImages(filteredImages.map(img => ({
+        ...img,
+        url: img.fullsize_url || img.url
+    })));
 }
 
 // Image deletion functions
-function deleteImages(imageIds) {
-    // IDs must be sent as request body, not inside another object
-    fetch('/delete-images', {
+function deleteImageAttachments(attachmentRefs) {
+    if (!attachmentRefs.length) {
+        return Promise.resolve();
+    }
+    return Promise.all(attachmentRefs.map(ref =>
+        fetch(`/api/attachments/${encodeURIComponent(ref)}`, { method: 'DELETE' })
+    )).then(responses => {
+        const failed = responses.filter(response => !response.ok).length;
+        if (failed) {
+            throw new Error(`${failed} image(s) could not be deleted`);
+        }
+    });
+}
+
+function deleteImages(imageIds, attachmentRefs = []) {
+    const legacyIds = imageIds || [];
+    const attachmentDeletes = deleteImageAttachments(attachmentRefs);
+    const legacyDelete = legacyIds.length ? fetch('/delete-images', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify(imageIds), // Send array of IDs directly
-    })
-    .then(response => response.json())
-    .then(data => {
-        NotificationModal.info('Images Deleted', data.message);
+        body: JSON.stringify(legacyIds),
+    }).then(response => response.json()) : Promise.resolve({ message: '' });
+
+    Promise.all([attachmentDeletes, legacyDelete])
+    .then(([, data]) => {
+        NotificationModal.info('Images Deleted', data.message || 'Images deleted');
         location.reload();
     })
     .catch((error) => {
@@ -118,8 +148,25 @@ function deleteImages(imageIds) {
 // Delete single image from viewer
 function deleteCurrentImage(url, index, imageData) {
     NotificationModal.confirm('Delete Image', 'Are you sure you want to delete this image?', () => {
-        deleteImages([imageData.id]);
+        if (imageData.attachment_ref) {
+            deleteImages([], [imageData.attachment_ref]);
+        } else {
+            deleteImages([imageData.id]);
+        }
     }, null, { type: 'error', confirmText: 'Delete' });
+}
+
+function imageDeletePayload(selectedImages) {
+    const idsToDelete = [];
+    const refsToDelete = [];
+    Array.from(selectedImages).forEach(checkbox => {
+        if (checkbox.dataset.attachmentRef) {
+            refsToDelete.push(checkbox.dataset.attachmentRef);
+        } else {
+            idsToDelete.push(parseInt(checkbox.dataset.id));
+        }
+    });
+    return { idsToDelete, refsToDelete };
 }
 
 // Event Listeners
@@ -138,8 +185,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const selectedImages = document.querySelectorAll('#all .image-checkbox:checked');
         if (selectedImages.length > 0) {
             NotificationModal.confirm('Delete Images', `Are you sure you want to delete ${selectedImages.length} selected images?`, () => {
-                const idsToDelete = Array.from(selectedImages).map(checkbox => parseInt(checkbox.dataset.id));
-                deleteImages(idsToDelete);
+                const { idsToDelete, refsToDelete } = imageDeletePayload(selectedImages);
+                deleteImages(idsToDelete, refsToDelete);
             }, null, { type: 'error', confirmText: 'Delete' });
         } else {
             NotificationModal.warning('Selection Required', 'Please select at least one image to delete');
@@ -150,8 +197,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const selectedImages = document.querySelectorAll('#bot .image-checkbox:checked');
         if (selectedImages.length > 0) {
             NotificationModal.confirm('Delete Images', `Are you sure you want to delete ${selectedImages.length} selected images?`, () => {
-                const idsToDelete = Array.from(selectedImages).map(checkbox => parseInt(checkbox.dataset.id));
-                deleteImages(idsToDelete);
+                const { idsToDelete, refsToDelete } = imageDeletePayload(selectedImages);
+                deleteImages(idsToDelete, refsToDelete);
             }, null, { type: 'error', confirmText: 'Delete' });
         } else {
             NotificationModal.warning('Selection Required', 'Please select at least one image to delete');
@@ -162,8 +209,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const selectedImages = document.querySelectorAll('#user .image-checkbox:checked');
         if (selectedImages.length > 0) {
             NotificationModal.confirm('Delete Images', `Are you sure you want to delete ${selectedImages.length} selected images?`, () => {
-                const idsToDelete = Array.from(selectedImages).map(checkbox => parseInt(checkbox.dataset.id));
-                deleteImages(idsToDelete);
+                const { idsToDelete, refsToDelete } = imageDeletePayload(selectedImages);
+                deleteImages(idsToDelete, refsToDelete);
             }, null, { type: 'error', confirmText: 'Delete' });
         } else {
             NotificationModal.warning('Selection Required', 'Please select at least one image to delete');

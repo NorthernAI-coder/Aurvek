@@ -17,6 +17,7 @@ const limitMessage = 25;
 const processedMessageIds = new Set();
 let currentThinkingBudget = 0;
 let isCurrentConversationLocked = false;
+let currentConversationIncognito = false;
 let userStopped = false;
 
 // Auto-scroll state management
@@ -563,10 +564,11 @@ function addMessage(author, message, timestampInfo = null, isTemporary = false, 
             imgElement.style.maxHeight = '256px';
             imgElement.style.objectFit = 'contain';
             imgElement.style.cursor = 'pointer';
-            imgElement.dataset.fullsize = messageObj.url.replace('_256.webp', '_fullsize.webp');
+            imgElement.dataset.fullsize = messageObj.fullsize_url || messageObj.url.replace('_256.webp', '_fullsize.webp');
             imgElement.dataset.messageId = messageId;
+            imgElement.dataset.attachmentRef = messageObj.attachment_ref || '';
             imgElement.onclick = function() {
-                imageHandler.showFullsize(this.dataset.fullsize, this.dataset.messageId);
+                imageHandler.showFullsize(this.dataset.fullsize, this.dataset.messageId, this.dataset.attachmentRef);
             };
             messageContent.appendChild(imgElement);
         } else if (messageObj.type === 'video_url') {
@@ -1041,7 +1043,7 @@ function showNoChatTemplate() {
     document.querySelector('#form-message button[type="submit"]').disabled = true;
 }
 
-function sendMessage(messageText) {
+function sendMessage(messageText, options = {}) {
     // Check if user can send messages based on API key configuration
     if (!ApiKeyManager.canSendMessages()) {
         ApiKeyManager.handleApiKeyError({ error: 'api_keys_required', action: 'configure_api_keys' });
@@ -1052,6 +1054,7 @@ function sendMessage(messageText) {
         console.error('No conversation selected');
         return false;
     }
+    const sendConversationId = currentConversationId;
 
     // Block send while images are being compressed
     if (compressionInProgress > 0) {
@@ -1059,7 +1062,9 @@ function sendMessage(messageText) {
         return false;
     }
 
-    if (!messageText.trim() && (!attachedFiles || attachedFiles.length === 0)) {
+    const outgoingFiles = Array.isArray(options.filesOverride) ? options.filesOverride : attachedFiles;
+
+    if (!messageText.trim() && (!outgoingFiles || outgoingFiles.length === 0)) {
         return false;
     }
 
@@ -1100,7 +1105,6 @@ function sendMessage(messageText) {
 
     addLoadingIndicator(multiAiLoadingText);
 
-    var files = document.getElementById('chat-files').files;
     var formData = new FormData();
 
     // Compress message with pako (maximum compression level)
@@ -1113,10 +1117,18 @@ function sendMessage(messageText) {
         formData.append('thinking_budget_tokens', currentThinkingBudget);
     }
 
+    if (options.pdfPageStart && options.pdfPageEnd) {
+        formData.append('pdf_page_start', options.pdfPageStart);
+        formData.append('pdf_page_end', options.pdfPageEnd);
+        if (options.pdfRetryToken) {
+            formData.append('pdf_retry_token', options.pdfRetryToken);
+        }
+    }
+
     // Multi-AI: append model IDs if active
     if (isMultiAiRequest) {
         // Block file attachments in Multi-AI v1
-        if (attachedFiles && attachedFiles.length > 0) {
+        if (outgoingFiles && outgoingFiles.length > 0) {
             NotificationModal.warning(
                 'Multi-AI',
                 'File attachments are not supported in Multi-AI Compare mode. Please disable Multi-AI or remove the attached files.'
@@ -1133,8 +1145,23 @@ function sendMessage(messageText) {
     var imagePreviews = document.getElementById('image-previews');
     imagePreviews.innerHTML = '';
 
-    processFiles(attachedFiles, formData, imagePreviews);
-    attachedFiles = [];
+    const filesForRetry = Array.from(outgoingFiles || []);
+    const retryRangeBaseStart = Number.isInteger(parseInt(options.pdfPageStart, 10))
+        ? parseInt(options.pdfPageStart, 10)
+        : 1;
+    const renderedAttachmentElements = processFiles(
+        outgoingFiles || [],
+        formData,
+        imagePreviews,
+        sendConversationId,
+        {
+            pdfPageStart: options.pdfPageStart || null,
+            pdfPageEnd: options.pdfPageEnd || null,
+        }
+    ) || [];
+    if (!options.filesOverride) {
+        attachedFiles = [];
+    }
 
     // Hoisted for error cleanup access across the entire promise chain
     let botMessageElement = null;
@@ -1142,10 +1169,13 @@ function sendMessage(messageText) {
     let streamContentReceived = false;
     let streamErrorOccurred = false;
     let streamSucceeded = false;
+    let pdfTooLargeError = null;
+    let pdfRangeRetryStarted = false;
     userStopped = false;
 
     function cleanupFailedStream(userMsgEl, botMsgEl, restoreText) {
         const hadAttachments = formData.getAll('file').length > 0;
+        renderedAttachmentElements.cancelled = true;
 
         // Remove empty/partial bot bubble
         if (botMsgEl && botMsgEl.parentNode) {
@@ -1174,12 +1204,195 @@ function sendMessage(messageText) {
         document.getElementById('message-text').style.height = 'auto';
     }
 
+    function resetSendUiForActiveConversation() {
+        removeLoadingIndicator();
+        toggleSendButton('Send');
+        const textInput = document.getElementById('message-text');
+        const submitBtn = document.querySelector('#form-message button[type="submit"]');
+        const canEnable = currentConversationId !== null && !isCurrentConversationLocked;
+        if (textInput) {
+            textInput.disabled = !canEnable;
+            textInput.style.height = 'auto';
+        }
+        if (submitBtn) submitBtn.disabled = !canEnable;
+    }
+
+    function removeRetryEcho(restoreControls = currentConversationId === sendConversationId) {
+        renderedAttachmentElements.cancelled = true;
+        if (userMessageElement && userMessageElement.parentNode) {
+            userMessageElement.remove();
+        }
+        renderedAttachmentElements.forEach((el) => {
+            if (el && el.parentNode) {
+                el.remove();
+            }
+        });
+        if (botMessageElement && botMessageElement.parentNode) {
+            botMessageElement.remove();
+        }
+        if (!restoreControls) {
+            return;
+        }
+        removeLoadingIndicator();
+        toggleSendButton('Send');
+        const submitBtn = document.querySelector('#form-message button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = false;
+        const textInput = document.getElementById('message-text');
+        textInput.disabled = false;
+        textInput.style.height = 'auto';
+    }
+
+    function showPdfRangeRetryModal(errorData) {
+        if (currentConversationId !== sendConversationId) {
+            removeRetryEcho(false);
+            resetSendUiForActiveConversation();
+            NotificationModal.warning(
+                'PDF too large',
+                'The PDF failed after you changed conversations. Return to the original conversation and resend a smaller page range.'
+            );
+            return;
+        }
+
+        removeLoadingIndicator();
+        toggleSendButton('Send');
+        const submitBtn = document.querySelector('#form-message button[type="submit"]');
+        if (submitBtn) submitBtn.disabled = false;
+        document.getElementById('message-text').disabled = false;
+
+        if (errorData.range_retry_available === false) {
+            removeRetryEcho();
+            document.getElementById('message-text').value = messageText_raw;
+            NotificationModal.warning(
+                'PDF too large',
+                'A PDF already in this conversation is too large for the selected AI model. Re-attach that PDF and send a smaller page range, or start a new conversation without it.'
+            );
+            return;
+        }
+
+        const retryPdfFiles = filesForRetry.filter((file) => file && file.type === 'application/pdf');
+        if (retryPdfFiles.length !== 1) {
+            removeRetryEcho();
+            if (currentConversationId === sendConversationId) {
+                document.getElementById('message-text').value = messageText_raw;
+            }
+            NotificationModal.warning(
+                'PDF too large',
+                'Page range retry supports one PDF attachment at a time. Re-attach one PDF and try again.'
+            );
+            return;
+        }
+
+        const pages = parseInt(errorData.retry_pages || errorData.pages || 0, 10);
+        const maxPage = pages > 0 ? pages : 1000;
+        const suggestedPageEnd = parseInt(errorData.suggested_page_end || 0, 10);
+        const defaultEnd = Number.isInteger(suggestedPageEnd) && suggestedPageEnd > 0
+            ? Math.min(maxPage, suggestedPageEnd)
+            : Math.min(maxPage, 100);
+        const filename = (errorData.retry_filename || errorData.filename)
+            ? escapeHtml(errorData.retry_filename || errorData.filename)
+            : 'document.pdf';
+        const retryHint = errorData.retry_hint
+            ? `<div class="pdf-range-provider-error">${escapeHtml(errorData.retry_hint)}</div>`
+            : '';
+        const contextPdfNote = parseInt(errorData.context_pdf_count || 0, 10) > 0
+            ? '<p>Previous PDFs in this conversation will be ignored for this retry.</p>'
+            : '';
+        const html = `
+            <div class="pdf-range-retry">
+                <p>PDF too large for the selected AI model.</p>
+                <p><strong>${filename}</strong>${pages ? ` has ${pages} pages.` : ''}</p>
+                ${contextPdfNote}
+                <div class="pdf-range-inputs">
+                    <label for="pdf-range-start">From page</label>
+                    <input id="pdf-range-start" class="form-control" type="number" min="1" max="${maxPage}" value="1">
+                    <label for="pdf-range-end">To page</label>
+                    <input id="pdf-range-end" class="form-control" type="number" min="1" max="${maxPage}" value="${defaultEnd}">
+                </div>
+                <div id="pdf-range-error" class="pdf-range-error" style="display:none;"></div>
+                ${retryHint}
+            </div>
+        `;
+        let rangeActionTaken = false;
+
+        NotificationModal.confirm(
+            'PDF too large',
+            html,
+            (modal) => {
+                if (currentConversationId !== sendConversationId) {
+                    rangeActionTaken = true;
+                    modal.hide();
+                    removeRetryEcho(false);
+                    NotificationModal.warning(
+                        'Conversation changed',
+                        'Return to the original conversation and resend the PDF range from there.'
+                    );
+                    return;
+                }
+                const start = parseInt(document.getElementById('pdf-range-start')?.value || '', 10);
+                const end = parseInt(document.getElementById('pdf-range-end')?.value || '', 10);
+                const errorEl = document.getElementById('pdf-range-error');
+                if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > maxPage) {
+                    if (errorEl) {
+                        errorEl.textContent = `Enter a valid range between 1 and ${maxPage}.`;
+                        errorEl.style.display = 'block';
+                    }
+                    return;
+                }
+                if ((end - start + 1) > 1000) {
+                    if (errorEl) {
+                        errorEl.textContent = 'Select at most 1000 pages.';
+                        errorEl.style.display = 'block';
+                    }
+                    return;
+                }
+                rangeActionTaken = true;
+                pdfRangeRetryStarted = true;
+                modal.hide();
+                removeRetryEcho();
+                const absoluteStart = retryRangeBaseStart + start - 1;
+                const absoluteEnd = retryRangeBaseStart + end - 1;
+                sendMessage(messageText_raw, {
+                    filesOverride: filesForRetry,
+                    pdfPageStart: absoluteStart,
+                    pdfPageEnd: absoluteEnd,
+                    pdfRetryToken: errorData.retry_token || null
+                });
+            },
+            () => {
+                rangeActionTaken = true;
+                removeRetryEcho();
+                if (currentConversationId === sendConversationId) {
+                    document.getElementById('message-text').value = messageText_raw;
+                }
+            },
+            {
+                type: 'warning',
+                confirmText: 'Send range',
+                cancelText: 'Do not send',
+                allowHtml: true,
+                hideOnConfirm: false
+            }
+        );
+
+        const modalEl = NotificationModal._modalElement;
+        if (modalEl) {
+            modalEl.addEventListener('hidden.bs.modal', () => {
+                if (rangeActionTaken || pdfRangeRetryStarted) return;
+                rangeActionTaken = true;
+                removeRetryEcho();
+                if (currentConversationId === sendConversationId) {
+                    document.getElementById('message-text').value = messageText_raw;
+                }
+            }, { once: true });
+        }
+    }
+
     controller = new AbortController();
     const signal = controller.signal;
 
     toggleSendButton('Stop');
 
-    secureFetch(`/api/conversations/${currentConversationId}/messages`, {
+    secureFetch(`/api/conversations/${sendConversationId}/messages`, {
         method: 'POST',
         body: formData,
         signal: signal,
@@ -1248,11 +1461,25 @@ function sendMessage(messageText) {
         }
 
         if (!response.ok) {
-            cleanupFailedStream(userMessageElement, botMessageElement, true);
-            return extractServerError(response).then((msg) => {
-                NotificationModal.error('Send failed', String(msg));
-                return null;
-            });
+            return response.clone().json()
+                .then((body) => {
+                    if (body && (body.error_code === 'pdf_too_large' || body.pdf_too_large === true)) {
+                        pdfTooLargeError = body;
+                        showPdfRangeRetryModal(body);
+                        return null;
+                    }
+                    cleanupFailedStream(userMessageElement, botMessageElement, true);
+                    const msg = body?.error || body?.message || body?.detail || `Request failed (${response.status})`;
+                    NotificationModal.error('Send failed', String(msg));
+                    return null;
+                })
+                .catch(() => {
+                    cleanupFailedStream(userMessageElement, botMessageElement, true);
+                    return extractServerError(response).then((msg) => {
+                        NotificationModal.error('Send failed', String(msg));
+                        return null;
+                    });
+                });
         }
 
         if (!response.body) {
@@ -1265,9 +1492,74 @@ function sendMessage(messageText) {
     })
     .then(reader => {
         if (!reader) return; // If there was redirection, reader will be undefined
-        
+
         const sseDecoder = new TextDecoder('utf-8');
         let sseBuffer = '';
+        let abandonedPdfErrorHandled = false;
+
+        function parseSseLines(value) {
+            sseBuffer += sseDecoder.decode(value, { stream: true });
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop();
+            return lines;
+        }
+
+        function rememberPdfTooLargeError(parsedData) {
+            if (parsedData && (parsedData.error_code === 'pdf_too_large' || parsedData.pdf_too_large === true)) {
+                pdfTooLargeError = parsedData;
+                streamErrorOccurred = true;
+                return true;
+            }
+            return false;
+        }
+
+        function inspectAbandonedSseForPdfError(lines) {
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const data = line.slice(6).trim();
+                if (!data || data === '[DONE]' || !data.startsWith('{')) continue;
+                try {
+                    const parsedData = JSON.parse(data);
+                    if (rememberPdfTooLargeError(parsedData)) {
+                        return true;
+                    }
+                } catch (err) {
+                    // Ignore malformed partial events while draining; normal render path handles visible errors.
+                }
+            }
+            return false;
+        }
+
+        function drainStreamSilently() {
+            return reader.read().then(({ done, value }) => {
+                if (done) {
+                    if (pdfTooLargeError && !pdfRangeRetryStarted && !abandonedPdfErrorHandled) {
+                        abandonedPdfErrorHandled = true;
+                        showPdfRangeRetryModal(pdfTooLargeError);
+                    }
+                    return;
+                }
+                if (inspectAbandonedSseForPdfError(parseSseLines(value)) && !pdfRangeRetryStarted && !abandonedPdfErrorHandled) {
+                    abandonedPdfErrorHandled = true;
+                    showPdfRangeRetryModal(pdfTooLargeError);
+                }
+                return drainStreamSilently();
+            }).catch(() => {});
+        }
+
+        function abandonStreamRender() {
+            renderedAttachmentElements.cancelled = true;
+            if (botMessageElement && botMessageElement.parentNode) {
+                botMessageElement.remove();
+            }
+            resetSendUiForActiveConversation();
+            return drainStreamSilently();
+        }
+
+        if (currentConversationId !== sendConversationId) {
+            return abandonStreamRender();
+        }
+
         let botMessageText = '';
         let endConversation = false;
         let newMessageId = null;
@@ -1278,6 +1570,10 @@ function sendMessage(messageText) {
         // Create the bot message element before starting to read the stream
         botMessageElement = document.createElement('div');
         botMessageElement.classList.add('message', 'text-white', 'bot');
+        botMessageElement.dataset.conversationId = sendConversationId;
+        if (userMessageElement) {
+            userMessageElement.dataset.conversationId = sendConversationId;
+        }
 
         // Create the container for the avatar and the message
         const messageContentContainer = document.createElement('div');
@@ -1327,14 +1623,14 @@ function sendMessage(messageText) {
             return botMessageText;
         };
 
-        const audioIcon = createIcon('fa-volume-up', 'inline', () => textToSpeech(getCurrentBotText(), user_id, currentConversationId, audioIcon, 'bot'));
+        const audioIcon = createIcon('fa-volume-up', 'inline', () => textToSpeech(getCurrentBotText(), user_id, sendConversationId, audioIcon, 'bot'));
         audioIcon.dataset.baseIcon = 'fa-volume-up';
         audioIcon.title = 'Read aloud';
         const bookmarkIcon = createIcon('fa-bookmark', 'none', function() {
             const messageElement = this.closest('.message');
             const messageId = messageElement ? messageElement.dataset.messageId : null;
             if (messageId) {
-                toggleBookmark(messageId, currentConversationId, this);
+                toggleBookmark(messageId, sendConversationId, this);
             } else {
                 console.error('Could not find message ID to mark as favorite');
             }
@@ -1342,9 +1638,9 @@ function sendMessage(messageText) {
         bookmarkIcon.title = 'Add to bookmarks';
         const copyIcon = createIcon('fa-copy', 'none', () => copyToClipboard(getCurrentBotText(), copyIcon));
         copyIcon.title = 'Copy text';
-        const branchIcon = createIcon('fa-code-branch', 'none', () => branchConversation(newMessageId, currentConversationId));
+        const branchIcon = createIcon('fa-code-branch', 'none', () => branchConversation(newMessageId, sendConversationId));
         branchIcon.title = 'Branch from here';
-        const rollbackIcon = createIcon('fa-level-up-alt', 'none', () => rollbackConversation(newMessageId, currentConversationId));
+        const rollbackIcon = createIcon('fa-level-up-alt', 'none', () => rollbackConversation(newMessageId, sendConversationId));
         rollbackIcon.title = 'Start over from here';
 
         iconContainer.appendChild(audioIcon);
@@ -1367,11 +1663,11 @@ function sendMessage(messageText) {
                 icon.setAttribute('data-message-id', messageId);
                 if (iconClass === 'fa-level-up-alt') {
                     icon.onclick = function() {
-                        rollbackConversation(this.getAttribute('data-message-id'), currentConversationId);
+                        rollbackConversation(this.getAttribute('data-message-id'), sendConversationId);
                     };
                 } else {
                     icon.onclick = function() {
-                        branchConversation(this.getAttribute('data-message-id'), currentConversationId);
+                        branchConversation(this.getAttribute('data-message-id'), sendConversationId);
                     };
                 }
             } else {
@@ -1387,16 +1683,26 @@ function sendMessage(messageText) {
         scrollToBottomIfNeeded();
 
         function readStream() {
+            if (currentConversationId !== sendConversationId) {
+                return abandonStreamRender();
+            }
             return reader.read().then(({ done, value }) => {
-				if (done) {
-					if (userStopped && !streamContentReceived) {
-						if (botMessageElement?.parentNode) botMessageElement.remove();
-						toggleSendButton('Send');
-						return;
-					}
-					if (!streamContentReceived && !streamErrorOccurred) {
-						cleanupFailedStream(userMessageElement, botMessageElement, true);
-						const hadAttachments = formData.getAll('file').length > 0;
+                if (currentConversationId !== sendConversationId) {
+                    return abandonStreamRender();
+                }
+					if (done) {
+						if (userStopped && !streamContentReceived) {
+							if (botMessageElement?.parentNode) botMessageElement.remove();
+							toggleSendButton('Send');
+							return;
+						}
+						if (pdfTooLargeError && !pdfRangeRetryStarted) {
+							showPdfRangeRetryModal(pdfTooLargeError);
+							return;
+						}
+						if (!streamContentReceived && !streamErrorOccurred) {
+							cleanupFailedStream(userMessageElement, botMessageElement, true);
+							const hadAttachments = formData.getAll('file').length > 0;
 						if (hadAttachments) {
 							NotificationModal.error('Empty response',
 								'The AI returned an empty response. Files were uploaded but the response failed. Please re-attach your files and try again.');
@@ -1418,23 +1724,24 @@ function sendMessage(messageText) {
 					}
 					return;
 				}
-                sseBuffer += sseDecoder.decode(value, { stream: true });
-                const lines = sseBuffer.split('\n');
-                // Keep the last (potentially incomplete) line in the buffer
-                sseBuffer = lines.pop();
+                const lines = parseSseLines(value);
         
                 for (const line of lines) {
                     if (line.startsWith('data: ')) {
                         const data = line.slice(6).trim();
 						
-                        if (data === '[DONE]') {
-                            if (userStopped && !streamContentReceived) {
-                                if (botMessageElement?.parentNode) botMessageElement.remove();
-                                toggleSendButton('Send');
-                                return;
-                            }
-                            if (!streamContentReceived && !streamErrorOccurred) {
-                                cleanupFailedStream(userMessageElement, botMessageElement, true);
+	                        if (data === '[DONE]') {
+	                            if (userStopped && !streamContentReceived) {
+	                                if (botMessageElement?.parentNode) botMessageElement.remove();
+	                                toggleSendButton('Send');
+	                                return;
+	                            }
+	                            if (pdfTooLargeError && !pdfRangeRetryStarted) {
+	                                showPdfRangeRetryModal(pdfTooLargeError);
+	                                return;
+	                            }
+	                            if (!streamContentReceived && !streamErrorOccurred) {
+	                                cleanupFailedStream(userMessageElement, botMessageElement, true);
                                 const hadAttachments = formData.getAll('file').length > 0;
                                 if (hadAttachments) {
                                     NotificationModal.error('Empty response',
@@ -1462,7 +1769,7 @@ function sendMessage(messageText) {
                                 endConversation = true;
                                 isCurrentConversationLocked = true;
                                 // Update UI to show locked state
-                                const selectedChat = document.querySelector(`.list-group-item[data-conversation-id="${currentConversationId}"]`);
+                                const selectedChat = document.querySelector(`.list-group-item[data-conversation-id="${sendConversationId}"]`);
                                 if (selectedChat) {
                                     selectedChat.dataset.locked = 'true';
                                     selectedChat.classList.add('conversation-locked');
@@ -1474,8 +1781,10 @@ function sendMessage(messageText) {
                                     }
                                 }
                                 // Show locked banner
-                                const lockedBanner = document.getElementById('locked-conversation-banner');
-                                if (lockedBanner) lockedBanner.style.display = 'flex';
+                                if (currentConversationId === sendConversationId) {
+                                    const lockedBanner = document.getElementById('locked-conversation-banner');
+                                    if (lockedBanner) lockedBanner.style.display = 'flex';
+                                }
                             }
                             // Note: pass_turn action sends '🚩' as content, which displays
                             // as a normal bot message. No special handling needed.
@@ -1527,14 +1836,21 @@ function sendMessage(messageText) {
                                 scrollToBottomIfNeeded();
                             } else if (parsedData.multi_ai_done && multiAiCarousel?._multiAiApi) {
                                 multiAiCarousel._multiAiApi.markSlideDone(parsedData.llm_id);
-                            } else if (parsedData.multi_ai_error && multiAiCarousel?._multiAiApi) {
-                                multiAiCarousel._multiAiApi.setSlideError(parsedData.llm_id, parsedData.error || 'Unknown error');
-                                scrollToBottomIfNeeded();
-                            } else if (parsedData.error && !parsedData.multi_ai_error) {
-                                console.error('SSE error:', parsedData.error);
-                                streamErrorOccurred = true;
-                                NotificationModal.error('AI Error', parsedData.error);
-                                if (multiAiCarousel?._multiAiApi) {
+	                            } else if (parsedData.multi_ai_error && multiAiCarousel?._multiAiApi) {
+	                                multiAiCarousel._multiAiApi.setSlideError(parsedData.llm_id, parsedData.error || 'Unknown error');
+	                                scrollToBottomIfNeeded();
+	                            } else if (parsedData.error && !parsedData.multi_ai_error) {
+	                                console.error('SSE error:', parsedData.error);
+	                                streamErrorOccurred = true;
+	                                if (parsedData.error_code === 'pdf_too_large' || parsedData.pdf_too_large === true) {
+	                                    pdfTooLargeError = parsedData;
+	                                    if (botMessageParagraph) {
+	                                        botMessageParagraph.textContent = parsedData.error;
+	                                    }
+	                                    continue;
+	                                }
+	                                NotificationModal.error('AI Error', parsedData.error);
+	                                if (multiAiCarousel?._multiAiApi) {
                                     multiAiCarousel._multiAiApi.setGlobalError(parsedData.error);
                                 } else if (botMessageParagraph) {
                                     botMessageParagraph.innerHTML = '';
@@ -1693,7 +2009,7 @@ function sendMessage(messageText) {
                 }
 
                 // Move this conversation to the top of the sidebar
-                moveConversationToTop(currentConversationId);
+                moveConversationToTop(sendConversationId);
 
                 // Add event listeners to show/hide icons
                 botMessageElement.addEventListener('mouseover', function() {
@@ -1761,13 +2077,14 @@ function sendMessage(messageText) {
 function updateMessageId(messageId, element) {
     if (element) {
         const isBotMessage = element.classList.contains('bot');
+        const targetConversationId = element.dataset.conversationId || currentConversationId;
         element.dataset.messageId = messageId;
         const rollbackIcon = element.querySelector('.fa-level-up-alt');
         if (rollbackIcon) {
             rollbackIcon.setAttribute('data-message-id', messageId);
             rollbackIcon.style.display = 'inline';
             rollbackIcon.onclick = function() {
-                rollbackConversation(messageId, currentConversationId);
+                rollbackConversation(messageId, targetConversationId);
             };
         } else if (isBotMessage) {
         }
@@ -1775,7 +2092,7 @@ function updateMessageId(messageId, element) {
         if (branchIcon) {
             branchIcon.setAttribute('data-message-id', messageId);
             branchIcon.onclick = function() {
-                branchConversation(messageId, currentConversationId);
+                branchConversation(messageId, targetConversationId);
             };
         }
     } else {
@@ -1875,6 +2192,9 @@ const loadedConversationIds = new Set();
 
 function addConversationElement(conversation, chatName, currentConversationId, isNew = false) {
     //console.log(`Adding conversation: ${conversation.id} External: ${conversation.external_platform} Chat Name: ${chatName}`);
+    if (conversation.hidden_from_history || conversation.is_incognito) {
+        return;
+    }
     
     // Ensure we always have a valid name
     chatName = chatName || `Chat ${conversation.id}`;
@@ -1907,6 +2227,7 @@ function addConversationElement(conversation, chatName, currentConversationId, i
     conversationElement.dataset.locked = conversation.locked ? 'true' : 'false';
     conversationElement.dataset.webSearchAllowed = conversation.web_search_allowed !== false ? 'true' : 'false';
     conversationElement.dataset.webSearchForced = conversation.web_search_forced === true ? 'true' : 'false';
+    conversationElement.dataset.isIncognito = conversation.is_incognito ? 'true' : 'false';
     if (conversation.forced_llm_id) {
         conversationElement.dataset.forcedLlmId = conversation.forced_llm_id;
     }
@@ -2423,6 +2744,12 @@ function sortDynamicChats() {
 }
 
 function updateSingleConversation(element, conversationData, externalContainer, dynamicContainer) {
+    if (conversationData.hidden_from_history || conversationData.is_incognito) {
+        if (element instanceof HTMLElement) {
+            element.remove();
+        }
+        return;
+    }
     // Ensure we always have a valid name
     const chatName = conversationData.chat_name || `Chat ${conversationData.id}`;
     let targetContainer;
@@ -2446,6 +2773,7 @@ function updateSingleConversation(element, conversationData, externalContainer, 
     element.dataset.conversationId = conversationData.id;
     element.dataset.lastActivity = conversationData.last_activity || '';
     element.dataset.machine = conversationData.machine || 'undefined';
+    element.dataset.isIncognito = conversationData.is_incognito ? 'true' : 'false';
     if (conversationData.external_platform) {
         element.dataset.externalPlatform = conversationData.external_platform;
     } else {
@@ -2679,6 +3007,15 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
         return Promise.resolve();
     }
 
+    if (currentConversationIncognito &&
+        currentConversationId &&
+        currentConversationId.toString() !== conversationId.toString()) {
+        return maybeCloseCurrentIncognitoBeforeLeaving().then(canContinue => {
+            if (!canContinue) return Promise.resolve();
+            return continueConversation(conversationId, chatName, machine, isInit, targetMessageId, conversationData);
+        });
+    }
+
     // Same conversation but jumping to a specific message: reset state and reload
     if (currentConversationId &&
         currentConversationId.toString() === conversationId.toString() &&
@@ -2708,8 +3045,14 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
     }
     isLoading = false;
     processedMessageIds.clear();
-    localStorage.setItem('activeConversationId', conversationId);
     currentConversationId = conversationId;
+    const isIncognitoConversation = isConversationIncognitoData(conversationData, selectedChat);
+    if (isIncognitoConversation) {
+        localStorage.removeItem('activeConversationId');
+    } else {
+        localStorage.setItem('activeConversationId', conversationId);
+    }
+    setIncognitoUiState(isIncognitoConversation);
     const dateOptions = { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' };
     const formattedStartDate = new Date(startDate).toLocaleDateString(undefined, dateOptions);
 
@@ -3002,6 +3345,8 @@ function processMessage(message, container, prepend = false) {
                     messageObj = {
                         type: 'image_url',
                         url: item.image_url.url,
+                        fullsize_url: item.image_url.fullsize_url,
+                        attachment_ref: item.image_url.attachment_ref,
                         alt: item.image_url.alt,
                         is_bookmarked: message.is_bookmarked,
                         conversation_id: message.conversation_id
@@ -3037,6 +3382,7 @@ function processMessage(message, container, prepend = false) {
                     messageObj = {
                         type: 'image_url',
                         url: item.source.data,
+                        fullsize_url: item.source.data,
                         is_bookmarked: message.is_bookmarked,
                         conversation_id: message.conversation_id
                     };
@@ -3131,6 +3477,7 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
         const data = await response.json();
         const messages = data.messages;
         const conversationInfo = data.conversation_info;
+        setIncognitoUiState(isConversationIncognitoData(conversationInfo));
 
         allMessagesLoaded = !data.has_more;
 
@@ -3320,12 +3667,115 @@ function setupInfiniteScroll(conversationId) {
 let isCurrentConversationEmpty = true;
 let isFirstCall = true;
 
-function startNewConversation(promptId = null) {
+function isConversationIncognitoData(conversationData, selectedChat = null) {
+    if (conversationData && (
+        conversationData.is_incognito === true ||
+        conversationData.hidden_from_history === true ||
+        conversationData.purge_on_close === true
+    )) {
+        return true;
+    }
+    return selectedChat && selectedChat.dataset.isIncognito === 'true';
+}
+
+function setIncognitoUiState(isIncognito) {
+    currentConversationIncognito = Boolean(isIncognito);
+    const badge = document.getElementById('incognito-chat-badge');
+    const closeBtn = document.getElementById('close-incognito-chat-btn');
+    if (badge) {
+        badge.hidden = !currentConversationIncognito;
+    }
+    if (closeBtn) {
+        closeBtn.hidden = !currentConversationIncognito;
+    }
+}
+
+function closeCurrentIncognitoConversation() {
+    if (!currentConversationIncognito || !currentConversationId) {
+        return Promise.resolve(false);
+    }
+    const closingId = currentConversationId;
+    return secureFetch(`/api/conversations/${closingId}/incognito/close`, {
+        method: 'POST'
+    })
+    .then(response => response ? response.json() : null)
+    .then(() => {
+        removeConversationElement(closingId);
+        loadedConversationIds.delete(Number(closingId));
+        loadedConversationIds.delete(String(closingId));
+        if (String(currentConversationId) === String(closingId)) {
+            currentConversationId = null;
+            localStorage.removeItem('activeConversationId');
+            setIncognitoUiState(false);
+            const chatMessagesContainer = document.getElementById('chat-messages-container');
+            if (chatMessagesContainer) {
+                chatMessagesContainer.innerHTML = '';
+            }
+        }
+        return true;
+    })
+    .catch(error => {
+        console.error('Error closing incognito conversation:', error);
+        NotificationModal.error('Close Failed', 'Could not close the incognito chat.');
+        return false;
+    });
+}
+
+function maybeCloseCurrentIncognitoBeforeLeaving() {
+    if (!currentConversationIncognito || !currentConversationId) {
+        return Promise.resolve(true);
+    }
+    return closeCurrentIncognitoConversation().then(result => result !== false);
+}
+
+function initIncognitoChatControls() {
+    const newIncognitoBtn = document.getElementById('new-incognito-chat-btn');
+    if (newIncognitoBtn) {
+        newIncognitoBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            const dropdownToggle = document.querySelector('.btn-group .dropdown-toggle-split[data-bs-toggle="dropdown"]');
+            if (dropdownToggle && typeof bootstrap !== 'undefined') {
+                bootstrap.Dropdown.getOrCreateInstance(dropdownToggle).hide();
+            }
+            SessionManager.validateSession(true).then(isValid => {
+                if (isValid) {
+                    startNewConversation(null, { incognito: true });
+                }
+            });
+        });
+    }
+
+    const closeBtn = document.getElementById('close-incognito-chat-btn');
+    if (closeBtn) {
+        closeBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            closeCurrentIncognitoConversation().then(closed => {
+                if (closed) {
+                    startNewConversation();
+                }
+            });
+        });
+    }
+
+    window.addEventListener('pagehide', function() {
+        if (!currentConversationIncognito || !currentConversationId) return;
+        const url = `/api/conversations/${currentConversationId}/incognito/close`;
+        if (navigator.sendBeacon) {
+            navigator.sendBeacon(url, new Blob([], { type: 'application/json' }));
+        } else {
+            fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+        }
+        localStorage.removeItem('activeConversationId');
+    });
+}
+
+function startNewConversation(promptId = null, options = {}) {
     if (admin_view) {
         return Promise.resolve();
     }
+    const incognito = options && options.incognito === true;
 
-    if (!isFirstCall && isCurrentConversationEmpty) {
+    if (!incognito && !isFirstCall && isCurrentConversationEmpty) {
         return Promise.resolve();
     }
 
@@ -3343,13 +3793,21 @@ function startNewConversation(promptId = null) {
     if (promptId !== null) {
         body.prompt_id = promptId;
     }
+    if (incognito) {
+        body.incognito = true;
+    }
 
-    return secureFetch('/api/conversations/new', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body)
+    return maybeCloseCurrentIncognitoBeforeLeaving().then(canContinue => {
+        if (!canContinue) {
+            return Promise.resolve();
+        }
+        return secureFetch('/api/conversations/new', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body)
+        });
     })
     .then(response => {
         if (!response) {
@@ -3360,7 +3818,9 @@ function startNewConversation(promptId = null) {
     })
     .then(data => {
         startDate = new Date(); 
-        addConversationElement(data, data.name, null, true);
+        if (!data.hidden_from_history && !data.is_incognito) {
+            addConversationElement(data, data.name, null, true);
+        }
         return continueConversation(data.id, data.name, data.machine, false, null, data);
     })
     .then(() => {
@@ -3803,14 +4263,14 @@ class ModelSelector {
             html += `<div class="model-group-header">${safeMachine}</div>`;
             
             // Sort models within each group
-            const sortedModels = groupedModels[machine].sort((a, b) => a.model.localeCompare(b.model));
+            const sortedModels = groupedModels[machine].sort((a, b) => (a.display_name || a.model).localeCompare(b.display_name || b.model));
             
             sortedModels.forEach(model => {
-                // const visionBadge = model.vision ? '<span class="vision-badge">Vision</span>' : '';
+                const displayText = escapeHtml(String(model.display_name || model.model || ''));
                 const safeModel = escapeHtml(String(model.model || ''));
                 html += `
                     <div class="model-item" data-llm-id="${model.id}" data-model="${safeModel}">
-                        <span>${safeModel}</span>
+                        <span>${displayText}</span>
                     </div>
                 `;
             });
@@ -4244,8 +4704,9 @@ class MultiAiManager {
             const safeMachine = escapeHtml(machine);
             html += `<div class="multi-ai-provider-group">`;
             html += `<div class="multi-ai-provider-header">${safeMachine}</div>`;
-            grouped[machine].sort((a, b) => a.model.localeCompare(b.model)).forEach(model => {
+            grouped[machine].sort((a, b) => (a.display_name || a.model).localeCompare(b.display_name || b.model)).forEach(model => {
                 const checked = this.selectedModels.some(s => s.llm_id === model.id) ? 'checked' : '';
+                const displayText = escapeHtml(String(model.display_name || model.model || ''));
                 const safeModelName = escapeHtml(String(model.model || ''));
                 const safeMachineName = escapeHtml(String(model.machine || ''));
                 html += `
@@ -4255,7 +4716,7 @@ class MultiAiManager {
                                data-machine="${safeMachineName}"
                                data-model="${safeModelName}"
                                ${checked}>
-                        <span class="multi-ai-model-name">${safeModelName}</span>
+                        <span class="multi-ai-model-name">${displayText}</span>
                     </label>
                 `;
             });
@@ -4883,6 +5344,7 @@ function initWebSearchEventListeners() {
 // Initialize on DOM ready
 document.addEventListener('DOMContentLoaded', function() {
     initPlusMenu();
+    initIncognitoChatControls();
     initializeThinkingTokensControl();
     initWebSearchEventListeners();
     setTimeout(() => {

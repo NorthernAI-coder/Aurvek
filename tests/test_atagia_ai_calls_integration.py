@@ -16,6 +16,12 @@ class FakeBridge:
         message_text,
         *,
         occurred_at=None,
+        prompt_id=None,
+        message_id=None,
+        source_seq=None,
+        ingest_origin=None,
+        confirmation_strategy=None,
+        incognito=None,
     ):
         self.context_calls.append(
             {
@@ -23,12 +29,25 @@ class FakeBridge:
                 "conversation_id": conversation_id,
                 "message_text": message_text,
                 "occurred_at": occurred_at,
+                "prompt_id": prompt_id,
+                "message_id": message_id,
+                "source_seq": source_seq,
+                "ingest_origin": ingest_origin,
+                "confirmation_strategy": confirmation_strategy,
+                "incognito": incognito,
             }
         )
         return self.context_result
 
-    async def ensure_user_and_conversation(self, user_id, conversation_id):
-        self.ensure_calls.append((user_id, conversation_id))
+    async def ensure_user_and_conversation(
+        self,
+        user_id,
+        conversation_id,
+        *,
+        prompt_id=None,
+        incognito=None,
+    ):
+        self.ensure_calls.append((user_id, conversation_id, prompt_id, incognito))
         return str(conversation_id)
 
     async def record_assistant_response(
@@ -38,6 +57,12 @@ class FakeBridge:
         response_text,
         *,
         occurred_at=None,
+        prompt_id=None,
+        message_id=None,
+        source_seq=None,
+        ingest_origin=None,
+        confirmation_strategy=None,
+        incognito=None,
     ):
         self.response_calls.append(
             {
@@ -45,6 +70,12 @@ class FakeBridge:
                 "conversation_id": conversation_id,
                 "response_text": response_text,
                 "occurred_at": occurred_at,
+                "prompt_id": prompt_id,
+                "message_id": message_id,
+                "source_seq": source_seq,
+                "ingest_origin": ingest_origin,
+                "confirmation_strategy": confirmation_strategy,
+                "incognito": incognito,
             }
         )
         return True
@@ -93,11 +124,59 @@ async def test_augment_prompt_fetches_atagia_context_and_appends_system_prompt(m
             "conversation_id": 99,
             "message_text": "hello",
             "occurred_at": "2026-04-16T12:00:00+00:00",
+            "prompt_id": None,
+            "message_id": None,
+            "source_seq": None,
+            "ingest_origin": "live_turn",
+            "confirmation_strategy": "live_prompt_allowed",
+            "incognito": None,
         }
     ]
     assert "Base system prompt" in prompt
     assert "[ATAGIA MEMORY CONTEXT - INTERNAL]" in prompt
     assert "Memory says: prefers short answers." in prompt
+
+
+@pytest.mark.asyncio
+async def test_atagia_context_decision_marks_primary_context_and_suppresses_local_history(monkeypatch):
+    import ai_calls
+
+    bridge = FakeBridge({"system_prompt": "Memory says: prefers short answers."})
+    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+
+    decision = await ai_calls._resolve_atagia_context(
+        "Base system prompt",
+        user_id=7,
+        conversation_id=99,
+        message=[{"type": "text", "text": "hello"}],
+    )
+    local_history = [{"message": "old local turn", "type": "user"}]
+
+    assert decision.active is True
+    assert decision.reason == "active"
+    assert "Memory says: prefers short answers." in decision.full_prompt
+    assert ai_calls._context_messages_for_provider(local_history, decision) == []
+
+
+@pytest.mark.asyncio
+async def test_atagia_context_decision_keeps_local_history_when_context_missing(monkeypatch):
+    import ai_calls
+
+    bridge = FakeBridge(None)
+    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+
+    decision = await ai_calls._resolve_atagia_context(
+        "Base system prompt",
+        user_id=7,
+        conversation_id=99,
+        message=[{"type": "text", "text": "hello"}],
+    )
+    local_history = [{"message": "old local turn", "type": "user"}]
+
+    assert decision.active is False
+    assert decision.reason == "no_context"
+    assert decision.full_prompt == "Base system prompt"
+    assert ai_calls._context_messages_for_provider(local_history, decision) == local_history
 
 
 @pytest.mark.asyncio
@@ -129,6 +208,12 @@ async def test_record_atagia_assistant_response_flattens_multi_ai_payload(monkey
             "conversation_id": 99,
             "response_text": "[gpt-5]\nFirst answer\n\n[claude]\nSecond answer",
             "occurred_at": None,
+            "prompt_id": None,
+            "message_id": None,
+            "source_seq": None,
+            "ingest_origin": "live_turn",
+            "confirmation_strategy": "live_prompt_allowed",
+            "incognito": None,
         }
     ]
 
@@ -146,8 +231,8 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
     async def fake_prompt_runtime(conversation_id, current_user, effective_prompt_id):
         return {"full_prompt": "runtime prompt"}
 
-    async def fake_warmup_atagia(user_id, conversation_id):
-        warmup_calls.append((user_id, conversation_id))
+    async def fake_warmup_atagia(user_id, conversation_id, *, prompt_id=None, incognito=None):
+        warmup_calls.append((user_id, conversation_id, prompt_id, incognito))
         return True
 
     monkeypatch.setattr(ai_calls, "_load_warmup_context_messages", fake_context_messages)
@@ -178,6 +263,6 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
         activity={"activity": "typing", "draft_length": 20},
     )
 
-    assert warmup_calls == [(7, 99)]
+    assert warmup_calls == [(7, 99, 2, False)]
     assert snapshot["context_messages"] == [{"message": "previous", "type": "user"}]
     assert snapshot["sidecars"] == {"atagia_ready": True}

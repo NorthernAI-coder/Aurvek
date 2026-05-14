@@ -230,7 +230,23 @@ async function handlePasteEvent(event) {
     }, 0);
 }
 
-function processFiles(files, formData, imagePreviews) {
+function getRangedPdfDisplayName(filename, rangeOptions = {}) {
+    const start = parseInt(rangeOptions.pdfPageStart || '', 10);
+    const end = parseInt(rangeOptions.pdfPageEnd || '', 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+        return filename;
+    }
+    const name = filename || 'document.pdf';
+    const dotIndex = name.lastIndexOf('.');
+    const root = dotIndex > 0 ? name.slice(0, dotIndex) : name;
+    const ext = dotIndex > 0 ? name.slice(dotIndex) : '.pdf';
+    return `${root || 'document'}_pages_${start}-${end}${ext || '.pdf'}`;
+}
+
+
+function processFiles(files, formData, imagePreviews, targetConversationId = null, displayOptions = {}) {
+    const renderedAttachmentElements = [];
+    renderedAttachmentElements.cancelled = false;
     for (var i = 0; i < files.length; i++) {
         if (!isAcceptedFileType(files[i]) || !validateFileSize(files[i])) {
             if (!isAcceptedFileType(files[i])) {
@@ -251,13 +267,14 @@ function processFiles(files, formData, imagePreviews) {
             badge.className = 'pdf-badge';
             badge.textContent = 'PDF';
             var label = document.createElement('span');
-            label.textContent = ' ' + files[i].name;  // textContent — XSS safe
+            label.textContent = ' ' + getRangedPdfDisplayName(files[i].name, displayOptions);
             pdfAttachment.appendChild(badge);
             pdfAttachment.appendChild(label);
             userMessageElement.appendChild(pdfAttachment);
 
             var chatMessagesContainer = document.getElementById('chat-messages-container');
             chatMessagesContainer.appendChild(userMessageElement);
+            renderedAttachmentElements.push(userMessageElement);
             var chatWindow = document.getElementById('chat-window');
             chatWindow.scrollTop = chatWindow.scrollHeight;
 
@@ -283,12 +300,21 @@ function processFiles(files, formData, imagePreviews) {
             msgDiv.appendChild(textAttachment);
             var chatMessagesContainer = document.getElementById('chat-messages-container');
             chatMessagesContainer.appendChild(msgDiv);
+            renderedAttachmentElements.push(msgDiv);
             var chatWindow = document.getElementById('chat-window');
             chatWindow.scrollTop = chatWindow.scrollHeight;
         } else {
             // Existing image preview logic
             var reader = new FileReader();
             reader.onload = function (e) {
+                if (
+                    renderedAttachmentElements.cancelled ||
+                    (targetConversationId !== null &&
+                        typeof currentConversationId !== 'undefined' &&
+                        currentConversationId !== targetConversationId)
+                ) {
+                    return;
+                }
                 var img = document.createElement('img');
                 img.src = e.target.result;
                 img.className = 'preview-image';
@@ -308,6 +334,7 @@ function processFiles(files, formData, imagePreviews) {
 
                 var chatMessagesContainer = document.getElementById('chat-messages-container');
                 chatMessagesContainer.appendChild(userMessageElement);
+                renderedAttachmentElements.push(userMessageElement);
 
                 var chatWindow = document.getElementById('chat-window');
                 chatWindow.scrollTop = chatWindow.scrollHeight;
@@ -325,6 +352,7 @@ function processFiles(files, formData, imagePreviews) {
     if (imagePreviews.children.length > 0) {
         imagePreviews.classList.remove('hidden');
     }
+    return renderedAttachmentElements;
 }
 
 

@@ -14,6 +14,7 @@ from openai import OpenAI
 from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile, Form, Body
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 import io
 import zlib
 import base64
@@ -22,13 +23,16 @@ from PIL.ExifTags import Base as ExifBase
 import re
 import os
 import logging
+import hashlib
 from typing import Any, List, Optional
 import traceback
 import sqlite3
 import uuid
 import requests
 import urllib.parse
+import contextvars
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 # Import own modules
 from tools import *
@@ -86,7 +90,8 @@ from common import (
 )
 from models import User, ConnectionManager
 from save_images import save_image_locally, generate_img_token, resize_image, get_or_generate_img_token
-from save_pdfs import save_pdf_locally, validate_pdf, extract_pdf_text_local
+from save_pdfs import validate_pdf, extract_pdf_text_local
+from save_pdfs import extract_pdf_page_range
 from whatsapp import is_whatsapp_conversation
 from tasks import generate_pdf_task, generate_mp3_task
 from chat_warmup import (
@@ -100,6 +105,19 @@ from chat_warmup import (
     normalize_model_ids as normalize_warmup_model_ids,
 )
 from atagia_bridge import get_atagia_bridge
+from conversation_privacy import ensure_conversation_privacy_schema
+from file_storage import (
+    create_pending_image_attachment,
+    create_pending_pdf_attachment,
+    create_pending_text_attachment,
+    discard_pending_attachments,
+    finalize_message_attachments,
+    image_block_to_provider_block,
+    read_attachment_bytes,
+)
+
+ATAGIA_LIVE_INGEST_ORIGIN = "live_turn"
+ATAGIA_LIVE_CONFIRMATION_STRATEGY = "live_prompt_allowed"
 
 # aiohttp logging for HTTP calls
 aiohttp_logger = logging.getLogger('aiohttp')
@@ -108,6 +126,8 @@ aiohttp_logger.setLevel(logging.DEBUG if os.getenv("APP_DEBUG", "false").lower()
 # API client configuration
 openai = OpenAI(api_key=openai_key)
 anthropic.api_key = claude_key
+
+PDF_RETRY_TOKEN_TTL_SECONDS = 30 * 60
 
 def safe_log_headers(headers: dict) -> dict:
     """Return a copy of headers with sensitive values masked."""
@@ -216,12 +236,28 @@ def _extract_human_error_message(raw_body: str, status_code: int, provider_label
         if isinstance(parsed, dict):
             error_obj = parsed.get("error")
             if isinstance(error_obj, dict):
+                code = error_obj.get("code") or error_obj.get("type")
                 message = error_obj.get("message")
                 if isinstance(message, str) and message.strip():
-                    return message.strip()
+                    message = message.strip()
+                    if isinstance(code, str) and code.strip() and code.strip() not in message:
+                        return f"{code.strip()}: {message}"
+                    if status_code == 413 and "413" not in message:
+                        return f"413: {message}"
+                    return message
+                if isinstance(code, str) and code.strip():
+                    return code.strip()
             top_level_message = parsed.get("message")
+            top_level_code = parsed.get("code") or parsed.get("type")
             if isinstance(top_level_message, str) and top_level_message.strip():
-                return top_level_message.strip()
+                message = top_level_message.strip()
+                if isinstance(top_level_code, str) and top_level_code.strip() and top_level_code.strip() not in message:
+                    return f"{top_level_code.strip()}: {message}"
+                if status_code == 413 and "413" not in message:
+                    return f"413: {message}"
+                return message
+            if isinstance(top_level_code, str) and top_level_code.strip():
+                return top_level_code.strip()
     except Exception:
         pass
 
@@ -235,6 +271,483 @@ def _human_exception_error(exc: Exception, provider_label: str) -> str:
     if isinstance(exc, aiohttp.ClientError):
         return f"{provider_label} connection error. Please check your network and retry."
     return f"{provider_label} unexpected error. Please try again."
+
+
+def _merge_pdf_error_metadata(*metas: dict | None) -> dict | None:
+    pdfs = []
+    has_other_attachments = False
+    for meta in metas:
+        if not meta:
+            continue
+        has_other_attachments = has_other_attachments or bool(meta.get("has_other_attachments"))
+        if isinstance(meta.get("pdfs"), list):
+            pdfs.extend(meta["pdfs"])
+        elif meta.get("filename") or meta.get("pages"):
+            pdfs.append({
+                "filename": meta.get("filename") or "document.pdf",
+                "pages": meta.get("pages") or 0,
+                "file_hash": meta.get("file_hash") or meta.get("retry_file_hash"),
+                "retry_source_hash": meta.get("retry_source_hash"),
+                "retry_source_pages": meta.get("retry_source_pages"),
+            })
+    if not pdfs:
+        return None
+
+    page_counts = []
+    for pdf in pdfs:
+        try:
+            page_counts.append(max(0, int(pdf.get("pages") or 0)))
+        except (TypeError, ValueError):
+            page_counts.append(0)
+    total_pages = sum(page_counts)
+    if len(pdfs) == 1:
+        filename = pdfs[0].get("filename") or "document.pdf"
+        pages = page_counts[0]
+        file_hash = pdfs[0].get("file_hash")
+        retry_source_hash = pdfs[0].get("retry_source_hash")
+        retry_source_pages = pdfs[0].get("retry_source_pages")
+    else:
+        filename = f"{len(pdfs)} PDF files"
+        pages = total_pages
+        file_hash = None
+        retry_source_hash = None
+        retry_source_pages = None
+    return {
+        "filename": filename,
+        "pages": pages,
+        "pdf_count": len(pdfs),
+        "pdfs": pdfs,
+        "has_other_attachments": has_other_attachments,
+        "file_hash": file_hash,
+        "retry_source_hash": retry_source_hash,
+        "retry_source_pages": retry_source_pages,
+    }
+
+
+def _extract_pdf_file_hash_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    basename = os.path.basename(urllib.parse.urlparse(url).path)
+    maybe_hash = basename.split("_", 1)[0]
+    if re.fullmatch(r"[0-9a-fA-F]{40}", maybe_hash or ""):
+        return maybe_hash.lower()
+    return None
+
+
+def _extract_pdf_metadata_from_saved_message(user_message) -> dict | None:
+    """Extract PDF metadata from a saved multimodal message."""
+    if user_message is None:
+        return None
+    try:
+        parsed = orjson.loads(user_message) if isinstance(user_message, str) else user_message
+    except (orjson.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    pdf_blocks = []
+    has_other_attachments = False
+    for block in parsed:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type != "document_url":
+            if block_type in {"image_url", "text_file", "document", "document_bytes", "file"}:
+                has_other_attachments = True
+            continue
+        info = block.get("document_url") or {}
+        retry_source_hash = info.get("retry_source_hash")
+        retry_source_pages = info.get("retry_source_pages")
+        pdf_blocks.append({
+            "filename": info.get("filename") or "document.pdf",
+            "pages": info.get("pages") or 0,
+            "file_hash": info.get("file_hash") or _extract_pdf_file_hash_from_url(info.get("url")),
+            "retry_source_hash": retry_source_hash,
+            "retry_source_pages": retry_source_pages,
+        })
+    if not pdf_blocks:
+        return None
+    return _merge_pdf_error_metadata({
+        "pdfs": pdf_blocks,
+        "has_other_attachments": has_other_attachments,
+    })
+
+
+def _extract_pdf_metadata_from_context_messages(context_messages) -> dict | None:
+    metas = []
+    for msg in context_messages or []:
+        if isinstance(msg, dict):
+            content = msg.get("message")
+        else:
+            content = getattr(msg, "message", None)
+        metas.append(_extract_pdf_metadata_from_saved_message(content))
+    return _merge_pdf_error_metadata(*metas)
+
+
+def _pdf_page_total_from_messages(context_messages) -> int:
+    meta = _extract_pdf_metadata_from_context_messages(context_messages)
+    return int((meta or {}).get("pages") or 0)
+
+
+def _pdf_count_from_metadata(meta: dict | None) -> int:
+    try:
+        return int((meta or {}).get("pdf_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _messages_have_saved_pdfs(context_messages) -> bool:
+    return _extract_pdf_metadata_from_context_messages(context_messages) is not None
+
+
+def _drop_pdf_blocks_from_context(context_messages: list) -> list:
+    filtered = []
+    skip_next_assistant = False
+    for msg in context_messages or []:
+        if not isinstance(msg, dict):
+            if skip_next_assistant:
+                skip_next_assistant = False
+                continue
+            filtered.append(msg)
+            continue
+        msg_type = msg.get("type")
+        if skip_next_assistant and msg_type != "user":
+            skip_next_assistant = False
+            continue
+        content = msg.get("message")
+        if not isinstance(content, list):
+            filtered.append(msg)
+            continue
+        had_pdf = any(
+            isinstance(block, dict) and block.get("type") == "document_url"
+            for block in content
+        )
+        blocks = [
+            block for block in content
+            if not (isinstance(block, dict) and block.get("type") == "document_url")
+        ]
+        if had_pdf and msg_type == "user":
+            skip_next_assistant = True
+        if blocks:
+            filtered.append({**msg, "message": blocks})
+    return filtered
+
+
+def _looks_like_pdf_size_error(
+    message: str,
+    has_pdf: bool = False,
+    mixed_attachments: bool = False,
+) -> bool:
+    """Detect provider errors that mean the attached PDF must be reduced."""
+    text = (message or "").lower()
+    explicit_pdf_terms = ("pdf", "document", "page", "pages")
+    strong_context_terms = (
+        "too many pages",
+        "page limit",
+        "maximum pages",
+        "maximum of",
+        "maximum number of pages",
+        "context length",
+        "context window",
+        "context_length_exceeded",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "token limit",
+        "tokens exceed",
+        "maximum context",
+        "maximum input",
+        "input length",
+    )
+    generic_size_terms = (
+        "pdf_too_large",
+        "pdf-too-large",
+        "request_too_large",
+        "payload_too_large",
+        "content_too_large",
+        "request entity too large",
+        "payload too large",
+        "413:",
+        "service error (413)",
+        " 413",
+        "exceeds",
+        "too large",
+        "file size",
+        "request body",
+    )
+    if has_pdf:
+        has_explicit_pdf_context = any(term in text for term in explicit_pdf_terms)
+        explicit_size_codes = (
+            "pdf_too_large",
+            "pdf-too-large",
+            "request_too_large",
+            "payload_too_large",
+            "content_too_large",
+            "413:",
+            "service error (413)",
+            " 413",
+        )
+        if text.strip() == "413" or any(term in text for term in explicit_size_codes):
+            return True
+        if any(term in text for term in strong_context_terms):
+            return (not mixed_attachments) or has_explicit_pdf_context
+        if mixed_attachments and not has_explicit_pdf_context:
+            return False
+        return any(term in text for term in generic_size_terms)
+    if "pdf" not in text and "document" not in text and "file" not in text:
+        return False
+    return any(term in text for term in (*strong_context_terms, *generic_size_terms))
+
+
+def _looks_like_generic_context_limit_error(message: str) -> bool:
+    text = (message or "").lower()
+    return any(term in text for term in (
+        "context length",
+        "context window",
+        "context_length_exceeded",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "token limit",
+        "tokens exceed",
+        "maximum context",
+        "maximum input",
+        "input length",
+    ))
+
+
+def _message_mentions_pdf_context(message: str) -> bool:
+    text = (message or "").lower()
+    return any(term in text for term in ("pdf", "document", "page", "pages"))
+
+
+def _extract_token_limit_details(message: str) -> tuple[int, int] | None:
+    match = re.search(r"(\d[\d,]*)\s+tokens?\s*>\s*(\d[\d,]*)\s+maximum", message or "", re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        used = int(match.group(1).replace(",", ""))
+        limit = int(match.group(2).replace(",", ""))
+    except ValueError:
+        return None
+    if used <= 0 or limit <= 0:
+        return None
+    return used, limit
+
+
+def _suggest_retry_pages_for_token_limit(pdf_meta: dict, message: str) -> int | None:
+    details = _extract_token_limit_details(message)
+    if not details:
+        return None
+    used, limit = details
+    try:
+        retry_pages = int(pdf_meta.get("retry_pages") or pdf_meta.get("pages") or 0)
+    except (TypeError, ValueError):
+        retry_pages = 0
+    if retry_pages <= 1:
+        return None
+    ratio = min(1.0, limit / used)
+    suggested = int((retry_pages * ratio * 0.8) + 0.999)
+    return max(1, min(retry_pages - 1, suggested))
+
+
+def _create_pdf_retry_token(
+    pdf_meta: dict | None,
+    current_user=None,
+    conversation_id: int | None = None,
+) -> str | None:
+    if not pdf_meta or current_user is None or conversation_id is None:
+        return None
+    current_pdf_count = _pdf_count_from_metadata({"pdf_count": pdf_meta.get("current_pdf_count")})
+    if current_pdf_count != 1 or not pdf_meta.get("range_retry_available", True):
+        return None
+    retry_file_hash = (
+        pdf_meta.get("retry_source_hash")
+        or pdf_meta.get("retry_file_hash")
+        or pdf_meta.get("file_hash")
+        or next(
+            (p.get("file_hash") for p in pdf_meta.get("pdfs", []) if isinstance(p, dict) and p.get("file_hash")),
+            None,
+        )
+    )
+    if not retry_file_hash:
+        return None
+    retry_pages = int(pdf_meta.get("retry_pages") or pdf_meta.get("pages") or 0)
+    payload = {
+        "kind": "pdf_range_retry",
+        "user_id": int(current_user.id),
+        "conversation_id": int(conversation_id),
+        "retry_filename": pdf_meta.get("retry_filename") or pdf_meta.get("filename"),
+        "retry_pages": retry_pages,
+        "source_pages": int(pdf_meta.get("retry_source_pages") or pdf_meta.get("source_pages") or retry_pages),
+        "file_hash": retry_file_hash,
+        "allow_skip_context_pdfs": True,
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=PDF_RETRY_TOKEN_TTL_SECONDS),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _decode_pdf_retry_token(token: str | None, current_user, conversation_id: int) -> dict | None:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+    try:
+        if payload.get("kind") != "pdf_range_retry":
+            return None
+        if int(payload.get("user_id")) != int(current_user.id):
+            return None
+        if int(payload.get("conversation_id")) != int(conversation_id):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return payload
+
+
+def _validate_pdf_retry_upload(pdf_retry_payload: dict, pdf_data: bytes, page_count: int) -> str | None:
+    expected_hash = (pdf_retry_payload or {}).get("file_hash")
+    if expected_hash:
+        actual_hash = hashlib.sha1(pdf_data).hexdigest()
+        if actual_hash != str(expected_hash).lower():
+            return "PDF range retry must use the same PDF that failed."
+    try:
+        expected_pages = int((pdf_retry_payload or {}).get("source_pages") or 0)
+    except (TypeError, ValueError):
+        expected_pages = 0
+    if expected_pages and int(page_count or 0) != expected_pages:
+        return "PDF range retry must use the same PDF page count that failed."
+    return None
+
+
+def _pdf_too_large_payload(
+    provider_label: str,
+    message: str,
+    user_message=None,
+    pdf_metadata: dict | None = None,
+    current_user=None,
+    conversation_id: int | None = None,
+) -> dict:
+    pdf_meta = pdf_metadata or _extract_pdf_metadata_from_saved_message(user_message) or {}
+    pages = pdf_meta.get("pages") or 0
+    filename = pdf_meta.get("filename") or "document.pdf"
+    pdf_count = int(pdf_meta.get("pdf_count") or 0)
+    range_retry_available = bool(pdf_meta.get("range_retry_available", pdf_count == 1))
+    token_limit_details = _extract_token_limit_details(message)
+    suggested_page_end = _suggest_retry_pages_for_token_limit(pdf_meta, message)
+    retry_reason = "token_limit" if token_limit_details else "pdf_limit"
+    friendly = "PDF too large for the selected AI model."
+    if pdf_count > 1 and pages:
+        friendly = f"PDFs too large for the selected AI model ({pdf_count} files, {pages} pages total)."
+    elif pdf_count > 1:
+        friendly = f"PDFs too large for the selected AI model ({pdf_count} files)."
+    elif pages:
+        friendly = f"PDF too large for the selected AI model ({pages} pages)."
+    payload = {
+        "error": friendly,
+        "error_code": "pdf_too_large",
+        "pdf_too_large": True,
+        "provider": provider_label,
+        "provider_message": message,
+        "filename": filename,
+        "pages": pages,
+        "pdf_count": pdf_count,
+        "current_pdf_count": int(pdf_meta.get("current_pdf_count") or 0),
+        "context_pdf_count": int(pdf_meta.get("context_pdf_count") or 0),
+        "range_retry_available": range_retry_available,
+        "retry_filename": pdf_meta.get("retry_filename"),
+        "retry_pages": pdf_meta.get("retry_pages") or 0,
+        "retry_reason": retry_reason,
+    }
+    if retry_reason == "token_limit":
+        payload["retry_hint"] = "That page range is still too large for this model's context window. Select fewer pages."
+    else:
+        payload["retry_hint"] = "This model cannot accept the PDF as sent. Select a smaller page range."
+    if suggested_page_end:
+        payload["suggested_page_end"] = suggested_page_end
+    retry_token = _create_pdf_retry_token(pdf_meta, current_user, conversation_id)
+    if retry_token:
+        payload["retry_token"] = retry_token
+    return payload
+
+
+def _provider_error_payload(
+    provider_label: str,
+    message: str,
+    user_message=None,
+    pdf_metadata: dict | None = None,
+    current_user=None,
+    conversation_id: int | None = None,
+) -> dict:
+    pdf_meta = pdf_metadata or _extract_pdf_metadata_from_saved_message(user_message)
+    if pdf_meta and _looks_like_pdf_size_error(
+        message,
+        has_pdf=True,
+        mixed_attachments=bool(pdf_meta.get("has_other_attachments")),
+    ):
+        current_pdf_count = int(pdf_meta.get("current_pdf_count") or 0)
+        generic_context_limit = (
+            _looks_like_generic_context_limit_error(message)
+            and not _message_mentions_pdf_context(message)
+        )
+        if generic_context_limit and current_pdf_count <= 0:
+            return {"error": message}
+        return _pdf_too_large_payload(provider_label, message, user_message, pdf_meta, current_user, conversation_id)
+    return {"error": message}
+
+
+def _pdf_upload_too_large_payload(
+    message: str,
+    current_pdf_count: int,
+    current_pages: int = 0,
+    context_pdf_count: int = 0,
+    context_pages: int = 0,
+    filename: str | None = None,
+    current_user=None,
+    conversation_id: int | None = None,
+    retry_file_hash: str | None = None,
+) -> dict:
+    total_pages = int(current_pages or 0) + int(context_pages or 0)
+    total_pdf_count = int(current_pdf_count or 0) + int(context_pdf_count or 0)
+    retry_available = int(current_pdf_count or 0) == 1
+    payload = {
+        "success": False,
+        "message": message,
+        "error": message,
+        "error_code": "pdf_too_large",
+        "pdf_too_large": True,
+        "provider": "Aurvek",
+        "provider_message": message,
+        "filename": filename or ("document.pdf" if total_pdf_count == 1 else f"{total_pdf_count} PDF files"),
+        "pages": total_pages,
+        "pdf_count": total_pdf_count,
+        "current_pdf_count": int(current_pdf_count or 0),
+        "context_pdf_count": int(context_pdf_count or 0),
+        "range_retry_available": retry_available,
+        "retry_filename": filename,
+        "retry_pages": int(current_pages or 0),
+    }
+    if retry_available:
+        retry_token = _create_pdf_retry_token(
+            {
+                "current_pdf_count": int(current_pdf_count or 0),
+                "context_pdf_count": int(context_pdf_count or 0),
+                "range_retry_available": True,
+                "retry_filename": filename,
+                "retry_pages": int(current_pages or 0),
+                "retry_file_hash": retry_file_hash,
+            },
+            current_user,
+            conversation_id,
+        )
+        if retry_token:
+            payload["retry_token"] = retry_token
+    return payload
+
+
+def _estimate_pdf_input_tokens_for_preflight(page_count: int, machine: str) -> int:
+    per_page = 300 if machine == "Gemini" else 1500
+    return max(0, int(page_count or 0)) * per_page
 
 
 def filter_invalid_context_messages(context_messages: list) -> list:
@@ -338,26 +851,6 @@ def decode_text_file(data: bytes, filename: str) -> str:
         raise ValueError(f"File '{filename}' could not be decoded (unsupported encoding)")
 
 
-def save_text_file_locally(current_user, conversation_id: int, content: str, filename: str) -> str:
-    """Save decoded text content to disk. Returns the URL path for storage in DB."""
-    import hashlib
-    content_hash = hashlib.sha1(content.encode('utf-8')).hexdigest()
-
-    h1, h2, user_hash = generate_user_hash(current_user.username)
-    conv_id_str = f"{conversation_id:07d}"
-    c1, c2 = conv_id_str[:3], conv_id_str[3:]
-
-    dir_path = os.path.join('data', 'users', h1, h2, user_hash, 'files', c1, c2, 'txt')
-    os.makedirs(dir_path, exist_ok=True)
-
-    file_path = os.path.join(dir_path, f'{content_hash}.txt')
-
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    return f'users/{h1}/{h2}/{user_hash}/files/{c1}/{c2}/txt/{content_hash}.txt'
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers (request-free, used by both web path and external channels)
 # ---------------------------------------------------------------------------
@@ -433,6 +926,18 @@ def _build_warmup_cache_key_from_state(
 
 _ATAGIA_CONTEXT_HEADER = "[ATAGIA MEMORY CONTEXT - INTERNAL]"
 _ATAGIA_CONTEXT_FOOTER = "[/ATAGIA MEMORY CONTEXT]"
+_current_atagia_user_message_id: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("current_atagia_user_message_id", default=None)
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AtagiaContextDecision:
+    full_prompt: str
+    active: bool
+    reason: str
+    context: Any | None = None
+    atagia_user_message_id: str | None = None
 
 
 def _message_text_for_atagia(value: Any) -> str:
@@ -502,6 +1007,13 @@ def _message_text_for_atagia(value: Any) -> str:
 
 
 def _extract_atagia_system_prompt(context: Any) -> str:
+    try:
+        from atagia.integrations import extract_context_system_prompt
+
+        return extract_context_system_prompt(context)
+    except Exception:
+        pass
+
     if context is None:
         return ""
     if isinstance(context, dict):
@@ -512,6 +1024,13 @@ def _extract_atagia_system_prompt(context: Any) -> str:
 
 
 def _append_atagia_context_to_prompt(full_prompt: str, context: Any) -> str:
+    try:
+        from atagia.integrations import append_context_to_prompt
+
+        return append_context_to_prompt(full_prompt, context)
+    except Exception:
+        pass
+
     atagia_prompt = _extract_atagia_system_prompt(context)
     if not atagia_prompt:
         return full_prompt
@@ -532,10 +1051,36 @@ async def _augment_prompt_with_atagia_context(
     conversation_id: int,
     message: Any,
     occurred_at: str | None = None,
+    prompt_id: int | str | None = None,
+    incognito: bool | None = None,
 ) -> str:
+    decision = await _resolve_atagia_context(
+        full_prompt,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        message=message,
+        occurred_at=occurred_at,
+        prompt_id=prompt_id,
+        incognito=incognito,
+    )
+    return decision.full_prompt
+
+
+async def _resolve_atagia_context(
+    full_prompt: str,
+    *,
+    user_id: int,
+    conversation_id: int,
+    message: Any,
+    occurred_at: str | None = None,
+    prompt_id: int | str | None = None,
+    message_id: int | str | None = None,
+    incognito: bool | None = None,
+) -> AtagiaContextDecision:
+    _current_atagia_user_message_id.set(None)
     message_text = _message_text_for_atagia(message).strip()
     if not message_text:
-        return full_prompt
+        return AtagiaContextDecision(full_prompt, False, "empty_message")
 
     try:
         bridge = get_atagia_bridge()
@@ -544,6 +1089,11 @@ async def _augment_prompt_with_atagia_context(
             conversation_id=conversation_id,
             message_text=message_text,
             occurred_at=occurred_at,
+            prompt_id=prompt_id,
+            message_id=message_id,
+            ingest_origin=ATAGIA_LIVE_INGEST_ORIGIN,
+            confirmation_strategy=ATAGIA_LIVE_CONFIRMATION_STRATEGY,
+            incognito=incognito,
         )
     except Exception:
         logger.warning(
@@ -551,21 +1101,101 @@ async def _augment_prompt_with_atagia_context(
             conversation_id,
             exc_info=True,
         )
-        return full_prompt
-    augmented = _append_atagia_context_to_prompt(full_prompt, context)
-    if augmented != full_prompt:
-        logger.debug(
-            "[atagia] Injected sidecar context for conversation_id=%s user_id=%s",
-            conversation_id,
-            user_id,
+        return AtagiaContextDecision(full_prompt, False, "error")
+    if context is None:
+        return AtagiaContextDecision(full_prompt, False, "no_context")
+
+    try:
+        from atagia.integrations import build_injection_decision
+
+        upstream_decision = build_injection_decision(full_prompt, context)
+        decision = AtagiaContextDecision(
+            upstream_decision.full_prompt,
+            upstream_decision.active,
+            upstream_decision.reason,
+            context=upstream_decision.context,
+            atagia_user_message_id=upstream_decision.atagia_user_message_id,
         )
-    return augmented
+    except Exception:
+        augmented = _append_atagia_context_to_prompt(full_prompt, context)
+        if augmented == full_prompt:
+            return AtagiaContextDecision(full_prompt, False, "empty_context", context=context)
+        decision = AtagiaContextDecision(
+            augmented,
+            True,
+            "active",
+            context=context,
+            atagia_user_message_id=_extract_atagia_message_id(context),
+        )
+
+    if not decision.active:
+        return decision
+
+    if decision.atagia_user_message_id:
+        _current_atagia_user_message_id.set(decision.atagia_user_message_id)
+
+    logger.debug(
+        "[atagia] Injected sidecar context for conversation_id=%s user_id=%s",
+        conversation_id,
+        user_id,
+    )
+    return decision
 
 
-async def _warmup_atagia_sidecar(user_id: int, conversation_id: int) -> bool:
+def _context_messages_for_provider(
+    context_messages: list[dict[str, Any]],
+    atagia_decision: AtagiaContextDecision,
+) -> list[dict[str, Any]]:
+    try:
+        from atagia.integrations import context_messages_for_provider
+
+        return context_messages_for_provider(context_messages, atagia_decision)
+    except Exception:
+        pass
+
+    if atagia_decision.active:
+        return []
+    return context_messages
+
+
+def _extract_atagia_message_id(context: Any) -> str | None:
+    try:
+        from atagia.integrations import extract_context_message_id
+
+        return extract_context_message_id(context)
+    except Exception:
+        pass
+
+    if context is None:
+        return None
+    if isinstance(context, dict):
+        raw_id = context.get("request_message_id") or context.get("message_id")
+    else:
+        raw_id = (
+            getattr(context, "request_message_id", None)
+            or getattr(context, "message_id", None)
+        )
+    return raw_id if isinstance(raw_id, str) and raw_id else None
+
+
+async def _warmup_atagia_sidecar(
+    user_id: int,
+    conversation_id: int,
+    *,
+    prompt_id: int | str | None = None,
+    incognito: bool | None = None,
+) -> bool:
     try:
         bridge = get_atagia_bridge()
-        return await bridge.ensure_user_and_conversation(user_id, conversation_id) is not None
+        return (
+            await bridge.ensure_user_and_conversation(
+                user_id,
+                conversation_id,
+                prompt_id=prompt_id,
+                incognito=incognito,
+            )
+            is not None
+        )
     except Exception:
         logger.warning(
             "[atagia] Warm-up sidecar preparation failed for conversation_id=%s",
@@ -581,6 +1211,10 @@ async def _record_atagia_assistant_response(
     conversation_id: int,
     content: Any,
     occurred_at: str | None = None,
+    prompt_id: int | str | None = None,
+    message_id: int | str | None = None,
+    source_seq: int | str | None = None,
+    incognito: bool | None = None,
 ) -> bool:
     response_text = _message_text_for_atagia(content).strip()
     if not response_text:
@@ -593,6 +1227,12 @@ async def _record_atagia_assistant_response(
             conversation_id=conversation_id,
             response_text=response_text,
             occurred_at=occurred_at,
+            prompt_id=prompt_id,
+            message_id=message_id,
+            source_seq=source_seq,
+            ingest_origin=ATAGIA_LIVE_INGEST_ORIGIN,
+            confirmation_strategy=ATAGIA_LIVE_CONFIRMATION_STRATEGY,
+            incognito=incognito,
         )
     except Exception:
         logger.warning(
@@ -603,7 +1243,55 @@ async def _record_atagia_assistant_response(
         return False
 
 
+async def _link_atagia_message_best_effort(
+    *,
+    message_id: int | None,
+    atagia_message_id: str | None,
+    conversation_id: int,
+    user_id: int,
+    role: str,
+    source: str = "live",
+) -> bool:
+    if message_id is None or not atagia_message_id:
+        return False
+    try:
+        from atagia_sync import record_atagia_message_link
+
+        return await record_atagia_message_link(
+            message_id=int(message_id),
+            atagia_message_id=atagia_message_id,
+            conversation_id=int(conversation_id),
+            user_id=int(user_id),
+            role="user" if role == "user" else "assistant",
+            source=source,
+        )
+    except Exception:
+        logger.warning(
+            "[atagia] Failed to link Aurvek message_id=%s to Atagia",
+            message_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _aurvek_atagia_message_id(message_id: int | str | None) -> str | None:
+    if message_id is None:
+        return None
+    text = str(message_id).strip()
+    if not text:
+        return None
+    if text.startswith("aurvek:msg:"):
+        return text
+    try:
+        from atagia.integrations import aurvek_message_id
+
+        return aurvek_message_id(text)
+    except Exception:
+        return f"aurvek:msg:{text}"
+
+
 async def _load_warmup_conversation_state(conversation_id: int, user_id: int) -> dict[str, Any] | None:
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn_ro:
         cursor = await conn_ro.execute(
             """
@@ -630,6 +1318,7 @@ async def _load_warmup_conversation_state(conversation_id: int, user_id: int) ->
                 COALESCE(p.force_web_search, 0) AS force_web_search,
                 COALESCE(ud.web_search_enabled, 1) AS user_web_search_enabled,
                 COALESCE(ud.web_search_mode, 'native') AS web_search_mode,
+                COALESCE(c.is_incognito, 0) AS is_incognito,
                 (
                     SELECT COALESCE(MAX(m.id), 0)
                     FROM MESSAGES m
@@ -909,7 +1598,12 @@ async def _build_chat_warmup_snapshot(
     context_messages, prompt_runtime, atagia_ready = await asyncio.gather(
         _load_warmup_context_messages(conversation_id, start_date),
         _load_warmup_prompt_runtime_snapshot(conversation_id, current_user, effective_prompt_id),
-        _warmup_atagia_sidecar(current_user.id, conversation_id),
+        _warmup_atagia_sidecar(
+            current_user.id,
+            conversation_id,
+            prompt_id=effective_prompt_id,
+            incognito=bool(state.get("is_incognito")),
+        ),
     )
 
     return {
@@ -932,6 +1626,7 @@ async def _build_chat_warmup_snapshot(
                 "user_web_search_enabled": bool(state.get("user_web_search_enabled")),
                 "web_search_mode": state.get("web_search_mode") or "native",
             },
+            "is_incognito": bool(state.get("is_incognito")),
         },
         "context_messages": context_messages,
         "context_count": len(context_messages),
@@ -1316,7 +2011,69 @@ def parse_stored_message(content):
     return content
 
 
-async def hydrate_image_for_context(image_block: dict, machine: str, current_user, force_base64: bool = False) -> dict:
+def _resolve_legacy_attachment_path(
+    raw_url: str,
+    current_user,
+    *,
+    conversation_id: int | None = None,
+    expected_kind: str | None = None,
+) -> tuple[str, str] | None:
+    if not raw_url or current_user is None:
+        return None
+
+    raw = str(raw_url).split("?", 1)[0]
+    if CLOUDFLARE_BASE_URL and raw.startswith(CLOUDFLARE_BASE_URL):
+        raw = raw[len(CLOUDFLARE_BASE_URL):]
+
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        raw = parsed.path
+    elif parsed.scheme:
+        return None
+
+    raw = urllib.parse.unquote(raw).lstrip("/")
+    if not raw:
+        return None
+
+    candidate = Path(raw) if raw.startswith("data/") else Path("data") / raw
+    h1, h2, user_hash = generate_user_hash(current_user.username)
+    user_root = (Path(users_directory) / h1 / h2 / user_hash).resolve()
+
+    try:
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(user_root):
+            return None
+        scope_root = user_root
+        if conversation_id is not None:
+            conv = f"{int(conversation_id):07d}"
+            scope_root = user_root / "files" / conv[:3] / conv[3:]
+            if not resolved.is_relative_to(scope_root):
+                return None
+            rel_parts = resolved.relative_to(scope_root).parts
+            if expected_kind == "image" and (len(rel_parts) < 2 or rel_parts[0] != "img"):
+                return None
+            if expected_kind == "pdf" and (len(rel_parts) < 2 or rel_parts[0] != "pdf" or rel_parts[1] != "uploads"):
+                return None
+            if expected_kind == "text" and (len(rel_parts) < 2 or rel_parts[0] != "txt"):
+                return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    data_root = Path("data").resolve()
+    try:
+        relative_to_data = resolved.relative_to(data_root).as_posix()
+    except ValueError:
+        return None
+    return relative_to_data, str(resolved)
+
+
+async def hydrate_image_for_context(
+    image_block: dict,
+    machine: str,
+    current_user,
+    force_base64: bool = False,
+    conversation_id: int | None = None,
+) -> dict:
     """Re-hydrate a stored image block with a fresh token URL for AI provider access.
 
     Takes a stored block like {"type":"image_url","image_url":{"url":"https://cdn.../hash_fullsize.webp"}}
@@ -1324,15 +2081,42 @@ async def hydrate_image_for_context(image_block: dict, machine: str, current_use
 
     For xAI: reads WebP from disk and converts to JPEG base64 (xAI does not support WebP).
     """
+    image_info = image_block.get("image_url", {})
+    attachment_ref = image_info.get("attachment_ref")
+    if attachment_ref:
+        try:
+            result = await read_attachment_bytes(
+                attachment_ref,
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                require_kind="image",
+            )
+        except Exception as exc:
+            logger.warning("[hydrate_image_for_context] Could not read attachment %s: %s", attachment_ref, exc)
+            result = None
+        if result:
+            image_data, attachment = result
+            provider_block = await asyncio.to_thread(
+                image_block_to_provider_block,
+                data=image_data,
+                mime_type=attachment.get("mime_detected") or "image/webp",
+                machine=machine,
+                force_base64=force_base64,
+            )
+            if provider_block is not None:
+                return provider_block
+
     base_url = image_block.get("image_url", {}).get("url", "")
-
-    # Strip CLOUDFLARE_BASE_URL prefix to get relative path
-    if CLOUDFLARE_BASE_URL and base_url.startswith(CLOUDFLARE_BASE_URL):
-        image_path = base_url[len(CLOUDFLARE_BASE_URL):]
-    else:
-        image_path = base_url
-
-    disk_path = os.path.join("data", image_path.replace("/", os.sep))
+    resolved_legacy = _resolve_legacy_attachment_path(
+        base_url,
+        current_user,
+        conversation_id=conversation_id,
+        expected_kind="image",
+    )
+    if not resolved_legacy:
+        logger.warning("[hydrate_image_for_context] Rejected unsafe legacy image URL")
+        return None
+    image_path, disk_path = resolved_legacy
 
     # Only enter thread when Pillow/IO work is actually needed
     needs_pillow = (
@@ -1376,6 +2160,7 @@ async def _format_messages_for_provider(
     machine: str,
     current_user=None,
     force_base64: bool = False,
+    conversation_id: int | None = None,
 ) -> list | str:
     """Format messages for a specific LLM provider.
     Extracted from get_ai_response() to be reused by watchdog_takeover_response()."""
@@ -1396,7 +2181,13 @@ async def _format_messages_for_provider(
                     elif block.get("type") == "image_url":
                         url = block["image_url"]["url"]
                         if current_user:
-                            hydrated_block = await hydrate_image_for_context(block, "Gemini", current_user, force_base64=force_base64)
+                            hydrated_block = await hydrate_image_for_context(
+                                block,
+                                "Gemini",
+                                current_user,
+                                force_base64=force_base64,
+                                conversation_id=conversation_id,
+                            )
                             if hydrated_block is None:
                                 continue
                             token_url = hydrated_block["image_url"]["url"]
@@ -1414,14 +2205,14 @@ async def _format_messages_for_provider(
                         else:
                             parts.append(genai_types.Part.from_uri(file_uri=token_url, mime_type=mime))
                     elif block.get("type") == "document_url":
-                        hydrated_block = hydrate_pdf_for_context(block, "Gemini")
+                        hydrated_block = await hydrate_pdf_for_context(block, "Gemini", current_user, conversation_id=conversation_id)
                         if hydrated_block is not None:
                             parts.append(genai_types.Part.from_bytes(
                                 data=base64.b64decode(hydrated_block["data"]),
                                 mime_type="application/pdf"
                             ))
                     elif block.get("type") == "text_file":
-                        parts.append(genai_types.Part.from_text(text=text_file_block_to_text(block)))
+                        parts.append(genai_types.Part.from_text(text=await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id)))
                 if parts:
                     contents.append(genai_types.Content(role=role, parts=parts))
             else:
@@ -1469,11 +2260,11 @@ async def _format_messages_for_provider(
                         if block.get("type") == "text":
                             text_parts.append(block["text"])
                         elif block.get("type") == "document_url":
-                            hydrated = hydrate_pdf_for_context(block, "O1")
+                            hydrated = await hydrate_pdf_for_context(block, "O1", current_user, conversation_id=conversation_id)
                             if hydrated is not None:
                                 text_parts.append(hydrated["text"])
                         elif block.get("type") == "text_file":
-                            text_parts.append(text_file_block_to_text(block))
+                            text_parts.append(await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id))
                         elif block.get("type") == "image_url":
                             text_parts.append("[An image was shared]")
                 msg_content = "\n".join(text_parts) if text_parts else str(msg_content)
@@ -1492,15 +2283,21 @@ async def _format_messages_for_provider(
                 hydrated = []
                 for block in content:
                     if block.get("type") == "image_url" and current_user:
-                        result = await hydrate_image_for_context(block, machine, current_user, force_base64=force_base64)
+                        result = await hydrate_image_for_context(
+                            block,
+                            machine,
+                            current_user,
+                            force_base64=force_base64,
+                            conversation_id=conversation_id,
+                        )
                         if result is not None:
                             hydrated.append(result)
                     elif block.get("type") == "document_url":
-                        result = hydrate_pdf_for_context(block, machine)
+                        result = await hydrate_pdf_for_context(block, machine, current_user, conversation_id=conversation_id)
                         if result is not None:
                             hydrated.append(result)
                     elif block.get("type") == "text_file":
-                        hydrated.append({"type": "text", "text": text_file_block_to_text(block)})
+                        hydrated.append({"type": "text", "text": await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id)})
                     else:
                         hydrated.append(block)
                 api_messages.append({
@@ -1555,6 +2352,7 @@ async def watchdog_takeover_response(
     model: str,
     event_type: str = "security",
     source: str = "post",
+    pending_attachment_refs: Optional[list[str]] = None,
 ):
     """Async generator: stream a takeover response from the watchdog LLM.
 
@@ -1631,7 +2429,8 @@ async def watchdog_takeover_response(
 
     # 5. Format messages for the watchdog LLM's provider
     api_messages = await _format_messages_for_provider(
-        context_messages, message, full_prompt, wd_machine, current_user
+        context_messages, message, full_prompt, wd_machine, current_user,
+        conversation_id=conversation_id,
     )
 
     # 6. Select streaming function
@@ -1669,6 +2468,7 @@ async def watchdog_takeover_response(
         "watchdog_hint_eval_id": None,
         "llm_id": wd_llm_id,
         "byok": resolved_key is not None,
+        "pending_attachment_refs": pending_attachment_refs,
     }
     if resolved_key:
         kwargs["user_api_key"] = resolved_key
@@ -1820,6 +2620,7 @@ async def watchdog_takeover_response_requestfree(
     api_messages = await _format_messages_for_provider(
         context_messages, last_user_msg, full_prompt, wd_machine,
         current_user=None,
+        conversation_id=conversation_id,
     )
 
     # 6. Select streaming function
@@ -2471,19 +3272,91 @@ def format_pdf_for_provider(machine: str, pdf_url_base: str, pdf_data_b64: str,
     return content_to_save, content_to_send
 
 
-def hydrate_pdf_for_context(block: dict, machine: str) -> dict | None:
+def _ranged_pdf_warning_text(
+    filename: str,
+    *,
+    page_start: int | None,
+    page_end: int | None,
+    source_page_count: int | None,
+) -> str:
+    range_text = f"pages {page_start}-{page_end}" if page_start and page_end else "a page range"
+    source_text = f" of the original {source_page_count}-page PDF" if source_page_count else ""
+    return (
+        "[WARNING] The attached PDF had to be cropped before upload because the full PDF was too large "
+        f"for this model. This attachment contains only {range_text}{source_text}: {filename}. "
+        "Pages outside that range are not attached. If a table of contents, index, footer, or other text mentions "
+        "pages outside the attached range, treat those as references to missing pages, not as pages you can read."
+    )
+
+
+async def hydrate_pdf_for_context(
+    block: dict,
+    machine: str,
+    current_user=None,
+    conversation_id: int | None = None,
+) -> dict | None:
     """Re-hydrate a stored document_url block for sending to AI provider."""
-    url = block["document_url"]["url"]
-    filename = block["document_url"].get("filename", "document.pdf")
-    page_count = block["document_url"].get("pages", 0)
+    doc_info = block["document_url"]
+    url = doc_info.get("url", "")
+    filename = doc_info.get("filename", "document.pdf")
+    page_count = doc_info.get("pages", 0)
 
-    # Guard against CLOUDFLARE_BASE_URL being None
-    if CLOUDFLARE_BASE_URL and url.startswith(CLOUDFLARE_BASE_URL):
-        relative_path = url[len(CLOUDFLARE_BASE_URL):]
-    else:
-        relative_path = url
+    attachment_ref = doc_info.get("attachment_ref")
+    if attachment_ref and current_user is not None:
+        try:
+            result = await read_attachment_bytes(
+                attachment_ref,
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                require_kind="pdf",
+            )
+        except Exception as exc:
+            logger.warning("[hydrate_pdf_for_context] Could not read attachment %s: %s", attachment_ref, exc)
+            result = None
+        if result:
+            pdf_data, attachment = result
+            page_count = attachment.get("page_count") or page_count
 
-    file_path = os.path.join("data", relative_path)
+            pdf_b64 = base64.b64encode(pdf_data).decode("utf-8")
+
+            if machine == "Claude":
+                return {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}
+                }
+            elif machine == "Gemini":
+                return {
+                    "type": "document_bytes",
+                    "data": pdf_b64,
+                    "mime_type": "application/pdf"
+                }
+            elif machine in ("OpenRouter", "GPT", "xAI"):
+                return {
+                    "type": "file",
+                    "file": {
+                        "filename": filename,
+                        "file_data": f"data:application/pdf;base64,{pdf_b64}"
+                    }
+                }
+            elif machine == "O1":
+                extracted_text = extract_pdf_text_local(pdf_data)
+                return {
+                    "type": "text",
+                    "text": f"[Content of PDF: {filename} ({page_count} pages)]\n\n{extracted_text}"
+                }
+            else:
+                raise ValueError(f"Unsupported provider for PDF hydration: {machine}")
+
+    resolved_legacy = _resolve_legacy_attachment_path(
+        url,
+        current_user,
+        conversation_id=conversation_id,
+        expected_kind="pdf",
+    )
+    if not resolved_legacy:
+        logger.warning("[hydrate_pdf_for_context] Rejected unsafe legacy PDF URL")
+        return None
+    _, file_path = resolved_legacy
 
     try:
         with open(file_path, 'rb') as f:
@@ -2523,6 +3396,35 @@ def hydrate_pdf_for_context(block: dict, machine: str) -> dict | None:
         raise ValueError(f"Unsupported provider for PDF hydration: {machine}")
 
 
+async def text_file_block_to_text_for_context(
+    block: dict,
+    current_user=None,
+    conversation_id: int | None = None,
+) -> str:
+    text_info = block.get("text_file", {}) if isinstance(block, dict) else {}
+    attachment_ref = text_info.get("attachment_ref")
+    if attachment_ref and current_user is not None:
+        try:
+            result = await read_attachment_bytes(
+                attachment_ref,
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                require_kind="text",
+            )
+        except Exception as exc:
+            logger.warning("[text_file_block_to_text_for_context] Could not read attachment %s: %s", attachment_ref, exc)
+            result = None
+        if result:
+            data, _ = result
+            return data.decode("utf-8", errors="replace")
+    owner_username = getattr(current_user, "username", None)
+    return text_file_block_to_text(
+        block,
+        owner_username=owner_username,
+        conversation_id=conversation_id,
+    )
+
+
 async def process_save_message(
     request: Request,
     conversation_id: int,
@@ -2535,6 +3437,9 @@ async def process_save_message(
     thinking_budget_tokens: Optional[int] = None,
     user_api_keys: Optional[dict] = None,  # User's custom API keys
     prevalidated: bool = False,
+    pdf_page_start: Optional[int] = None,
+    pdf_page_end: Optional[int] = None,
+    pdf_retry_token: Optional[str] = None,
 ):
     """
     Pure business logic function for processing and saving messages.
@@ -2613,8 +3518,15 @@ async def process_save_message(
 
     message_list_to_save = []
     message_list_to_send = []
+    pending_attachment_refs: list[str] = []
+
+    async def _attachment_error_response(message: str, status_code: int = 400):
+        await discard_pending_attachments(pending_attachment_refs, "message_upload_aborted")
+        return JSONResponse(content={'success': False, 'message': message}, status_code=status_code)
 
     logger.debug("Before entering into get_db_connection")
+
+    await ensure_conversation_privacy_schema()
 
     # Use read-only connection for SELECT queries
     async with get_db_connection(readonly=True) as conn_ro:
@@ -2633,7 +3545,8 @@ async def process_save_message(
                    COALESCE(L.max_output_tokens, 0),
                    COALESCE(ep.enable_moderation, 0) AS enable_moderation,
                    COALESCE(ep.is_paid, 0) AS is_paid,
-                   COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled
+                   COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled,
+                   COALESCE(c.is_incognito, 0) AS is_incognito
             FROM conversations c
             JOIN LLM L ON c.llm_id = L.id
             LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
@@ -2660,7 +3573,10 @@ async def process_save_message(
                 enable_moderation,
                 prompt_is_paid,
                 gransabio_enabled_col,
+                conversation_incognito,
             ) = conversation_row
+
+        conversation_incognito = bool(conversation_incognito)
 
         if is_locked:
             logger.info(f"Ignored message to conversation ID {conversation_id}, Locked state: {is_locked}")
@@ -2673,11 +3589,183 @@ async def process_save_message(
         logger.debug(f"text en process_save_message: {user_message}")
 
         input_tokens = estimate_message_tokens(user_message)
+        pdf_pages_in_request = 0
+        pdf_range_requested_preflight = pdf_page_start is not None or pdf_page_end is not None
+        pdf_file_count = 0
+        pdf_filename_for_retry = None
+        pdf_file_hash_for_retry = None
+        pdf_retry_payload = None
+        skip_context_pdfs_for_retry = False
+
+        if files:
+            pdf_file_count = sum(1 for f in files if f['content_type'] == 'application/pdf')
+            pdf_filename_for_retry = next(
+                (f.get('filename') for f in files if f['content_type'] == 'application/pdf'),
+                None,
+            )
+            if pdf_file_count == 1:
+                retry_pdf = next((f for f in files if f['content_type'] == 'application/pdf'), None)
+                if retry_pdf:
+                    pdf_file_hash_for_retry = hashlib.sha1(retry_pdf['data']).hexdigest()
+
+        if pdf_range_requested_preflight:
+            if pdf_file_count != 1:
+                return JSONResponse(
+                    content={'success': False, 'message': 'Page range retry supports one PDF at a time.'},
+                    status_code=400
+                )
+            if pdf_page_start is None or pdf_page_end is None:
+                return JSONResponse(
+                    content={'success': False, 'message': 'Both PDF page start and end are required.'},
+                    status_code=400
+                )
+            pdf_retry_payload = _decode_pdf_retry_token(pdf_retry_token, current_user, conversation_id)
+            if not pdf_retry_payload:
+                return JSONResponse(
+                    content={'success': False, 'message': 'PDF range retry expired. Please resend the original PDF and wait for the range prompt again.'},
+                    status_code=400
+                )
 
         if files:
             for f in files:
                 if is_text_file(f['content_type'], f['filename']):
                     input_tokens += int(len(f['data']) / 4 * 1.1 + 0.5)
+                elif f['content_type'] == 'application/pdf':
+                    if len(f['data']) > MAX_PDF_SIZE_MB * 1024 * 1024:
+                        return JSONResponse(
+                            content={'success': False, 'message': f'PDF exceeds {MAX_PDF_SIZE_MB}MB limit.'},
+                            status_code=400
+                    )
+                    try:
+                        page_count_for_cost = validate_pdf(
+                            f['data'],
+                            enforce_page_limit=False,
+                        )
+                        if pdf_range_requested_preflight:
+                            retry_validation_error = _validate_pdf_retry_upload(
+                                pdf_retry_payload,
+                                f['data'],
+                                page_count_for_cost,
+                            )
+                            if retry_validation_error:
+                                return JSONResponse(
+                                    content={'success': False, 'message': retry_validation_error},
+                                    status_code=400
+                                )
+                            range_start = int(pdf_page_start)
+                            range_end = int(pdf_page_end)
+                            if range_start < 1 or range_end < range_start or range_end > page_count_for_cost:
+                                return JSONResponse(
+                                    content={'success': False, 'message': f'PDF page range exceeds document length ({page_count_for_cost} pages)'},
+                                    status_code=400
+                                )
+                            page_count_for_cost = range_end - range_start + 1
+                            if page_count_for_cost > MAX_PDF_PAGES:
+                                return JSONResponse(
+                                    content=_pdf_upload_too_large_payload(
+                                        f'PDF page range exceeds {MAX_PDF_PAGES} page limit ({page_count_for_cost} pages)',
+                                        pdf_file_count,
+                                        page_count_for_cost,
+                                        filename=f.get('filename'),
+                                        current_user=current_user,
+                                        conversation_id=conversation_id,
+                                        retry_file_hash=hashlib.sha1(f['data']).hexdigest(),
+                                    ),
+                                    status_code=400
+                                )
+                        elif page_count_for_cost > MAX_PDF_PAGES:
+                            return JSONResponse(
+                                content=_pdf_upload_too_large_payload(
+                                    f'PDF exceeds {MAX_PDF_PAGES} page limit ({page_count_for_cost} pages)',
+                                    pdf_file_count,
+                                    page_count_for_cost,
+                                    filename=f.get('filename') if pdf_file_count == 1 else None,
+                                    current_user=current_user,
+                                    conversation_id=conversation_id,
+                                    retry_file_hash=hashlib.sha1(f['data']).hexdigest() if pdf_file_count == 1 else None,
+                                ),
+                                status_code=400
+                            )
+                    except ValueError as e:
+                        return JSONResponse(
+                            content={'success': False, 'message': str(e), 'error_code': 'pdf_validation_error'},
+                            status_code=400
+                        )
+                    pdf_pages_in_request += page_count_for_cost
+                    if pdf_pages_in_request > MAX_PDF_PAGES:
+                        return JSONResponse(
+                            content=_pdf_upload_too_large_payload(
+                                f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({pdf_pages_in_request} pages)',
+                                pdf_file_count,
+                                pdf_pages_in_request,
+                                filename=pdf_filename_for_retry if pdf_file_count == 1 else None,
+                                current_user=current_user,
+                                conversation_id=conversation_id,
+                                retry_file_hash=hashlib.sha1(f['data']).hexdigest() if pdf_file_count == 1 else None,
+                            ),
+                            status_code=400
+                        )
+                    input_tokens += _estimate_pdf_input_tokens_for_preflight(page_count_for_cost, machine)
+            skip_context_pdfs_for_retry = bool(
+                pdf_range_requested_preflight
+                and pdf_retry_payload
+                and pdf_retry_payload.get("allow_skip_context_pdfs")
+            )
+
+        if not skip_context_pdfs_for_retry:
+            async with conn_ro.execute(
+                '''
+                SELECT message
+                FROM messages
+                WHERE conversation_id = ?
+                AND date >= ?
+                AND message LIKE '%"document_url"%'
+                ORDER BY id ASC, date ASC
+                ''',
+                (conversation_id, start_date)
+            ) as cursor:
+                context_pdf_rows = await cursor.fetchall()
+
+            context_pdf_pages = 0
+            context_pdf_count = 0
+            for row in context_pdf_rows:
+                try:
+                    stored_message = parse_stored_message(custom_unescape(row[0]))
+                except Exception as exc:
+                    logger.warning(
+                        "[process_save_message] Could not estimate stored PDF tokens for conversation_id=%s: %s",
+                        conversation_id,
+                        exc,
+                    )
+                    continue
+                if not isinstance(stored_message, list):
+                    continue
+                for block in stored_message:
+                    if not isinstance(block, dict) or block.get("type") != "document_url":
+                        continue
+                    pdf_info = block.get("document_url") or {}
+                    try:
+                        page_count_for_cost = int(pdf_info.get("pages") or 0)
+                    except (TypeError, ValueError):
+                        page_count_for_cost = 0
+                    context_pdf_count += 1
+                    context_pdf_pages += page_count_for_cost
+                    if context_pdf_pages + pdf_pages_in_request > MAX_PDF_PAGES:
+                        return JSONResponse(
+                            content=_pdf_upload_too_large_payload(
+                                f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({context_pdf_pages + pdf_pages_in_request} pages including conversation context)',
+                                pdf_file_count,
+                                pdf_pages_in_request,
+                                context_pdf_count=context_pdf_count,
+                                context_pages=context_pdf_pages,
+                                filename=pdf_filename_for_retry if pdf_file_count == 1 else None,
+                                current_user=current_user,
+                                conversation_id=conversation_id,
+                                retry_file_hash=pdf_file_hash_for_retry,
+                            ),
+                            status_code=400
+                        )
+                    input_tokens += _estimate_pdf_input_tokens_for_preflight(page_count_for_cost, machine)
 
         current_balance = await get_balance(current_user.id)
         model_output_cap, output_limit_fallback_used = _model_output_cap(llm_max_output_tokens)
@@ -2736,28 +3824,36 @@ async def process_save_message(
                 if not pdf_redirect_will_happen:
                     async with get_db_connection(readonly=True) as conn_pdf:
                         cursor_pdf = await conn_pdf.execute(
-                            "SELECT 1 FROM messages WHERE conversation_id = ? AND message LIKE '%\"document_url\"%' LIMIT 1",
-                            (conversation_id,)
+                            "SELECT 1 FROM messages WHERE conversation_id = ? AND date >= ? AND message LIKE '%\"document_url\"%' LIMIT 1",
+                            (conversation_id, start_date)
                         )
                         pdf_redirect_will_happen = (await cursor_pdf.fetchone()) is not None
-
-            if pdf_redirect_will_happen and not openrouter_key:
-                return JSONResponse(
-                    content={'success': False, 'message': 'PDF files with this model require OpenRouter integration. Use Claude, Gemini, or select an OpenRouter model directly.'},
-                    status_code=400
-                )
 
             # Determine if this call will use BYOK (user's own API key)
             from common import resolve_api_key_for_provider, get_user_api_key_mode, API_KEY_MODE_SYSTEM_ONLY, BYOK_MIN_BALANCE_PAID_PROMPT
             api_key_mode_preflight = await get_user_api_key_mode(current_user.id)
-            is_byok = False
-            if api_key_mode_preflight != API_KEY_MODE_SYSTEM_ONLY and user_api_keys:
-                preflight_key, _ = resolve_api_key_for_provider(user_api_keys, api_key_mode_preflight, machine)
-                is_byok = preflight_key is not None
-
-            # Force non-BYOK when PDF redirect is active (platform pays OpenRouter)
-            if pdf_redirect_will_happen:
-                is_byok = False
+            preflight_provider = "OpenRouter" if pdf_redirect_will_happen else machine
+            preflight_key, preflight_use_system = resolve_api_key_for_provider(
+                user_api_keys or {},
+                api_key_mode_preflight,
+                preflight_provider,
+            )
+            if (
+                pdf_redirect_will_happen
+                and not preflight_key
+                and preflight_use_system
+                and not openrouter_key
+            ):
+                return JSONResponse(
+                    content={'success': False, 'message': 'PDF files with this model require OpenRouter integration. Use Claude, Gemini, or select an OpenRouter model directly.'},
+                    status_code=400
+                )
+            if not preflight_key and not preflight_use_system:
+                return JSONResponse(
+                    content={'success': False, 'message': f'API key required for {preflight_provider}.'},
+                    status_code=400
+                )
+            is_byok = preflight_key is not None
 
             if is_byok:
                 # BYOK: no API cost to platform. Only need balance for paid prompt markup.
@@ -2850,6 +3946,7 @@ async def process_save_message(
             "effective_prompt_id": effective_prompt_id,
             "active_extension_id": active_extension_id,
             "last_message_id": last_message_id or 0,
+            "is_incognito": conversation_incognito,
         }
         warmup_key = _build_warmup_cache_key_from_state(
             warmup_state,
@@ -2899,77 +3996,126 @@ async def process_save_message(
             elif is_text_file(f['content_type'], f['filename']):
                 text_files.append(f)
             else:
-                return JSONResponse(
-                    content={'success': False, 'message': f"Unsupported file type: {f['content_type']}"},
-                    status_code=400
-                )
+                return await _attachment_error_response(f"Unsupported file type: {f['content_type']}")
 
         # Validate and process PDFs
         if len(pdfs) > MAX_PDFS_PER_MESSAGE:
-            return JSONResponse(
-                content={'success': False, 'message': f'Maximum {MAX_PDFS_PER_MESSAGE} PDFs per message.'},
-                status_code=400
-            )
+            return await _attachment_error_response(f'Maximum {MAX_PDFS_PER_MESSAGE} PDFs per message.')
 
+        pdf_range_requested = pdf_page_start is not None or pdf_page_end is not None
+        if pdf_range_requested:
+            if len(pdfs) != 1:
+                return await _attachment_error_response('Page range retry supports one PDF at a time.')
+            if pdf_page_start is None or pdf_page_end is None:
+                return await _attachment_error_response('Both PDF page start and end are required.')
+
+        pdf_pages_in_request = 0
         for pdf in pdfs:
             if len(pdf['data']) > MAX_PDF_SIZE_MB * 1024 * 1024:
-                return JSONResponse(
-                    content={'success': False, 'message': f'PDF exceeds {MAX_PDF_SIZE_MB}MB limit.'},
-                    status_code=400
+                return await _attachment_error_response(f'PDF exceeds {MAX_PDF_SIZE_MB}MB limit.')
+            try:
+                pdf_data = pdf['data']
+                filename = pdf['filename'] or 'document.pdf'
+                original_pdf_data = pdf_data
+                original_pdf_hash = hashlib.sha1(original_pdf_data).hexdigest()
+                page_count = validate_pdf(
+                    pdf_data,
+                    enforce_page_limit=not pdf_range_requested,
                 )
-            page_count = validate_pdf(pdf['data'])
-            pdf_b64 = base64.b64encode(pdf['data']).decode("utf-8")
+                original_page_count = page_count
+                if pdf_range_requested:
+                    pdf_data, page_count, original_page_count = extract_pdf_page_range(
+                        pdf_data,
+                        pdf_page_start,
+                        pdf_page_end
+                    )
+                    name_root, name_ext = os.path.splitext(filename)
+                    filename = f"{name_root or 'document'}_pages_{pdf_page_start}-{pdf_page_end}{name_ext or '.pdf'}"
+                    logger.info(
+                        "[process_save_message] PDF page range selected: %s pages %s-%s of %s",
+                        filename,
+                        pdf_page_start,
+                        pdf_page_end,
+                        original_page_count,
+                    )
+                pdf_pages_in_request += page_count
+                if pdf_pages_in_request > MAX_PDF_PAGES:
+                    return await _attachment_error_response(
+                        f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({pdf_pages_in_request} pages)'
+                    )
+            except ValueError as exc:
+                return await _attachment_error_response(str(exc))
+            pdf_b64 = base64.b64encode(pdf_data).decode("utf-8")
 
             # For O1 only: extract text locally (O1 is text-only, can't receive PDF data)
             extracted_text = None
             if machine == "O1":
-                extracted_text = extract_pdf_text_local(pdf['data'])
+                extracted_text = extract_pdf_text_local(pdf_data)
 
-            base_url, _ = await save_pdf_locally(pdf['data'], pdf['filename'], current_user, conversation_id)
-            content_to_save, content_to_send = format_pdf_for_provider(
-                machine, base_url, pdf_b64, pdf['filename'], page_count, extracted_text
+            try:
+                pending_pdf = await create_pending_pdf_attachment(
+                    user_id=current_user.id,
+                    conversation_id=conversation_id,
+                    data=pdf_data,
+                    filename=filename,
+                    page_count=page_count,
+                    declared_mime=pdf.get('content_type') or 'application/pdf',
+                )
+            except Exception as exc:
+                logger.error("[process_save_message] Could not save PDF attachment: %s", exc)
+                return await _attachment_error_response('Failed to save PDF.', status_code=500)
+            pending_attachment_refs.append(pending_pdf.public_id)
+            _, content_to_send = format_pdf_for_provider(
+                machine, "", pdf_b64, filename, page_count, extracted_text
             )
-            message_list_to_save.append(content_to_save)
+            save_block = pending_pdf.block
+            if pdf_range_requested:
+                save_block["document_url"]["retry_source_hash"] = original_pdf_hash
+                save_block["document_url"]["retry_source_pages"] = original_page_count
+            message_list_to_save.append(save_block)
+            if pdf_range_requested:
+                message_list_to_send.append({
+                    "type": "text",
+                    "text": _ranged_pdf_warning_text(
+                        filename,
+                        page_start=pdf_page_start,
+                        page_end=pdf_page_end,
+                        source_page_count=original_page_count,
+                    ),
+                })
             message_list_to_send.append(content_to_send)
 
         # Validate and process text files
         if text_files:
             if len(text_files) > MAX_TEXT_FILES_PER_MESSAGE:
-                return JSONResponse(
-                    content={'success': False, 'message': f'Maximum {MAX_TEXT_FILES_PER_MESSAGE} text files per message'},
-                    status_code=400
-                )
+                return await _attachment_error_response(f'Maximum {MAX_TEXT_FILES_PER_MESSAGE} text files per message')
 
             for tf in text_files:
                 size_mb = len(tf['data']) / (1024 * 1024)
                 if size_mb > MAX_TEXT_FILE_SIZE_MB:
-                    return JSONResponse(
-                        content={'success': False, 'message': f"Text file '{tf['filename']}' exceeds {MAX_TEXT_FILE_SIZE_MB}MB limit"},
-                        status_code=400
-                    )
+                    return await _attachment_error_response(f"Text file '{tf['filename']}' exceeds {MAX_TEXT_FILE_SIZE_MB}MB limit")
 
                 try:
                     text_content = decode_text_file(tf['data'], tf['filename'])
                 except ValueError as e:
-                    return JSONResponse(
-                        content={'success': False, 'message': str(e)},
-                        status_code=400
-                    )
+                    return await _attachment_error_response(str(e))
 
                 filename = tf['filename'] or 'unnamed.txt'
                 line_count = text_content.count('\n') + 1
 
-                text_file_url = save_text_file_locally(current_user, conversation_id, text_content, filename)
-
-                content_to_save = {
-                    "type": "text_file",
-                    "text_file": {
-                        "url": text_file_url,
-                        "filename": filename,
-                        "lines": line_count
-                    }
-                }
-                message_list_to_save.append(content_to_save)
+                try:
+                    pending_text = await create_pending_text_attachment(
+                        user_id=current_user.id,
+                        conversation_id=conversation_id,
+                        text_content=text_content,
+                        filename=filename,
+                        declared_mime=tf.get('content_type') or 'text/plain',
+                    )
+                except Exception as exc:
+                    logger.error("[process_save_message] Could not save text attachment: %s", exc)
+                    return await _attachment_error_response('Failed to save text file.', status_code=500)
+                pending_attachment_refs.append(pending_text.public_id)
+                message_list_to_save.append(pending_text.block)
 
                 content_to_send = {
                     "type": "text",
@@ -2979,10 +4125,7 @@ async def process_save_message(
 
         # Validate and process images
         if len(images) > MAX_IMAGES_PER_MESSAGE:
-            return JSONResponse(
-                content={'success': False, 'message': f'Maximum {MAX_IMAGES_PER_MESSAGE} images per message.'},
-                status_code=400
-            )
+            return await _attachment_error_response(f'Maximum {MAX_IMAGES_PER_MESSAGE} images per message.')
 
         for file_item in images:
             image_data = file_item['data']
@@ -2994,17 +4137,11 @@ async def process_save_message(
                     _validate_and_compress_image, image_data, filename
                 )
             except ValueError as e:
-                return JSONResponse(
-                    content={'success': False, 'message': str(e)},
-                    status_code=400
-                )
+                return await _attachment_error_response(str(e))
 
             # Post-compression size check
             if len(image_data) > MAX_API_IMAGE_SIZE_MB * 1024 * 1024:
-                return JSONResponse(
-                    content={'success': False, 'message': 'Image is too large. Please use a smaller or lower-resolution image.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('Image is too large. Please use a smaller or lower-resolution image.')
 
             logger.debug(
                 f"[process_save_message] Image processed: {filename}, "
@@ -3014,41 +4151,34 @@ async def process_save_message(
             # Base64 encode (fast, stays on event loop)
             image1_data = base64.b64encode(image_data).decode("utf-8")
 
-            # Save to disk in thread (does NOT block event loop)
-            # Only use direct-write when WE compressed it (not for user-uploaded WebPs)
             try:
-                image_url_base_256, image_url_token_256, image_url_base_fullsize, image_url_token_fullsize = (
-                    await save_image_locally(
-                        request, image_data, current_user, conversation_id, filename, "user",
-                        pre_compressed_webp=was_compressed
-                    )
+                pending_image = await create_pending_image_attachment(
+                    user_id=current_user.id,
+                    conversation_id=conversation_id,
+                    data=image_data,
+                    filename=filename,
+                    mime_detected=image_media_type,
+                    declared_mime=file_item.get('content_type'),
+                    width=w,
+                    height=h,
                 )
             except Exception as e:
                 logger.error(f"[process_save_message] Could not save image: {e}")
-                return JSONResponse(
-                    content={'success': False, 'message': 'Failed to save image.'},
-                    status_code=500
-                )
-
-            if not (image_url_base_256 and image_url_token_256 and image_url_base_fullsize and image_url_token_fullsize):
-                logger.error("[process_save_message] - Could not save the image")
-                continue  # Skip this image, process remaining ones
+                return await _attachment_error_response('Failed to save image.', status_code=500)
+            pending_attachment_refs.append(pending_image.public_id)
 
             # Format for provider (in thread -- xAI may need Pillow JPEG conversion)
             # NOTE: image_media_type here is the Pillow-detected/compression-derived type,
             # NOT the client-reported MIME. This is correct and intentional.
             try:
-                image_content_to_save, image_content_to_send = await asyncio.to_thread(
+                _, image_content_to_send = await asyncio.to_thread(
                     format_image_for_provider,
-                    machine, image_url_base_fullsize, image1_data, image_media_type
+                    machine, "", image1_data, image_media_type
                 )
             except ValueError:
-                return JSONResponse(
-                    content={'success': False, 'message': f'Unsupported AI provider for images: {machine}'},
-                    status_code=400
-                )
+                return await _attachment_error_response(f'Unsupported AI provider for images: {machine}')
 
-            message_list_to_save.append(image_content_to_save)
+            message_list_to_save.append(pending_image.block)
             message_list_to_send.append(image_content_to_send)
 
         if user_message:
@@ -3119,6 +4249,7 @@ async def process_save_message(
             # If none are flagged, proceed
         except Exception as e:
             logger.error(f"[process_save_message] - Error calling moderation API: {e}")
+            await discard_pending_attachments(pending_attachment_refs, "moderation_error")
             return JSONResponse(content={'success': False, 'message': f'Failed to process message: {str(e)}'}, status_code=400)
     # --- End of Moderation API Integration ---
 
@@ -3200,6 +4331,7 @@ async def process_save_message(
 
         # Save the user's message and handle the flagged case
         if message_flagged:
+            await discard_pending_attachments(pending_attachment_refs, "moderation_blocked")
             # Save the user's message and the AI's response to the database
             async with conversation_write_lock(conversation_id):
                 async with get_db_connection() as conn:
@@ -3259,15 +4391,20 @@ async def process_save_message(
                     request,
                     output_tokens,
                     user_message=message_to_save,
+                    input_token_fallback=input_tokens,
+                    skip_context_pdfs=skip_context_pdfs_for_retry,
                     thinking_budget_tokens=thinking_budget_tokens,
                     user_api_keys=user_api_keys,
                     llm_id=conversation_llm_id,
                     byok=is_byok,
+                    pending_attachment_refs=pending_attachment_refs,
                 ):
                     yield chunk
             except asyncio.CancelledError:
                 logger.info("Client disconnected")
                 raise
+            finally:
+                await discard_pending_attachments(pending_attachment_refs, "stream_finished")
 
     return StreamingResponse(stream_response(), media_type='text/event-stream')
 
@@ -3284,6 +4421,9 @@ async def save_message(
     is_whatsapp: bool = Form(False),
     thinking_budget_tokens: Optional[int] = Form(None),
     multi_ai_models: Optional[str] = Form(None),
+    pdf_page_start: Optional[int] = Form(None),
+    pdf_page_end: Optional[int] = Form(None),
+    pdf_retry_token: Optional[str] = Form(None),
 ):
     """
     FastAPI endpoint that handles HTTP request and delegates to process_save_message.
@@ -3509,6 +4649,9 @@ async def save_message(
         thinking_budget_tokens=thinking_budget_tokens,
         user_api_keys=user_api_keys,
         prevalidated=True,
+        pdf_page_start=pdf_page_start,
+        pdf_page_end=pdf_page_end,
+        pdf_retry_token=pdf_retry_token,
     )
 
 
@@ -3554,6 +4697,8 @@ async def build_full_prompt_context(
         "gransabio_config_raw": None,
         "user_level": "customer",
         "original_prompt": "",
+        "atagia_context_active": False,
+        "atagia_context_reason": "",
     }
 
     if context_messages is None:
@@ -3829,14 +4974,22 @@ async def build_full_prompt_context(
             full_prompt = assemble_system_prompt(
                 blocks, variables, prompt_base, watchdog_enabled, watchdog_hint_block
             )
-            full_prompt = await _augment_prompt_with_atagia_context(
+            atagia_decision = await _resolve_atagia_context(
                 full_prompt,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 message=user_message,
+                prompt_id=effective_role_id,
+            )
+            full_prompt = atagia_decision.full_prompt
+            context_messages = _context_messages_for_provider(
+                context_messages,
+                atagia_decision,
             )
 
     result["full_prompt"] = full_prompt
+    result["atagia_context_active"] = atagia_decision.active
+    result["atagia_context_reason"] = atagia_decision.reason
     result["watchdog_config"] = watchdog_config
     result["watchdog_hint_active"] = watchdog_hint_active
     result["watchdog_hint_eval_id"] = watchdog_hint_eval_id
@@ -3856,11 +5009,14 @@ async def get_ai_response(
     max_tokens,
     temperature=0.7,
     user_message=None,
+    input_token_fallback=None,
+    skip_context_pdfs: bool = False,
     thinking_budget_tokens=None,
     user_api_keys: Optional[dict] = None,
     llm_id=None,
     save_to_db: bool = True,
     byok: bool = False,
+    pending_attachment_refs: Optional[list[str]] = None,
 ):
     logger.info(f"*** Enters {machine}")
     logger.debug(f"Parameters received: conversation_id={conversation_id}, model={model}, max_tokens={max_tokens}")
@@ -3873,6 +5029,7 @@ async def get_ai_response(
 
     try:
         # Use read-only connection for SELECT queries
+        await ensure_conversation_privacy_schema()
         async with get_db_connection(readonly=True) as conn_ro:
             async with conn_ro.cursor() as cursor_ro:
                 # Get prompt and other details
@@ -3897,7 +5054,8 @@ async def get_ai_response(
                         pe.name AS extension_name,
                         pe.prompt_text AS extension_prompt_text,
                         COALESCE(p.gransabio_enabled, 0) AS gransabio_enabled,
-                        p.gransabio_config AS gransabio_config
+                        p.gransabio_config AS gransabio_config,
+                        COALESCE(c.is_incognito, 0) AS is_incognito
                     FROM CONVERSATIONS c
                     LEFT JOIN PROMPTS p ON c.role_id = p.id
                     LEFT JOIN USER_DETAILS ud ON ud.user_id = ?
@@ -3915,7 +5073,9 @@ async def get_ai_response(
                      extensions_auto_advance, extensions_free_selection,
                      active_extension_id, extension_name,
                      extension_prompt_text,
-                     gransabio_enabled, gransabio_config_raw) = result
+                     gransabio_enabled, gransabio_config_raw,
+                     conversation_incognito) = result
+                    conversation_incognito = bool(conversation_incognito)
                     
                     if conversation_role_id is None and effective_role_id:
                         # Update conversation role_id if needed
@@ -4088,6 +5248,7 @@ async def get_ai_response(
                                             model=model,
                                             event_type=pre_event_type,
                                             source="pre",
+                                            pending_attachment_refs=pending_attachment_refs,
                                         ):
                                             yield chunk
                                         return
@@ -4168,6 +5329,7 @@ async def get_ai_response(
                                         model=model,
                                         event_type=pending_hint_event_type,
                                         source="post",
+                                        pending_attachment_refs=pending_attachment_refs,
                                     ):
                                         yield chunk
                                     return
@@ -4184,12 +5346,21 @@ async def get_ai_response(
                     variables = {"user_level": user_level}
                     full_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                                         watchdog_enabled, watchdog_hint_block)
-                    full_prompt = await _augment_prompt_with_atagia_context(
+                    atagia_decision = await _resolve_atagia_context(
                         full_prompt,
                         user_id=user_id,
                         conversation_id=conversation_id,
                         message=message,
+                        prompt_id=prompt_id,
+                        incognito=conversation_incognito,
                     )
+                    full_prompt = atagia_decision.full_prompt
+                    context_messages = _context_messages_for_provider(
+                        context_messages,
+                        atagia_decision,
+                    )
+                    if skip_context_pdfs:
+                        context_messages = _drop_pdf_blocks_from_context(context_messages)
 
                 else:
                     logger.error(f"[get_ai_response] - No conversation found with id {conversation_id} for user {user_id}")
@@ -4209,6 +5380,29 @@ async def get_ai_response(
                     for msg in context_messages
                     for block in (msg.get("message", []) if isinstance(msg.get("message"), list) else [])
                 )
+                current_pdf_error_metadata = _extract_pdf_metadata_from_saved_message(user_message)
+                context_pdf_error_metadata = _extract_pdf_metadata_from_context_messages(context_messages)
+                pdf_error_metadata = _merge_pdf_error_metadata(
+                    current_pdf_error_metadata,
+                    context_pdf_error_metadata,
+                )
+                if pdf_error_metadata:
+                    current_pdf_count = int((current_pdf_error_metadata or {}).get("pdf_count") or 0)
+                    context_pdf_count = int((context_pdf_error_metadata or {}).get("pdf_count") or 0)
+                    pdf_error_metadata["current_pdf_count"] = current_pdf_count
+                    pdf_error_metadata["context_pdf_count"] = context_pdf_count
+                    pdf_error_metadata["range_retry_available"] = current_pdf_count == 1
+                    if current_pdf_count == 1:
+                        pdf_error_metadata["retry_filename"] = current_pdf_error_metadata.get("filename")
+                        pdf_error_metadata["retry_pages"] = current_pdf_error_metadata.get("pages")
+                        pdf_error_metadata["retry_file_hash"] = (
+                            current_pdf_error_metadata.get("retry_source_hash")
+                            or current_pdf_error_metadata.get("file_hash")
+                        )
+                        pdf_error_metadata["retry_source_pages"] = (
+                            current_pdf_error_metadata.get("retry_source_pages")
+                            or current_pdf_error_metadata.get("pages")
+                        )
 
                 pdf_redirect_active = False
 
@@ -4246,7 +5440,12 @@ async def get_ai_response(
                                 if block.get("type") == "text":
                                     parts.append(genai_types.Part.from_text(text=block["text"]))
                                 elif block.get("type") == "image_url":
-                                    hydrated_block = await hydrate_image_for_context(block, "Gemini", current_user)
+                                    hydrated_block = await hydrate_image_for_context(
+                                        block,
+                                        "Gemini",
+                                        current_user,
+                                        conversation_id=conversation_id,
+                                    )
                                     if hydrated_block is None:
                                         continue
                                     token_url = hydrated_block["image_url"]["url"]
@@ -4263,14 +5462,14 @@ async def get_ai_response(
                                             mime = "image/jpeg"
                                         parts.append(genai_types.Part.from_uri(file_uri=token_url, mime_type=mime))
                                 elif block.get("type") == "document_url":
-                                    hydrated = hydrate_pdf_for_context(block, "Gemini")
+                                    hydrated = await hydrate_pdf_for_context(block, "Gemini", current_user, conversation_id=conversation_id)
                                     if hydrated is not None:
                                         parts.append(genai_types.Part.from_bytes(
                                             data=base64.b64decode(hydrated["data"]),
                                             mime_type="application/pdf"
                                         ))
                                 elif block.get("type") == "text_file":
-                                    parts.append(genai_types.Part.from_text(text=text_file_block_to_text(block)))
+                                    parts.append(genai_types.Part.from_text(text=await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id)))
                             if parts:
                                 gemini_contents.append(genai_types.Content(role=role, parts=parts))
                         else:
@@ -4319,11 +5518,11 @@ async def get_ai_response(
                                     if block.get("type") == "text":
                                         text_parts.append(block["text"])
                                     elif block.get("type") == "document_url":
-                                        hydrated = hydrate_pdf_for_context(block, "O1")
+                                        hydrated = await hydrate_pdf_for_context(block, "O1", current_user, conversation_id=conversation_id)
                                         if hydrated is not None:
                                             text_parts.append(hydrated["text"])
                                     elif block.get("type") == "text_file":
-                                        text_parts.append(text_file_block_to_text(block))
+                                        text_parts.append(await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id))
                                     elif block.get("type") == "image_url":
                                         text_parts.append("[An image was shared]")
                             msg_content = "\n".join(text_parts) if text_parts else str(msg_content)
@@ -4339,15 +5538,20 @@ async def get_ai_response(
                             hydrated = []
                             for block in content:
                                 if block.get("type") == "image_url":
-                                    result = await hydrate_image_for_context(block, machine, current_user)
+                                    result = await hydrate_image_for_context(
+                                        block,
+                                        machine,
+                                        current_user,
+                                        conversation_id=conversation_id,
+                                    )
                                     if result is not None:
                                         hydrated.append(result)
                                 elif block.get("type") == "document_url":
-                                    result = hydrate_pdf_for_context(block, machine)
+                                    result = await hydrate_pdf_for_context(block, machine, current_user, conversation_id=conversation_id)
                                     if result is not None:
                                         hydrated.append(result)
                                 elif block.get("type") == "text_file":
-                                    hydrated.append({"type": "text", "text": text_file_block_to_text(block)})
+                                    hydrated.append({"type": "text", "text": await text_file_block_to_text_for_context(block, current_user, conversation_id=conversation_id)})
                                 else:
                                     hydrated.append(block)
                             api_messages.append({"role": "user" if msg['type'] == 'user' else "assistant", "content": hydrated})
@@ -4497,6 +5701,8 @@ async def get_ai_response(
                     "current_user": current_user,
                     "request": request,
                     "user_message": user_message,
+                    "input_token_fallback": input_token_fallback,
+                    "pdf_error_metadata": pdf_error_metadata,
                     "prompt_id": prompt_id,
                     "watchdog_config": watchdog_config,
                     "watchdog_hint_active": watchdog_hint_active,
@@ -4505,6 +5711,7 @@ async def get_ai_response(
                     "save_to_db": save_to_db,
                     "web_search_mode": web_search_mode,
                     "byok": byok,
+                    "pending_attachment_refs": pending_attachment_refs,
                 }
 
                 # Add tools if available for this provider
@@ -4514,10 +5721,10 @@ async def get_ai_response(
                 if machine == "Claude" and thinking_budget_tokens:
                     kwargs["thinking_budget_tokens"] = thinking_budget_tokens
 
-                # PDF redirect: pass remapped model and force non-BYOK
+                # PDF redirect: pass remapped model while preserving BYOK when
+                # the user provided an OpenRouter key.
                 if pdf_redirect_active:
                     kwargs["api_model"] = openrouter_model_id
-                    kwargs["byok"] = False
 
                 # ===========================================
                 # Resolve which API key to use based on mode
@@ -4533,8 +5740,10 @@ async def get_ai_response(
 
                 if resolved_key:
                     kwargs["user_api_key"] = resolved_key
+                    kwargs["byok"] = True
                     logger.info(f"Using user's custom {machine} API key")
                 elif use_system:
+                    kwargs["byok"] = False
                     logger.info(f"Using system {machine} API key")
                 else:
                     # own_only mode without configured key - should have been caught earlier
@@ -4569,6 +5778,7 @@ async def get_ai_response(
                             api_messages_b64 = await _format_messages_for_provider(
                                 context_messages, message, full_prompt, machine,
                                 current_user=current_user, force_base64=True,
+                                conversation_id=conversation_id,
                             )
                             kwargs["messages"] = api_messages_b64
                             first_chunk = None
@@ -4771,6 +5981,10 @@ async def get_ai_response(
                             machine,
                             full_prompt,
                             user_message,
+                            input_token_fallback=input_token_fallback,
+                            user_api_key=resolved_key,
+                            api_model=openrouter_model_id if pdf_redirect_active else None,
+                            pdf_error_metadata=pdf_error_metadata,
                             prompt_id=prompt_id,
                             watchdog_config=watchdog_config,
                             watchdog_hint_active=watchdog_hint_active,
@@ -4778,6 +5992,7 @@ async def get_ai_response(
                             llm_id=llm_id,
                             byok=byok,
                             thinking_budget_tokens=thinking_budget_tokens,
+                            pending_attachment_refs=pending_attachment_refs,
                         ):
                             yield chunk
 
@@ -5327,8 +6542,11 @@ def _build_tool_response_messages(api_messages: list, tool_call: dict, tool_resu
 
 
 async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None,
+                      input_token_fallback=None,
+                      pdf_error_metadata=None,
                       prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                      llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                      llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                      pending_attachment_refs: Optional[list[str]] = None):
     global stop_signals
     logger.debug("enters call_o1_api")
 
@@ -5399,7 +6617,7 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
                     raw_log = f"[call_o1_api] - Error: Received status code {response.status}. Response body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (o1)")
-                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                    yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
         except asyncio.TimeoutError as exc:
             error_msg = f"[call_o1_api] - Request timed out for conversation {conversation_id}"
@@ -5438,8 +6656,9 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
             return
         else:
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
+                                                                        input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, byok=byok)
+                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -5450,8 +6669,11 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
 
 
 async def call_llm_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, api_url, api_key, provider_label, user_message=None, extra_headers=None, custom_timeout=None, tools=None,
+                       input_token_fallback=None,
+                       pdf_error_metadata=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None):
+                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None,
+                       pending_attachment_refs: Optional[list[str]] = None):
     """
     Generic LLM API call function for OpenAI-compatible APIs.
     Used by GPT, xAI, and OpenRouter.
@@ -5626,7 +6848,7 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                     raw_log = f"[call_llm_api] - Error: Received status code {response.status}. Response body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, provider_label)
-                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                    yield f"data: {orjson.dumps(_provider_error_payload(provider_label, human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
                     logger.error(f"Request details: URL: {api_url}, Headers: {safe_log_headers(headers)}, "
@@ -5693,8 +6915,9 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
             return
         else:
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
+                                                                        input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, byok=byok)
+                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -5704,8 +6927,11 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
         yield "data: [DONE]\n\n"
 
 async def call_gpt_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                       input_token_fallback=None,
+                       pdf_error_metadata=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                       pending_attachment_refs: Optional[list[str]] = None):
     api_url = "https://api.openai.com/v1/chat/completions"
     api_key = user_api_key or openai.api_key  # Use user's key if provided
 
@@ -5722,6 +6948,8 @@ async def call_gpt_api(messages, model, temperature, max_tokens, prompt, convers
         api_key,
         "OpenAI (GPT)",
         user_message=user_message,
+        input_token_fallback=input_token_fallback,
+        pdf_error_metadata=pdf_error_metadata,
         tools=tools,
         prompt_id=prompt_id,
         watchdog_config=watchdog_config,
@@ -5731,6 +6959,7 @@ async def call_gpt_api(messages, model, temperature, max_tokens, prompt, convers
         save_to_db=save_to_db,
         web_search_mode=web_search_mode,
         byok=byok,
+        pending_attachment_refs=pending_attachment_refs,
     ):
         yield chunk
 
@@ -5794,6 +7023,20 @@ def _convert_messages_for_responses_api(messages: list) -> list:
                         "type": "input_text",
                         "text": f"[PDF document: {fn} -- content unavailable in this format]"
                     })
+                elif btype == "file":
+                    file_info = block.get("file", {}) if isinstance(block.get("file"), dict) else {}
+                    file_data = file_info.get("file_data")
+                    if file_data:
+                        new_content.append({
+                            "type": "input_file",
+                            "filename": file_info.get("filename") or "document.pdf",
+                            "file_data": file_data,
+                        })
+                    else:
+                        new_content.append({
+                            "type": "input_text",
+                            "text": f"[File attachment: {file_info.get('filename') or 'document.pdf'} -- content unavailable]"
+                        })
                 elif btype == "text_file":
                     new_content.append({
                         "type": "input_text",
@@ -5810,8 +7053,11 @@ def _convert_messages_for_responses_api(messages: list) -> list:
 
 
 async def call_gpt_responses_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                                  input_token_fallback=None,
+                                  pdf_error_metadata=None,
                                   prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                                  llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                                  llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                                  pending_attachment_refs: Optional[list[str]] = None):
     """
     OpenAI Responses API call function. Replaces call_gpt_api for all OpenAI calls.
     Uses /v1/responses endpoint with semantic SSE events instead of Chat Completions.
@@ -6027,8 +7273,11 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                             elif etype == "response.failed":
                                 error_info = event_data.get("response", {}).get("error", {})
                                 error_msg = error_info.get("message", "Unknown API error")
+                                error_code = error_info.get("code") or error_info.get("type")
+                                if isinstance(error_code, str) and error_code.strip() and error_code.strip() not in error_msg:
+                                    error_msg = f"{error_code.strip()}: {error_msg}"
                                 logger.error(f"[call_gpt_responses_api] Response failed: {error_msg}")
-                                yield f"data: {orjson.dumps({'error': f'OpenAI API error: {error_msg}'}).decode()}\n\n"
+                                yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', error_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                                 error_yielded = True
 
                             elif etype == "response.incomplete":
@@ -6050,7 +7299,7 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                     raw_log = f"[call_gpt_responses_api] Error: status {response.status}. Body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (GPT)")
-                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                    yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
         except asyncio.TimeoutError as exc:
@@ -6108,8 +7357,9 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
         else:
             citations_data = orjson.dumps(citations).decode() if citations else None
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
+                                                                        input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok)
+                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -6120,8 +7370,11 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
 
 
 async def call_xai_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                       input_token_fallback=None,
+                       pdf_error_metadata=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                       pending_attachment_refs: Optional[list[str]] = None):
     api_url = "https://api.x.ai/v1/chat/completions"
     api_key = user_api_key or xai_key  # Use user's key if provided
 
@@ -6138,6 +7391,8 @@ async def call_xai_api(messages, model, temperature, max_tokens, prompt, convers
         api_key,
         "xAI (Grok)",
         user_message=user_message,
+        input_token_fallback=input_token_fallback,
+        pdf_error_metadata=pdf_error_metadata,
         tools=tools,
         prompt_id=prompt_id,
         watchdog_config=watchdog_config,
@@ -6147,13 +7402,17 @@ async def call_xai_api(messages, model, temperature, max_tokens, prompt, convers
         save_to_db=save_to_db,
         web_search_mode=web_search_mode,
         byok=byok,
+        pending_attachment_refs=pending_attachment_refs,
     ):
         yield chunk
 
 
 async def call_xai_responses_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                                  input_token_fallback=None,
+                                  pdf_error_metadata=None,
                                   prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                                  llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                                  llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                                  pending_attachment_refs: Optional[list[str]] = None):
     """
     xAI Responses API call function. Replaces call_xai_api for all xAI/Grok calls.
     Uses /v1/responses endpoint with semantic SSE events instead of Chat Completions.
@@ -6359,8 +7618,11 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                             elif etype == "response.failed":
                                 error_info = event_data.get("response", {}).get("error", {})
                                 error_msg = error_info.get("message", "Unknown API error")
+                                error_code = error_info.get("code") or error_info.get("type")
+                                if isinstance(error_code, str) and error_code.strip() and error_code.strip() not in error_msg:
+                                    error_msg = f"{error_code.strip()}: {error_msg}"
                                 logger.error(f"[call_xai_responses_api] Response failed: {error_msg}")
-                                yield f"data: {orjson.dumps({'error': f'xAI API error: {error_msg}'}).decode()}\n\n"
+                                yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', error_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                                 error_yielded = True
 
                             elif etype == "response.incomplete":
@@ -6382,7 +7644,7 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                     raw_log = f"[call_xai_responses_api] Error: status {response.status}. Body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "xAI (Grok)")
-                    yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                    yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
         except asyncio.TimeoutError as exc:
@@ -6440,8 +7702,9 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
         else:
             citations_data = orjson.dumps(citations).decode() if citations else None
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
+                                                                        input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok)
+                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -6452,8 +7715,11 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
 
 
 async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                              input_token_fallback=None,
+                              pdf_error_metadata=None,
                               prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                              llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None):
+                              llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None,
+                              pending_attachment_refs: Optional[list[str]] = None):
     """
     Call OpenRouter unified API - 100% OpenAI compatible.
 
@@ -6500,6 +7766,8 @@ async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, 
         api_key,
         "OpenRouter",
         user_message=user_message,
+        input_token_fallback=input_token_fallback,
+        pdf_error_metadata=pdf_error_metadata,
         extra_headers=extra_headers,
         custom_timeout=custom_timeout,
         tools=tools,
@@ -6512,13 +7780,17 @@ async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, 
         web_search_mode=web_search_mode,
         byok=byok,
         api_model=api_model,
+        pending_attachment_refs=pending_attachment_refs,
     ):
         yield chunk
 
 
 async def call_claude_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, thinking_budget_tokens=None, user_api_key=None, tools=None,
+                          input_token_fallback=None,
+                          pdf_error_metadata=None,
                           prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                          llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                          llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                          pending_attachment_refs: Optional[list[str]] = None):
     global stop_signals
     logger.debug("Entering call_claude_api")
 
@@ -6851,7 +8123,7 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
                                      f"messages={len(data.get('messages', []))}, "
                                      f"conversation_id={conversation_id}")
                         human_msg = _extract_human_error_message(error_body, response.status, "Claude")
-                        yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                        yield f"data: {orjson.dumps(_provider_error_payload('Claude', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                         error_yielded = True
                         break  # Don't continue on error
             except asyncio.TimeoutError as exc:
@@ -6949,8 +8221,9 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         else:
             citations_data = orjson.dumps(all_citations).decode() if all_citations else None
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
+                                                                        input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok)
+                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -6960,8 +8233,11 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         yield "data: [DONE]\n\n"
 
 async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
+                          input_token_fallback=None,
+                          pdf_error_metadata=None,
                           prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                          llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False):
+                          llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
+                          pending_attachment_refs: Optional[list[str]] = None):
     global stop_signals
     logger.info("Entering call_gemini_api")
     user_id = current_user.id
@@ -7051,7 +8327,7 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
             output_tokens = last_chunk.usage_metadata.candidates_token_count or 0
             total_tokens = last_chunk.usage_metadata.total_token_count or 0
         else:
-            input_tokens = estimate_message_tokens(str(contents))
+            input_tokens = 0
             output_tokens = estimate_message_tokens(content)
             total_tokens = input_tokens + output_tokens
 
@@ -7103,7 +8379,7 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
 
     except Exception as e:
         logger.error(f"[call_gemini_api] - Error calling Gemini API: {e}")
-        yield f"data: {orjson.dumps({'error': str(e)}).decode()}\n\n"
+        yield f"data: {orjson.dumps(_provider_error_payload('Gemini', str(e), user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
         error_yielded = True
         return
 
@@ -7130,8 +8406,9 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
             try:
                 citations_data = orjson.dumps(citations).decode() if citations else None
                 user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
+                                                                            input_token_fallback=input_token_fallback,
                                                                             prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                            llm_id=llm_id, citations_json=citations_data, byok=byok)
+                                                                            llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
                 if user_message_id and bot_message_id:
                     yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
             except Exception as e:
@@ -7481,8 +8758,13 @@ def get_directions(origin: str, destination: str, api_key: str, mode: str = "tra
 
 
 async def handle_function_call(function_name, function_arguments, messages, model, temperature, max_tokens, content, conversation_id, current_user, request, input_tokens, output_tokens, total_tokens, message_id, user_id, client, prompt, user_message=None,
+                               input_token_fallback=None,
+                               user_api_key=None,
+                               api_model=None,
+                               pdf_error_metadata=None,
                                prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                               llm_id=None, byok: bool = False, thinking_budget_tokens=None):
+                               llm_id=None, byok: bool = False, thinking_budget_tokens=None,
+                               pending_attachment_refs: Optional[list[str]] = None):
     save_to_db = True
     final_content = ""
     # Initialize with pre-tool content from Claude (if any)
@@ -7552,13 +8834,21 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 "current_user": current_user,
                 "request": request,
                 "user_message": user_message,
+                "input_token_fallback": input_token_fallback,
+                "pdf_error_metadata": pdf_error_metadata,
                 "prompt_id": prompt_id,
                 "watchdog_config": watchdog_config,
                 "watchdog_hint_active": watchdog_hint_active,
                 "watchdog_hint_eval_id": watchdog_hint_eval_id,
                 "llm_id": llm_id,
                 "byok": byok,
+                "pending_attachment_refs": pending_attachment_refs,
             }
+
+            if user_api_key:
+                second_kwargs["user_api_key"] = user_api_key
+            if api_model:
+                second_kwargs["api_model"] = api_model
 
             if client == "Claude" and thinking_budget_tokens:
                 second_kwargs["thinking_budget_tokens"] = thinking_budget_tokens
@@ -7852,8 +9142,9 @@ async def handle_function_call(function_name, function_arguments, messages, mode
             logger.warning(f"Empty content after function call '{function_name}' for conversation {conversation_id}. Not saving to DB.")
             return
         user_message_id, bot_message_id = await save_content_to_db(content_to_save, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
+                                                                    input_token_fallback=input_token_fallback,
                                                                     prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                    llm_id=llm_id, byok=byok)
+                                                                    llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
         if user_message_id and bot_message_id:
             yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -7862,12 +9153,28 @@ async def handle_function_call(function_name, function_arguments, messages, mode
     
 
 async def save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=None,
+                             input_token_fallback=None,
                              prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
-                             llm_id=None, citations_json=None, byok=False, override_api_cost=None):
+                             llm_id=None, citations_json=None, byok=False, override_api_cost=None,
+                             pending_attachment_refs: Optional[list[str]] = None):
     # logger.info(f"Complete AI message:\n {content}")  # Commented to avoid encoding issues with emojis
     logger.info(f"Tokens usados:\ninput_tokens: {input_tokens}\noutput_tokens: {output_tokens}\ntotal_tokens: {total_tokens}")
 
     last_lock_error = None
+    conversation_incognito = False
+    try:
+        from conversation_privacy import is_incognito_conversation
+
+        conversation_incognito = await is_incognito_conversation(
+            int(conversation_id),
+            user_id=int(user_id),
+        )
+    except Exception:
+        logger.warning(
+            "[atagia] Could not resolve conversation privacy for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
 
     for attempt in range(DB_MAX_RETRIES):
         retry_needed = False
@@ -7880,6 +9187,29 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     await conn.execute("BEGIN IMMEDIATE")
                     transaction_started = True
                     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+                    reported_input_tokens = int(input_tokens or 0)
+                    fallback_user_input_tokens = estimate_message_tokens(user_message) if user_message else 0
+                    try:
+                        fallback_estimated_input_tokens = int(input_token_fallback or 0)
+                    except (TypeError, ValueError):
+                        fallback_estimated_input_tokens = 0
+                    fallback_input_tokens = max(
+                        fallback_user_input_tokens,
+                        fallback_estimated_input_tokens,
+                    )
+                    # Providers generally report prompt tokens including the user message.
+                    # Use reported tokens when available; only fallback when missing/zero.
+                    billable_input_tokens = (
+                        reported_input_tokens
+                        if reported_input_tokens > 0
+                        else fallback_input_tokens
+                    )
+                    reported_output_tokens = int(output_tokens or 0)
+                    billable_output_tokens = (
+                        reported_output_tokens
+                        if reported_output_tokens > 0
+                        else estimate_message_tokens(content)
+                    )
 
                     user_message_id = None
                     if user_message is not None:
@@ -7894,6 +9224,14 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         )
                         user_row = await cursor.fetchone()
                         user_message_id = user_row[0] if user_row else None
+                        if user_message_id is not None and pending_attachment_refs:
+                            await finalize_message_attachments(
+                                conn,
+                                message_id=user_message_id,
+                                conversation_id=conversation_id,
+                                user_id=user_id,
+                                message_json=user_message,
+                            )
 
                     bot_insert_query = '''
                         INSERT INTO messages
@@ -7903,7 +9241,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     '''
                     cursor = await conn.execute(
                         bot_insert_query,
-                        (conversation_id, user_id, content, 'bot', input_tokens, output_tokens, current_time, llm_id, citations_json)
+                        (conversation_id, user_id, content, 'bot', billable_input_tokens, billable_output_tokens, current_time, llm_id, citations_json)
                     )
                     row = await cursor.fetchone()
                     message_id = row[0] if row else None
@@ -7929,16 +9267,6 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         else:
                             input_token_cost_per_million, output_token_cost_per_million = 0, 0
 
-                    reported_input_tokens = int(input_tokens or 0)
-                    fallback_user_input_tokens = estimate_message_tokens(user_message) if user_message else 0
-                    # Providers generally report prompt tokens including the user message.
-                    # Use reported tokens when available; only fallback when missing/zero.
-                    billable_input_tokens = (
-                        reported_input_tokens
-                        if reported_input_tokens > 0
-                        else fallback_user_input_tokens
-                    )
-
                     # Get prompt_id from conversation (role_id in CONVERSATIONS is the prompt_id)
                     if prompt_id is None:
                         prompt_query = 'SELECT role_id FROM CONVERSATIONS WHERE id = ?'
@@ -7949,7 +9277,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     billing_ok = await consume_token(
                         user_id,
                         billable_input_tokens,
-                        output_tokens,
+                        billable_output_tokens,
                         input_token_cost_per_million,
                         output_token_cost_per_million,
                         conn,
@@ -7960,12 +9288,22 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     )
                     if not billing_ok:
                         await conn.rollback()
+                        await discard_pending_attachments(pending_attachment_refs, "billing_failed")
                         return (None, None)
 
                     # Update conversation last_activity for sort ordering
                     await conn.execute("UPDATE CONVERSATIONS SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))
 
                     await conn.commit()
+
+                    if user_message_id is not None:
+                        await _link_atagia_message_best_effort(
+                            message_id=user_message_id,
+                            atagia_message_id=_current_atagia_user_message_id.get(),
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            role="user",
+                        )
 
                     # --- Hint consumption: post-commit, best-effort, fail-open ---
                     if watchdog_hint_active and watchdog_hint_eval_id is not None:
@@ -7996,11 +9334,23 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                             )
 
                     if message_id is not None:
-                        await _record_atagia_assistant_response(
+                        atagia_recorded = await _record_atagia_assistant_response(
                             user_id=user_id,
                             conversation_id=conversation_id,
                             content=content,
+                            prompt_id=prompt_id,
+                            message_id=message_id,
+                            source_seq=message_id,
+                            incognito=conversation_incognito,
                         )
+                        if atagia_recorded:
+                            await _link_atagia_message_best_effort(
+                                message_id=message_id,
+                                atagia_message_id=_aurvek_atagia_message_id(message_id),
+                                conversation_id=conversation_id,
+                                user_id=user_id,
+                                role="assistant",
+                            )
 
                     return user_message_id, message_id
 
@@ -8023,6 +9373,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         retry_needed = True
                     else:
                         logger.error(f"[save_content_to_db] - Operational error: {exc}")
+                        await discard_pending_attachments(pending_attachment_refs, "db_operational_error")
                         return (None, None)
                 except Exception as e:
                     if transaction_started:
@@ -8031,6 +9382,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         except Exception:
                             pass
                     logger.error(f"[save_content_to_db] - Error during transaction: {e}")
+                    await discard_pending_attachments(pending_attachment_refs, "db_transaction_error")
                     return (None, None)
 
         if retry_needed:
@@ -8044,6 +9396,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
             DB_MAX_RETRIES,
             last_lock_error,
         )
+        await discard_pending_attachments(pending_attachment_refs, "db_lock_retries_exhausted")
     return (None, None)
 
 
@@ -8153,6 +9506,7 @@ async def save_multi_ai_to_db(
     watchdog_hint_active: bool = False,
     watchdog_hint_eval_id: Optional[int] = None,
     byok_models: set = None,
+    incognito: bool = False,
 ) -> tuple:
     """Save Multi-AI response as a single bot message. Bill each model separately.
 
@@ -8213,10 +9567,16 @@ async def save_multi_ai_to_db(
                             if reported_input_tokens > 0
                             else user_input_tokens
                         )
+                        reported_output_tokens = int(r.get("output_tokens") or 0)
+                        billable_output = (
+                            reported_output_tokens
+                            if reported_output_tokens > 0
+                            else estimate_message_tokens(r.get("content", ""))
+                        )
                         bill_result = await consume_token(
                             user_id,
                             billable_input,
-                            r["output_tokens"],
+                            billable_output,
                             input_cost,
                             output_cost,
                             conn,
@@ -8233,6 +9593,15 @@ async def save_multi_ai_to_db(
                     await conn.execute("UPDATE CONVERSATIONS SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))
 
                     await conn.commit()
+
+                    if user_msg_id is not None:
+                        await _link_atagia_message_best_effort(
+                            message_id=user_msg_id,
+                            atagia_message_id=_current_atagia_user_message_id.get(),
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            role="user",
+                        )
 
                     # Keep watchdog state transitions aligned with single-model save flow.
                     if watchdog_hint_active and watchdog_hint_eval_id is not None:
@@ -8266,11 +9635,23 @@ async def save_multi_ai_to_db(
                             )
 
                     if bot_msg_id is not None:
-                        await _record_atagia_assistant_response(
+                        atagia_recorded = await _record_atagia_assistant_response(
                             user_id=user_id,
                             conversation_id=conversation_id,
                             content=combined_json,
+                            prompt_id=prompt_id,
+                            message_id=bot_msg_id,
+                            source_seq=bot_msg_id,
+                            incognito=incognito,
                         )
+                        if atagia_recorded:
+                            await _link_atagia_message_best_effort(
+                                message_id=bot_msg_id,
+                                atagia_message_id=_aurvek_atagia_message_id(bot_msg_id),
+                                conversation_id=conversation_id,
+                                user_id=user_id,
+                                role="assistant",
+                            )
 
                     return (user_msg_id, bot_msg_id)
 
@@ -8328,6 +9709,8 @@ async def _run_single_ai(
     user_api_key: str = None,
     prompt_id: int = None,
     temperature: float = 0.7,
+    input_token_fallback: int = 0,
+    pdf_error_metadata: dict | None = None,
 ):
     """Run a single AI model and put results into the shared queue.
 
@@ -8336,30 +9719,49 @@ async def _run_single_ai(
     """
     machine = llm_info["machine"]
     model = llm_info["model"]
+    provider_machine = machine
+    api_model = None
+    pdf_redirect_active = False
     input_tokens_collected = 0
     output_tokens_collected = 0
+    content_collected = ""
 
     try:
+        if machine in ("GPT", "xAI") and _messages_have_saved_pdfs(context_messages):
+            pdf_redirect_active = True
+            provider_machine = "OpenRouter"
+            api_model = OPENROUTER_MODEL_MAP.get(
+                model,
+                f"openai/{model}" if machine == "GPT" else f"x-ai/{model}"
+            )
+            logger.info(
+                "Multi-AI PDF redirect: %s/%s -> OpenRouter/%s",
+                machine,
+                model,
+                api_model,
+            )
+
         # Format messages for the provider
         api_messages = await _format_messages_for_provider(
-            context_messages, user_message, system_prompt, machine, current_user
+            context_messages, user_message, system_prompt, provider_machine, current_user,
+            conversation_id=conversation_id,
         )
 
         # Select the appropriate call function based on machine
-        if machine == "Gemini":
+        if provider_machine == "Gemini":
             api_func = call_gemini_api
-        elif machine == "O1":
+        elif provider_machine == "O1":
             api_func = call_o1_api
-        elif machine == "GPT":
+        elif provider_machine == "GPT":
             api_func = call_gpt_responses_api
-        elif machine == "Claude":
+        elif provider_machine == "Claude":
             api_func = call_claude_api
-        elif machine == "xAI":
+        elif provider_machine == "xAI":
             api_func = call_xai_responses_api
-        elif machine == "OpenRouter":
+        elif provider_machine == "OpenRouter":
             api_func = call_openrouter_api
         else:
-            raise ValueError(f"Unknown machine type: {machine}")
+            raise ValueError(f"Unknown machine type: {provider_machine}")
 
         # Build kwargs with save_to_db=False, tools disabled
         kwargs = {
@@ -8372,17 +9774,22 @@ async def _run_single_ai(
             "current_user": current_user,
             "request": request,
             "user_message": None,  # Don't save user message per-worker
+            "input_token_fallback": input_token_fallback,
+            "pdf_error_metadata": pdf_error_metadata,
             "save_to_db": False,
             "llm_id": llm_id,
             "prompt_id": prompt_id,
         }
 
         # O1 doesn't accept tools parameter - only add for functions that support it
-        if machine != "O1":
+        if provider_machine != "O1":
             kwargs["tools"] = None  # Tools disabled for Multi-AI
 
-        if machine == "Claude" and thinking_budget_tokens:
+        if provider_machine == "Claude" and thinking_budget_tokens:
             kwargs["thinking_budget_tokens"] = thinking_budget_tokens
+
+        if api_model:
+            kwargs["api_model"] = api_model
 
         if user_api_key:
             kwargs["user_api_key"] = user_api_key
@@ -8412,6 +9819,7 @@ async def _run_single_ai(
                             output_tokens_collected = chunk_data.get("output_tokens", 0)
                         elif "content" in chunk_data:
                             content_text = chunk_data["content"]
+                            content_collected += content_text
                             await queue.put({
                                 "type": "chunk",
                                 "llm_id": llm_id,
@@ -8419,12 +9827,30 @@ async def _run_single_ai(
                                 "content": content_text,
                             })
                         elif "error" in chunk_data:
-                            await queue.put({
+                            error_item = {
                                 "type": "error",
                                 "llm_id": llm_id,
                                 "model": model,
                                 "error": str(chunk_data["error"])[:200],
-                            })
+                            }
+                            for key in (
+                                "error_code",
+                                "pdf_too_large",
+                                "provider",
+                                "provider_message",
+                                "filename",
+                                "pages",
+                                "pdf_count",
+                                "current_pdf_count",
+                                "context_pdf_count",
+                                "range_retry_available",
+                                "retry_filename",
+                                "retry_pages",
+                                "retry_token",
+                            ):
+                                if key in chunk_data:
+                                    error_item[key] = chunk_data[key]
+                            await queue.put(error_item)
                             return
                     except orjson.JSONDecodeError:
                         pass
@@ -8434,8 +9860,8 @@ async def _run_single_ai(
             "type": "done",
             "llm_id": llm_id,
             "model": model,
-            "input_tokens": input_tokens_collected,
-            "output_tokens": output_tokens_collected,
+            "input_tokens": input_tokens_collected or int(input_token_fallback or 0),
+            "output_tokens": output_tokens_collected or estimate_message_tokens(content_collected),
         })
 
     except Exception as exc:
@@ -8469,6 +9895,7 @@ async def process_multi_ai_message(
     global stop_signals
 
     # --- 1. Validation ---
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn_ro:
         cursor = await conn_ro.execute(
             """SELECT c.locked, c.llm_id, c.user_id, c.chat_name,
@@ -8483,7 +9910,8 @@ async def process_multi_ai_message(
                       COALESCE(p.forced_llm_id, 0) AS forced_llm_id,
                       p.allowed_llms,
                       COALESCE(p.force_web_search, 0) AS force_web_search,
-                      COALESCE(p.gransabio_enabled, 0) AS gransabio_enabled
+                      COALESCE(p.gransabio_enabled, 0) AS gransabio_enabled,
+                      COALESCE(c.is_incognito, 0) AS is_incognito
                FROM CONVERSATIONS c
                LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
                LEFT JOIN PROMPTS p ON p.id = COALESCE(c.role_id, ud.current_prompt_id)
@@ -8509,7 +9937,9 @@ async def process_multi_ai_message(
         allowed_llms_raw,
         force_web_search,
         gransabio_enabled,
+        conversation_incognito,
     ) = conv_row
+    conversation_incognito = bool(conversation_incognito)
 
     # Verify user owns conversation
     if current_user.id != conv_user_id:
@@ -8791,12 +10221,36 @@ async def process_multi_ai_message(
             yield f"data: {orjson.dumps({'error': 'Moderation check failed'}).decode()}\n\n"
             return
 
-    system_prompt = await _augment_prompt_with_atagia_context(
+    atagia_decision = await _resolve_atagia_context(
         system_prompt,
         user_id=current_user.id,
         conversation_id=conversation_id,
         message=user_message,
+        prompt_id=prompt_id,
+        incognito=conversation_incognito,
     )
+    system_prompt = atagia_decision.full_prompt
+    context_messages_dicts = _context_messages_for_provider(
+        context_messages_dicts,
+        atagia_decision,
+    )
+    context_pdf_error_metadata = _extract_pdf_metadata_from_context_messages(context_messages_dicts)
+    context_pdf_pages = int((context_pdf_error_metadata or {}).get("pages") or 0)
+    context_pdf_count = int((context_pdf_error_metadata or {}).get("pdf_count") or 0)
+    if context_pdf_error_metadata:
+        context_pdf_error_metadata["current_pdf_count"] = 0
+        context_pdf_error_metadata["context_pdf_count"] = context_pdf_count
+        context_pdf_error_metadata["range_retry_available"] = False
+    if context_pdf_pages > MAX_PDF_PAGES:
+        payload = _pdf_upload_too_large_payload(
+            f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({context_pdf_pages} pages in conversation context)',
+            current_pdf_count=0,
+            current_pages=0,
+            context_pdf_count=context_pdf_count,
+            context_pages=context_pdf_pages,
+        )
+        yield f"data: {orjson.dumps(payload).decode()}\n\n"
+        return
 
     # --- 4. Chat name generation (once) ---
     updated_chat_name = None
@@ -8830,9 +10284,23 @@ async def process_multi_ai_message(
     excluded_models = []
     for mid in model_ids:
         info = llm_infos[mid]
-        resolved_key, use_system = resolve_api_key_for_provider(
-            user_api_keys or {}, api_key_mode, info["machine"]
+        provider_for_key = (
+            "OpenRouter"
+            if context_pdf_pages > 0 and info["machine"] in ("GPT", "xAI")
+            else info["machine"]
         )
+        resolved_key, use_system = resolve_api_key_for_provider(
+            user_api_keys or {}, api_key_mode, provider_for_key
+        )
+        if (
+            provider_for_key == "OpenRouter"
+            and not resolved_key
+            and use_system
+            and not openrouter_key
+        ):
+            excluded_models.append(mid)
+            yield f"data: {orjson.dumps({'multi_ai_error': True, 'llm_id': mid, 'model': info['model'], 'error': 'PDF files with this model require OpenRouter integration.'}).decode()}\n\n"
+            continue
         if resolved_key:
             resolved_keys[mid] = resolved_key
         elif use_system:
@@ -8840,7 +10308,7 @@ async def process_multi_ai_message(
         else:
             # own_only mode without key for this provider
             excluded_models.append(mid)
-            yield f"data: {orjson.dumps({'multi_ai_error': True, 'llm_id': mid, 'model': info['model'], 'error': 'API key required for this provider'}).decode()}\n\n"
+            yield f"data: {orjson.dumps({'multi_ai_error': True, 'llm_id': mid, 'model': info['model'], 'error': f'API key required for {provider_for_key}'}).decode()}\n\n"
 
     # Remove excluded models
     model_ids = [mid for mid in model_ids if mid not in excluded_models]
@@ -8867,7 +10335,14 @@ async def process_multi_ai_message(
 
     # Estimate max_tokens based on the SUM of costs across all selected models.
     # This is conservative and prevents partial billing failures at commit time.
-    input_tokens_est = estimate_message_tokens(user_message)
+    input_tokens_est_base = estimate_message_tokens(user_message)
+    input_tokens_est_by_model = {
+        mid: input_tokens_est_base + _estimate_pdf_input_tokens_for_preflight(
+            context_pdf_pages,
+            llm_infos[mid].get("machine"),
+        )
+        for mid in model_ids
+    }
 
     async with get_db_connection(readonly=True) as conn_ro:
         placeholders = ",".join("?" for _ in model_ids)
@@ -8945,7 +10420,11 @@ async def process_multi_ai_message(
         yield f"data: {orjson.dumps({'error': 'Invalid model cost configuration'}).decode()}\n\n"
         return
     else:
-        estimated_input_cost = input_tokens_est * sum_input_cost_per_token
+        estimated_input_cost = sum(
+            input_tokens_est_by_model[mid] * (costs_by_id[mid][0] / 1_000_000)
+            for mid in model_ids
+            if mid not in byok_models
+        )
         if estimated_input_cost >= current_balance:
             yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
             return
@@ -9004,6 +10483,8 @@ async def process_multi_ai_message(
                 user_api_key=resolved_keys.get(mid),
                 prompt_id=prompt_id,
                 temperature=0.7,
+                input_token_fallback=input_tokens_est_by_model.get(mid, input_tokens_est_base),
+                pdf_error_metadata=context_pdf_error_metadata,
             )
         )
         tasks[mid] = task
@@ -9035,6 +10516,33 @@ async def process_multi_ai_message(
                 yield f"data: {orjson.dumps({'multi_ai_done': True, 'llm_id': item_llm_id, 'model': item['model']}).decode()}\n\n"
 
             elif item["type"] == "error":
+                if item.get("error_code") == "pdf_too_large" or item.get("pdf_too_large") is True:
+                    stop_signals[conversation_id] = True
+                    for task in tasks.values():
+                        if not task.done():
+                            task.cancel()
+                    pdf_payload = {
+                        key: item[key]
+                        for key in (
+                            "error",
+                            "error_code",
+                            "pdf_too_large",
+                            "provider",
+                            "provider_message",
+                            "filename",
+                            "pages",
+                            "pdf_count",
+                            "current_pdf_count",
+                            "context_pdf_count",
+                            "range_retry_available",
+                            "retry_filename",
+                            "retry_pages",
+                            "retry_token",
+                        )
+                        if key in item
+                    }
+                    yield f"data: {orjson.dumps(pdf_payload).decode()}\n\n"
+                    return
                 results[item_llm_id]["content"] = item.get("error", "Unknown error")
                 results[item_llm_id]["error"] = True
                 done_count += 1
@@ -9066,6 +10574,7 @@ async def process_multi_ai_message(
             watchdog_hint_active=watchdog_hint_active,
             watchdog_hint_eval_id=watchdog_hint_eval_id,
             byok_models=byok_models,
+            incognito=conversation_incognito,
         )
 
         yield f"data: {orjson.dumps({'message_ids': {'user': user_msg_id, 'bot': bot_msg_id}}).decode()}\n\n"

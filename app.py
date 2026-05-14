@@ -67,7 +67,7 @@ from fastapi import UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from fastapi.templating import Jinja2Templates
-from typing import Union, Optional, List, Dict, Tuple
+from typing import Any, Union, Optional, List, Dict, Tuple
 from starlette.background import BackgroundTask
 from starlette.status import HTTP_401_UNAUTHORIZED
 from fastapi.middleware.cors import CORSMiddleware
@@ -123,6 +123,25 @@ from common import compute_static_hashes
 import nh3
 from elevenlabs_service import service as elevenlabs_service
 from message_search import build_fts_query, execute_search
+from conversation_privacy import (
+    delete_conversation_rows,
+    ensure_conversation_privacy_schema,
+    get_conversation_privacy,
+    mark_conversation_incognito,
+    purge_conversation_local_records,
+)
+from file_storage import (
+    THUMB_VARIANT,
+    attachment_content_url,
+    attachment_download_url,
+    clone_attachments_for_branch,
+    delete_attachment_and_rewrite_message,
+    discard_stale_pending_attachments,
+    ensure_file_storage_schema,
+    get_attachment_path_for_user,
+    prune_unreferenced_blobs,
+    resolve_attachment_for_user,
+)
 from elevenlabs_sdk_proxy import ElevenLabsSDKProxy
 from welcome_service import build_world, user_has_pack_access, user_has_prompt_access, serve_welcome_world
 from tools.tts import process_plain_text, insert_tts_break, process_text_for_tts, get_voice_code_from_prompt, get_voice_code_from_conversation, get_tts_generator, send_cached_audio, get_file_path, handle_tts_request
@@ -231,6 +250,9 @@ async def lifespan(app: FastAPI):
     # Set WAL journal mode once (persistent across connections)
     from database import ensure_wal_mode
     await ensure_wal_mode()
+    await ensure_file_storage_schema()
+    await discard_stale_pending_attachments()
+    await ensure_conversation_privacy_schema()
 
     # Keep additive schema migrations available for existing installs. The
     # standalone runner still handles deployment migrations; this guard keeps
@@ -347,6 +369,12 @@ async def lifespan(app: FastAPI):
     try:
         from gransabio_service import shutdown_http_client
         await shutdown_http_client()
+    except Exception:
+        pass
+
+    try:
+        from atagia_bridge import close_atagia_bridge
+        await close_atagia_bridge()
     except Exception:
         pass
 
@@ -1377,6 +1405,54 @@ async def settings_page(request: Request, current_user: User = Depends(get_curre
         "user_balance": user_balance
     })
     return templates.TemplateResponse("settings.html", context)
+
+
+class MemoryPreferencesUpdateRequest(BaseModel):
+    remember_across_chats: Optional[bool] = None
+    remember_across_devices: Optional[bool] = None
+    memory_privacy_mode: Optional[str] = None
+
+
+VALID_MEMORY_PRIVACY_MODES = {"balanced", "trusted_private"}
+
+
+@app.get("/api/user/memory-preferences")
+async def get_user_memory_preferences(current_user: User = Depends(get_current_user)):
+    """Get the current user's Atagia memory sharing preferences."""
+    if current_user is None:
+        return unauthenticated_response()
+
+    from atagia_bridge import get_atagia_bridge
+
+    preferences = await get_atagia_bridge().get_memory_preferences(current_user.id)
+    return JSONResponse(content=preferences)
+
+
+@app.put("/api/user/memory-preferences")
+async def update_user_memory_preferences(
+    payload: MemoryPreferencesUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Update the current user's Atagia memory sharing preferences."""
+    if current_user is None:
+        return unauthenticated_response()
+
+    from atagia_bridge import get_atagia_bridge
+
+    if (
+        payload.memory_privacy_mode is not None
+        and payload.memory_privacy_mode not in VALID_MEMORY_PRIVACY_MODES
+    ):
+        raise HTTPException(status_code=400, detail="Invalid memory privacy mode.")
+
+    preferences = await get_atagia_bridge().set_memory_preferences(
+        current_user.id,
+        remember_across_chats=payload.remember_across_chats,
+        remember_across_devices=payload.remember_across_devices,
+        memory_privacy_mode=payload.memory_privacy_mode,
+    )
+    status_code = 200 if preferences.get("available", False) else 503
+    return JSONResponse(content=preferences, status_code=status_code)
 
 
 # ============================================================================
@@ -6025,6 +6101,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
     if not (await current_user.is_admin or await current_user.is_user):
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
     
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
 
@@ -6052,7 +6129,9 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
                 FROM MAGIC_LINKS
                 WHERE id IN (SELECT MAX(id) FROM MAGIC_LINKS GROUP BY user_id)
             ) m ON u.id = m.user_id
-            LEFT JOIN CONVERSATIONS c ON u.id = c.user_id
+            LEFT JOIN CONVERSATIONS c
+              ON u.id = c.user_id
+             AND COALESCE(c.hidden_from_history, 0) = 0
             LEFT JOIN PROMPTS p ON ud.current_prompt_id = p.id
             LEFT JOIN LLM ll ON ud.llm_id = ll.id
             JOIN USER_ROLES ur ON u.role_id = ur.id
@@ -6082,7 +6161,9 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
                 FROM MAGIC_LINKS
                 WHERE id IN (SELECT MAX(id) FROM MAGIC_LINKS GROUP BY user_id)
             ) m ON u.id = m.user_id
-            LEFT JOIN CONVERSATIONS c ON u.id = c.user_id
+            LEFT JOIN CONVERSATIONS c
+              ON u.id = c.user_id
+             AND COALESCE(c.hidden_from_history, 0) = 0
             LEFT JOIN PROMPTS p ON ud.current_prompt_id = p.id
             LEFT JOIN LLM ll ON ud.llm_id = ll.id
             JOIN USER_ROLES ur ON u.role_id = ur.id
@@ -6965,6 +7046,9 @@ async def handle_recent_conversation(current_user: User, recent_conversation):
 async def handle_get_request(request, user_id, current_user, conn, admin_view=False):
     effective_user_id = user_id if user_id is not None else current_user.id
 
+    await ensure_conversation_privacy_schema()
+    if not admin_view and effective_user_id == current_user.id:
+        await _purge_stale_incognito_conversations_for_user(current_user)
     async with conn.cursor() as cursor:
         await cursor.execute('''
             SELECT
@@ -6979,24 +7063,28 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 ud.allow_image_generation,
                 COALESCE(c.llm_id, ud.llm_id) AS current_model_type,
                 COALESCE(ud.web_search_enabled, 1) AS web_search_enabled,
-                (SELECT COUNT(*) FROM conversations WHERE user_id = u.id) AS conversation_count,
+                (SELECT COUNT(*)
+                 FROM conversations
+                 WHERE user_id = u.id
+                   AND COALESCE(hidden_from_history, 0) = 0) AS conversation_count,
                 c.id AS conversation_id,
                 c.start_date AS start_date,
                 c.role_id,
                 COALESCE(p.image, p2.image) AS bot_picture,
                 COALESCE(p.description, p2.description) AS prompt_description,
-                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model, 'enabled', enabled))
+                (SELECT json_group_array(json_object('id', id, 'machine', machine, 'model', model, 'enabled', enabled, 'display_name', display_name))
                  FROM LLM
                  WHERE machine != 'GranSabio'
-                   AND (COALESCE(enabled, 1) = 1 OR id = ud.llm_id OR id = c.llm_id)
-                 ORDER BY machine, model) AS llm_models_json,
+                   AND (COALESCE(enabled, 1) = 1 OR id = ud.llm_id OR id = c.llm_id)) AS llm_models_json,
                 (SELECT json_group_array(json_object('id', id, 'name', name)) FROM Voices) AS voices_json,
                 ud.current_alter_ego_id,
                 ae.name AS alter_ego_name,
                 ae.profile_picture AS alter_ego_profile_picture
             FROM users u
             JOIN user_details ud ON u.id = ud.user_id
-            LEFT JOIN conversations c ON c.user_id = u.id
+            LEFT JOIN conversations c
+              ON c.user_id = u.id
+             AND COALESCE(c.hidden_from_history, 0) = 0
             LEFT JOIN (
                 SELECT ep.value
                 FROM user_details ud2
@@ -7006,7 +7094,8 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             LEFT JOIN Prompts p ON c.role_id = p.id
             LEFT JOIN Prompts p2 ON ud.current_prompt_id = p2.id  -- Add join with current prompt
             LEFT JOIN USER_ALTER_EGOS ae ON ud.current_alter_ego_id = ae.id
-            WHERE u.id = ? AND (ep.value IS NULL OR ep.value = '')
+            WHERE u.id = ?
+              AND (ep.value IS NULL OR ep.value = '')
             ORDER BY c.last_activity DESC, c.id DESC
             LIMIT 1
         ''', (effective_user_id, effective_user_id))
@@ -7019,6 +7108,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
         logger.debug(f"Retrieved start_date from database: {full_data['start_date']}")
 
         llm_models = orjson.loads(full_data['llm_models_json']) if full_data['llm_models_json'] else []
+        llm_models.sort(key=lambda m: (m.get('machine', ''), m.get('display_name') or m.get('model', '')))
         available_voices = orjson.loads(full_data['voices_json']) if full_data['voices_json'] else []
 
         # Determine which profile picture and username to use
@@ -7071,7 +7161,9 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             SELECT cf.id, cf.name, cf.color, cf.created_at, cf.updated_at,
                    COUNT(c.id) as conversation_count
             FROM CHAT_FOLDERS cf
-            LEFT JOIN CONVERSATIONS c ON cf.id = c.folder_id
+            LEFT JOIN CONVERSATIONS c
+              ON cf.id = c.folder_id
+             AND COALESCE(c.hidden_from_history, 0) = 0
             WHERE cf.user_id = ?
             GROUP BY cf.id, cf.name, cf.color, cf.created_at, cf.updated_at
             ORDER BY cf.created_at ASC
@@ -7128,6 +7220,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                     JOIN llm l ON c.llm_id = l.id
                     LEFT JOIN prompts p ON c.role_id = p.id
                     WHERE c.id = ? AND (c.folder_id IS NULL OR c.folder_id = 0)
+                      AND COALESCE(c.hidden_from_history, 0) = 0
                 ''', (platform, conv_id))
                 ext_conv = await cursor.fetchone()
                 if ext_conv:
@@ -7148,6 +7241,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             JOIN llm l ON c.llm_id = l.id
             LEFT JOIN prompts p ON c.role_id = p.id
             WHERE c.user_id = ? AND (c.folder_id IS NULL OR c.folder_id = 0){initial_ext_exclude}
+              AND COALESCE(c.hidden_from_history, 0) = 0
             ORDER BY c.last_activity DESC, c.id DESC
             LIMIT ?
         ''', [effective_user_id] + initial_ext_exclude_params + [init_normal_limit])
@@ -7225,6 +7319,7 @@ async def admin_conversations(request: Request, current_user: User = Depends(get
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
     if not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
+    await ensure_conversation_privacy_schema()
 
     # Read filters from query params
     f_search = request.query_params.get("search", "").strip()
@@ -7277,7 +7372,7 @@ async def admin_conversations(request: Request, current_user: User = Depends(get
     sort_column = ALLOWED_SORT_COLUMNS[sort_by]
 
     # Build WHERE clause
-    conditions = []
+    conditions = ["COALESCE(c.hidden_from_history, 0) = 0"]
     params = []
 
     if f_user_exact:
@@ -8287,6 +8382,224 @@ async def bulk_delete_llms(request: Request, current_user: User = Depends(get_cu
 
 
 # ---------------------------------------------------------------------------
+# Atagia Admin
+# ---------------------------------------------------------------------------
+
+_ATAGIA_WORKER_CONTROL_ACTIONS = {
+    "pause_new_jobs",
+    "drain_and_pause",
+    "hard_pause",
+    "resume_processing",
+    "active",
+}
+
+
+def _normalize_atagia_admin_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    data = jsonable_encoder(value)
+    if isinstance(data, dict):
+        return data
+    return {"value": data}
+
+
+def _format_atagia_bridge_error(error: Any) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    data = _normalize_atagia_admin_payload(error)
+    if data:
+        return data
+    return {"message": str(error)}
+
+
+@app.get("/admin/atagia")
+async def admin_atagia_get(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return RedirectResponse(url="/")
+    from atagia_config import get_atagia_config, template_config
+
+    context = await get_template_context(request, current_user)
+    context["config"] = template_config(await get_atagia_config())
+    return templates.TemplateResponse("admin_atagia.html", context)
+
+
+@app.post("/admin/atagia")
+async def admin_atagia_post(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_bridge import reset_atagia_bridge
+    from atagia_config import save_atagia_admin_config
+
+    data = await request.json()
+    try:
+        await save_atagia_admin_config(data)
+    except ValueError as exc:
+        return JSONResponse(content={"success": False, "message": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.error("Failed to save Atagia configuration: %s", exc, exc_info=True)
+        return JSONResponse(
+            content={"success": False, "message": "Failed to save Atagia configuration."},
+            status_code=500,
+        )
+
+    await reset_atagia_bridge()
+    return JSONResponse(content={"success": True, "message": "Atagia configuration saved."})
+
+
+@app.post("/admin/atagia/test-connection")
+async def admin_atagia_test(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_bridge import AtagiaBridge
+    from atagia_config import preview_bridge_config_from_admin_payload
+
+    data = await request.json()
+    try:
+        config = await preview_bridge_config_from_admin_payload(data)
+    except ValueError as exc:
+        return JSONResponse(content={"success": False, "message": str(exc)}, status_code=400)
+
+    bridge = AtagiaBridge(config)
+    try:
+        ok, message = await bridge.test_connection()
+    finally:
+        await bridge.close()
+
+    status_code = 200 if ok else 502
+    return JSONResponse(
+        content={"success": ok, "message": message},
+        status_code=status_code,
+    )
+
+
+@app.post("/admin/atagia/sync")
+async def admin_atagia_sync(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_sync import DEFAULT_BATCH_SIZE, start_atagia_history_sync
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    try:
+        batch_size = int(data.get("batch_size") or DEFAULT_BATCH_SIZE)
+    except (TypeError, ValueError):
+        batch_size = DEFAULT_BATCH_SIZE
+
+    result = await start_atagia_history_sync(batch_size=max(1, min(batch_size, 1000)))
+    status_code = 202 if result.get("started") else 409
+    return JSONResponse(content={"success": bool(result.get("started")), **result}, status_code=status_code)
+
+
+@app.get("/admin/atagia/sync-status")
+async def admin_atagia_sync_status(current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_sync import get_atagia_sync_status
+
+    return JSONResponse(content={"success": True, "status": await get_atagia_sync_status()})
+
+
+@app.get("/admin/atagia/diagnostics")
+async def admin_atagia_diagnostics(current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_admin_status import get_atagia_admin_status
+
+    return JSONResponse(content={"success": True, "status": await get_atagia_admin_status()})
+
+
+@app.get("/admin/atagia/worker-control")
+async def admin_atagia_worker_control_get(current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_bridge import get_atagia_bridge
+
+    bridge = get_atagia_bridge()
+    state = await bridge.get_worker_control()
+    error = _format_atagia_bridge_error(bridge.last_error)
+    return JSONResponse(
+        content={
+            "success": True,
+            "available": state is not None,
+            "state": _normalize_atagia_admin_payload(state),
+            "error": error,
+        }
+    )
+
+
+@app.post("/admin/atagia/worker-control")
+async def admin_atagia_worker_control_post(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_bridge import get_atagia_bridge
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    action = str(data.get("action") or data.get("mode") or "").strip().lower()
+    if action not in _ATAGIA_WORKER_CONTROL_ACTIONS:
+        return JSONResponse(
+            content={"success": False, "message": "Invalid Atagia processing action."},
+            status_code=400,
+        )
+
+    reason = str(data.get("reason") or "").strip() or None
+    timeout_seconds = data.get("timeout_seconds")
+    try:
+        timeout_seconds = float(timeout_seconds) if timeout_seconds not in (None, "") else None
+    except (TypeError, ValueError):
+        return JSONResponse(
+            content={"success": False, "message": "Invalid timeout_seconds value."},
+            status_code=400,
+        )
+    if timeout_seconds is not None and (timeout_seconds <= 0 or timeout_seconds > 300):
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": "timeout_seconds must be greater than 0 and at most 300.",
+            },
+            status_code=400,
+        )
+
+    bridge = get_atagia_bridge()
+    if action == "pause_new_jobs":
+        state = await bridge.pause_new_jobs(reason=reason)
+    elif action == "drain_and_pause":
+        state = await bridge.drain_and_pause(
+            reason=reason,
+            timeout_seconds=timeout_seconds,
+        )
+    elif action == "hard_pause":
+        state = await bridge.hard_pause(reason=reason)
+    else:
+        state = await bridge.resume_processing(reason=reason)
+
+    if state is None:
+        error = _format_atagia_bridge_error(bridge.last_error)
+        message = "Atagia processing control is unavailable."
+        if error and error.get("message"):
+            message = f"{message} {error['message']}"
+        return JSONResponse(
+            content={"success": False, "message": message, "error": error},
+            status_code=502,
+        )
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "message": "Atagia processing control updated.",
+            "state": _normalize_atagia_admin_payload(state),
+        }
+    )
+
+
 # GranSabio Admin
 # ---------------------------------------------------------------------------
 
@@ -9976,6 +10289,7 @@ async def get_conversations(
     if current_user.id != user_id and not await is_admin(current_user.id):
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         async with conn.cursor() as cursor:
             # Filter by folder first
@@ -10032,6 +10346,7 @@ async def get_conversations(
                             JOIN llm l ON c.llm_id = l.id
                             LEFT JOIN prompts p ON c.role_id = p.id
                             WHERE c.id = ?{folder_condition}
+                              AND COALESCE(c.hidden_from_history, 0) = 0
                         '''
                         ext_params = [platform, conv_id] + folder_params
                         await cursor.execute(ext_query, ext_params)
@@ -10055,6 +10370,7 @@ async def get_conversations(
                 JOIN llm l ON c.llm_id = l.id
                 LEFT JOIN prompts p ON c.role_id = p.id
                 WHERE c.user_id = ?{folder_condition}{external_exclude}
+                  AND COALESCE(c.hidden_from_history, 0) = 0
             '''
             params = [user_id] + folder_params + external_exclude_params
 
@@ -10110,6 +10426,7 @@ async def get_all_conversations(request: Request, current_user: User = Depends(g
         details="Admin listed all user conversations"
     )
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         query = '''
             SELECT c.id, u.username, c.start_date, u.id as user_id,
@@ -10118,6 +10435,7 @@ async def get_all_conversations(request: Request, current_user: User = Depends(g
             FROM conversations c
             JOIN users u ON c.user_id = u.id
             LEFT JOIN messages m ON c.id = m.conversation_id
+            WHERE COALESCE(c.hidden_from_history, 0) = 0
             GROUP BY c.id
             ORDER BY c.last_activity DESC
         '''
@@ -10299,6 +10617,8 @@ async def process_message(
     request: Request,
     current_user: User = Depends(get_current_user),
     media_owner_username: Optional[str] = None,
+    conversation_id: Optional[int] = None,
+    message_id: Optional[int] = None,
 ):
     valid_extensions = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     # CLOUDFLARE_BASE_URL imported from common.py (reads from env var)
@@ -10320,9 +10640,29 @@ async def process_message(
             return message
 
     if isinstance(message_json, list):
+        can_admin_view = await is_admin(current_user.id)
         for entry in message_json:
             if entry.get('type') == 'image_url':
-                url = entry.get('image_url', {}).get('url', '')
+                image_info = entry.get('image_url', {})
+                attachment_ref = image_info.get('attachment_ref')
+                if attachment_ref:
+                    async with get_db_connection(readonly=True) as conn:
+                        attachment = await resolve_attachment_for_user(
+                            conn,
+                            public_id=attachment_ref,
+                            user_id=current_user.id,
+                            conversation_id=conversation_id,
+                            message_id=message_id,
+                            require_kind="image",
+                            allow_admin=can_admin_view,
+                        )
+                    if attachment:
+                        image_info['url'] = attachment_content_url(attachment_ref, variant=THUMB_VARIANT)
+                        image_info['fullsize_url'] = attachment_content_url(attachment_ref)
+                        image_info['filename'] = image_info.get('filename') or attachment.get('original_filename')
+                    continue
+
+                url = image_info.get('url', '')
 
                 extension = url.rsplit('.', 1)[-1].lower()
                 if extension not in valid_extensions:
@@ -10369,6 +10709,44 @@ async def process_message(
                         full_url = urljoin(CLOUDFLARE_BASE_URL, f"{video_path}?token={token}")
                         entry['video_url']['url'] = full_url
 
+            elif entry.get('type') == 'document_url':
+                doc_info = entry.get('document_url', {})
+                attachment_ref = doc_info.get('attachment_ref')
+                if attachment_ref:
+                    async with get_db_connection(readonly=True) as conn:
+                        attachment = await resolve_attachment_for_user(
+                            conn,
+                            public_id=attachment_ref,
+                            user_id=current_user.id,
+                            conversation_id=conversation_id,
+                            message_id=message_id,
+                            require_kind="pdf",
+                            allow_admin=can_admin_view,
+                        )
+                    if attachment:
+                        doc_info['url'] = attachment_download_url(attachment_ref)
+                        doc_info['filename'] = doc_info.get('filename') or attachment.get('original_filename')
+                        doc_info['pages'] = doc_info.get('pages') or attachment.get('page_count') or 0
+
+            elif entry.get('type') == 'text_file':
+                text_info = entry.get('text_file', {})
+                attachment_ref = text_info.get('attachment_ref')
+                if attachment_ref:
+                    async with get_db_connection(readonly=True) as conn:
+                        attachment = await resolve_attachment_for_user(
+                            conn,
+                            public_id=attachment_ref,
+                            user_id=current_user.id,
+                            conversation_id=conversation_id,
+                            message_id=message_id,
+                            require_kind="text",
+                            allow_admin=can_admin_view,
+                        )
+                    if attachment:
+                        text_info['url'] = attachment_download_url(attachment_ref)
+                        text_info['filename'] = text_info.get('filename') or attachment.get('original_filename')
+                        text_info['lines'] = text_info.get('lines') or attachment.get('text_line_count') or 0
+
         return orjson.dumps(message_json).decode('utf-8')
 
     return message
@@ -10386,6 +10764,7 @@ async def get_messages(
         return unauthenticated_response()
 
     logger.debug(f"Requested messages for conversation ID: {conversation_id}")
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
 
         cursor = await conn.cursor()
@@ -10420,7 +10799,10 @@ async def get_messages(
                    p.name AS prompt_name, p.image AS bot_picture, p.description AS prompt_description,
                    p.extensions_enabled, p.extensions_free_selection,
                    l.machine, l.model,
-                   COALESCE(p.is_paid, 0) AS is_paid
+                   COALESCE(p.is_paid, 0) AS is_paid,
+                   COALESCE(c.is_incognito, 0) AS is_incognito,
+                   COALESCE(c.hidden_from_history, 0) AS hidden_from_history,
+                   COALESCE(c.purge_on_close, 0) AS purge_on_close
             FROM CONVERSATIONS c
             LEFT JOIN PROMPTS p ON c.role_id = p.id
             LEFT JOIN LLM l ON c.llm_id = l.id
@@ -10545,6 +10927,9 @@ async def get_messages(
         "bot_profile_picture": bot_profile_picture,
         "prompt_description": conv_row['prompt_description'],
         "is_paid": bool(conv_row['is_paid']),
+        "is_incognito": bool(conv_row['is_incognito']),
+        "hidden_from_history": bool(conv_row['hidden_from_history']),
+        "purge_on_close": bool(conv_row['purge_on_close']),
         **extensions_data
     }
 
@@ -10582,6 +10967,8 @@ async def get_messages(
                 request,
                 current_user,
                 media_owner_username=row['username'],
+                conversation_id=conversation_id,
+                message_id=row['message_id'],
             )
             msg_data = {
                 "id": row['message_id'],
@@ -10894,6 +11281,7 @@ async def update_external_platform(
 
         await mutate_external_platforms(current_user.id, _web_remove)
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
         await cursor.execute('''
@@ -11065,6 +11453,7 @@ class BranchConversationRequest(BaseModel):
 class NewConversationRequest(BaseModel):
     prompt_id: Optional[int] = None
     folder_id: Optional[int] = None
+    incognito: bool = False
 @app.post("/api/conversations/new")
 async def start_new_conversation(
     request: NewConversationRequest = NewConversationRequest(),
@@ -11073,13 +11462,14 @@ async def start_new_conversation(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    logger.info(f"[NEW] CREATING NEW CONVERSATION - User: {current_user.username}, folder_id: {request.folder_id}, prompt_id: {request.prompt_id}")
+    logger.info(f"[NEW] CREATING NEW CONVERSATION - User: {current_user.username}, folder_id: {request.folder_id}, prompt_id: {request.prompt_id}, incognito: {request.incognito}")
     
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
+        await ensure_conversation_privacy_schema(conn)
 
         # Validate folder_id if provided
-        if request.folder_id is not None:
+        if request.folder_id is not None and not request.incognito:
             await cursor.execute(
                 "SELECT id FROM CHAT_FOLDERS WHERE id = ? AND user_id = ?",
                 (request.folder_id, current_user.id)
@@ -11093,7 +11483,7 @@ async def start_new_conversation(
                 cursor,
                 current_user,
                 prompt_id=request.prompt_id,
-                folder_id=request.folder_id,
+                folder_id=None if request.incognito else request.folder_id,
                 strict_prompt_access=True,
             )
         except PermissionError:
@@ -11101,7 +11491,15 @@ async def start_new_conversation(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
-        logger.info(f"[SUCCESS] NEW CONVERSATION CREATED - ID: {conversation_id}, folder_id: {request.folder_id}")
+        if request.incognito:
+            await mark_conversation_incognito(
+                conn,
+                conversation_id=conversation_id,
+                user_id=current_user.id,
+                incognito=True,
+            )
+
+        logger.info(f"[SUCCESS] NEW CONVERSATION CREATED - ID: {conversation_id}, folder_id: {None if request.incognito else request.folder_id}")
 
         await cursor.execute(
             """
@@ -11196,6 +11594,9 @@ async def start_new_conversation(
             'web_search_allowed': not disable_web_search_value,
             'web_search_forced': force_web_search_value,
             'last_activity': conversation_last_activity,
+            'is_incognito': bool(request.incognito),
+            'hidden_from_history': bool(request.incognito),
+            'purge_on_close': bool(request.incognito),
         }
         if extensions_enabled_value:
             response_data['active_extension'] = active_extension_data
@@ -11363,6 +11764,7 @@ async def get_bookmarked_messages(
             JOIN USERS u ON m.user_id = u.id
             LEFT JOIN CONVERSATIONS c ON m.conversation_id = c.id
             WHERE m.user_id = ? AND m.is_bookmarked = 1
+              AND COALESCE(c.hidden_from_history, 0) = 0
             ORDER BY m.conversation_id DESC, m.date ASC
         ''', (current_user.id,))
         messages = await cursor.fetchall()
@@ -11405,6 +11807,7 @@ async def search_messages(
     if not fts_query:
         return JSONResponse(content={"query": q, "has_more": False, "next_offset": 0, "items": []})
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         items = await execute_search(conn, current_user.id, fts_query, limit + 1, offset, conversation_id)
 
@@ -11419,6 +11822,108 @@ async def search_messages(
         "items": items
     })
 
+
+async def _purge_atagia_conversation_best_effort(
+    *,
+    user_id: int,
+    conversation_id: int,
+    prompt_id: int | None = None,
+    incognito: bool = False,
+) -> bool:
+    try:
+        from atagia_bridge import get_atagia_bridge
+
+        return await get_atagia_bridge().purge_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            prompt_id=prompt_id,
+            incognito=incognito,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to purge Atagia conversation data for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
+        return False
+
+
+async def _purge_stale_incognito_conversations_for_user(current_user: User) -> None:
+    try:
+        await ensure_conversation_privacy_schema()
+        async with get_db_connection(readonly=True) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                """
+                SELECT id, role_id
+                FROM CONVERSATIONS
+                WHERE user_id = ?
+                  AND COALESCE(is_incognito, 0) = 1
+                """,
+                (current_user.id,),
+            )
+            rows = await cursor.fetchall()
+    except Exception:
+        logger.warning(
+            "Failed to load stale incognito conversations for user_id=%s",
+            current_user.id,
+            exc_info=True,
+        )
+        return
+
+    for row in rows:
+        conversation_id = int(row["id"])
+        await _purge_atagia_conversation_best_effort(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            prompt_id=row["role_id"],
+            incognito=True,
+        )
+        try:
+            purged = await purge_conversation_local_records(
+                conversation_id=conversation_id,
+                user_id=current_user.id,
+            )
+            if purged:
+                await _delete_conversation_files_for_user(current_user, conversation_id)
+                await prune_unreferenced_blobs()
+        except Exception:
+            logger.warning(
+                "Failed to purge stale incognito conversation_id=%s",
+                conversation_id,
+                exc_info=True,
+            )
+
+
+async def _delete_conversation_files_for_user(
+    current_user: User,
+    conversation_id: int,
+) -> bool:
+    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
+    conversation_id_str = f"{conversation_id:07d}"
+    conversation_folder = os.path.join(
+        users_directory,
+        hash_prefix1,
+        hash_prefix2,
+        user_hash,
+        "files",
+        conversation_id_str[:3],
+        conversation_id_str[3:],
+    )
+    if not os.path.exists(conversation_folder):
+        return True
+    try:
+        shutil.rmtree(conversation_folder)
+        return True
+    except OSError as exc:
+        logger.error(
+            "Error deleting conversation folder %s: %s",
+            conversation_id,
+            str(exc),
+        )
+        return False
+
+
 @app.delete("/api/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: int, current_user: User = Depends(get_current_user)):
     if current_user is None:
@@ -11426,24 +11931,43 @@ async def delete_conversation(conversation_id: int, current_user: User = Depends
     
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
+        await ensure_conversation_privacy_schema(conn)
         
         # Get the user_id of the conversation
-        await cursor.execute('SELECT user_id FROM conversations WHERE id = ?', (conversation_id,))
+        await cursor.execute(
+            """
+            SELECT user_id, role_id, COALESCE(is_incognito, 0) AS is_incognito
+            FROM conversations
+            WHERE id = ?
+            """,
+            (conversation_id,),
+        )
         result = await cursor.fetchone()
         if not result:
             return JSONResponse(content={'error': 'Conversation not found'}, status_code=404)
         
         user_id = result[0]
-        
-        # Delete child records before conversation
-        await cursor.execute('DELETE FROM WATCHDOG_STATE WHERE conversation_id = ?', (conversation_id,))
-        await cursor.execute('DELETE FROM WATCHDOG_EVENTS WHERE conversation_id = ?', (conversation_id,))
-        await cursor.execute('DELETE FROM messages WHERE conversation_id = ?', (conversation_id,))
+        if user_id != current_user.id:
+            return JSONResponse(content={'error': 'Access denied'}, status_code=403)
 
-        # Delete the conversation
-        await cursor.execute('DELETE FROM conversations WHERE id = ? AND user_id = ?', (conversation_id, current_user.id))
+        prompt_id = result[1]
+        is_incognito = bool(result[2])
+        if is_incognito:
+            await _purge_atagia_conversation_best_effort(
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                prompt_id=prompt_id,
+                incognito=True,
+            )
+
+        await delete_conversation_rows(
+            conn,
+            conversation_id=conversation_id,
+            user_id=current_user.id,
+        )
         
         await conn.commit()
+        await prune_unreferenced_blobs()
         
         # Generate user hash
         hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
@@ -11473,6 +11997,55 @@ async def delete_conversation(conversation_id: int, current_user: User = Depends
                 # Here you could decide whether to return an error or simply log it
         
         return JSONResponse(content={'success': True}, status_code=200)
+
+
+@app.post("/api/conversations/{conversation_id}/incognito/close")
+async def close_incognito_conversation(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    """Close an incognito conversation and purge local/Atagia conversation data."""
+    if current_user is None:
+        return unauthenticated_response()
+
+    privacy = await get_conversation_privacy(conversation_id, user_id=current_user.id)
+    if privacy is None:
+        return JSONResponse(content={"success": True, "already_closed": True})
+    if not bool(privacy.get("is_incognito")):
+        return JSONResponse(
+            content={"success": False, "error": "Conversation is not incognito"},
+            status_code=400,
+        )
+
+    async with conversation_write_lock(conversation_id):
+        atagia_purged = await _purge_atagia_conversation_best_effort(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            prompt_id=privacy.get("role_id"),
+            incognito=True,
+        )
+        try:
+            purged = await purge_conversation_local_records(
+                conversation_id=conversation_id,
+                user_id=current_user.id,
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                content={"success": False, "error": str(exc)},
+                status_code=400,
+            )
+
+    if purged:
+        await _delete_conversation_files_for_user(current_user, conversation_id)
+        await prune_unreferenced_blobs()
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "purged": bool(purged),
+            "atagia_purged": bool(atagia_purged),
+        }
+    )
 
 
 @app.post("/api/conversations/{conversation_id}/lock")
@@ -11623,16 +12196,14 @@ async def bulk_lock_conversations(request: Request, current_user: User = Depends
 async def delete_conversation_recursively(conversation_id):
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
+        await ensure_conversation_privacy_schema(conn)
         await cursor.execute("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
         result = await cursor.fetchone()
         if result:
             user_id = result[0]
-            await cursor.execute("DELETE FROM WATCHDOG_STATE WHERE conversation_id = ?", (conversation_id,))
-            await cursor.execute("DELETE FROM WATCHDOG_EVENTS WHERE conversation_id = ?", (conversation_id,))
-            await cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+            await delete_conversation_rows(conn, conversation_id=conversation_id)
             await conn.commit()
-            await cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-            await conn.commit()
+            await prune_unreferenced_blobs()
             return user_id
     return None
     
@@ -12145,6 +12716,7 @@ async def rollback_conversation(
             (conversation_id, message_id)
         )
         await conn.commit()
+        await prune_unreferenced_blobs()
 
         # Get the new last message after the rollback
         cursor = await conn.execute(
@@ -12169,10 +12741,12 @@ async def branch_conversation(
 
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
+        await ensure_conversation_privacy_schema(conn)
 
         # 1. Verify conversation belongs to user, get metadata
         await cursor.execute('''
-            SELECT id, role_id, llm_id, active_extension_id, chat_name
+            SELECT id, role_id, llm_id, active_extension_id, chat_name,
+                   COALESCE(is_incognito, 0) AS is_incognito
             FROM CONVERSATIONS WHERE id = ? AND user_id = ?
         ''', (conversation_id, current_user.id))
         source_conv = await cursor.fetchone()
@@ -12183,6 +12757,8 @@ async def branch_conversation(
         source_llm_id = source_conv['llm_id']
         source_extension_id = source_conv['active_extension_id']
         source_chat_name = source_conv['chat_name']
+        if bool(source_conv['is_incognito']):
+            raise HTTPException(status_code=400, detail="Incognito conversations cannot be branched")
 
         # Validate prompt access (user may have lost access since original conversation)
         if source_role_id and not await can_user_access_prompt(current_user, source_role_id, cursor):
@@ -12226,17 +12802,51 @@ async def branch_conversation(
               source_extension_id, conversation_id, request.message_id, branch_name))
         new_conv_id = (await cursor.fetchone())[0]
 
-        # 8. Copy messages up to and including message_id
-        #    Bookmarks reset to 0, user_id set to current_user.id (defensive)
+        # 8. Copy messages up to and including message_id.
+        #    Bookmarks reset to 0, user_id set to current_user.id (defensive).
+        #    New attachment rows need a new public_id per copied message, so we
+        #    insert row-by-row instead of INSERT...SELECT.
+        await ensure_file_storage_schema(conn)
         await cursor.execute('''
-            INSERT INTO MESSAGES (conversation_id, user_id, message, type, date,
-                                  input_tokens_used, output_tokens_used, is_bookmarked, llm_id, citations_json)
-            SELECT ?, ?, message, type, date,
-                   input_tokens_used, output_tokens_used, 0, llm_id, citations_json
+            SELECT id, message, type, date, input_tokens_used, output_tokens_used,
+                   llm_id, citations_json
             FROM MESSAGES
             WHERE conversation_id = ? AND id <= ?
             ORDER BY id ASC
-        ''', (new_conv_id, current_user.id, conversation_id, request.message_id))
+        ''', (conversation_id, request.message_id))
+        source_messages = await cursor.fetchall()
+
+        for source_message in source_messages:
+            await cursor.execute('''
+                INSERT INTO MESSAGES (conversation_id, user_id, message, type, date,
+                                      input_tokens_used, output_tokens_used, is_bookmarked, llm_id, citations_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                RETURNING id
+            ''', (
+                new_conv_id,
+                current_user.id,
+                source_message['message'],
+                source_message['type'],
+                source_message['date'],
+                source_message['input_tokens_used'],
+                source_message['output_tokens_used'],
+                source_message['llm_id'],
+                source_message['citations_json'],
+            ))
+            new_message_id = (await cursor.fetchone())[0]
+            rewritten_message = await clone_attachments_for_branch(
+                conn,
+                old_message_id=source_message['id'],
+                new_message_id=new_message_id,
+                new_conversation_id=new_conv_id,
+                user_id=current_user.id,
+                message_json=source_message['message'],
+            )
+            if rewritten_message != source_message['message']:
+                await cursor.execute(
+                    "UPDATE MESSAGES SET message = ? WHERE id = ?",
+                    (rewritten_message, new_message_id),
+                )
 
         # 9. Copy media files + rewrite URLs
         hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
@@ -12531,6 +13141,7 @@ async def get_chat_folders(current_user: User = Depends(get_current_user)):
         return unauthenticated_response()
     
     try:
+        await ensure_conversation_privacy_schema()
         async with get_db_connection(readonly=True) as conn:
             async with conn.cursor() as cursor:
                 # Get folders with conversation count
@@ -12538,7 +13149,9 @@ async def get_chat_folders(current_user: User = Depends(get_current_user)):
                     SELECT cf.id, cf.name, cf.color, cf.created_at, cf.updated_at,
                            COUNT(c.id) as conversation_count
                     FROM CHAT_FOLDERS cf
-                    LEFT JOIN CONVERSATIONS c ON cf.id = c.folder_id
+                    LEFT JOIN CONVERSATIONS c
+                      ON cf.id = c.folder_id
+                     AND COALESCE(c.hidden_from_history, 0) = 0
                     WHERE cf.user_id = ?
                     GROUP BY cf.id, cf.name, cf.color, cf.created_at, cf.updated_at
                     ORDER BY cf.created_at ASC
@@ -22758,6 +23371,8 @@ async def media_gallery(request: Request, current_user: User = Depends(get_curre
     conversations = []
     
     try:
+        await ensure_conversation_privacy_schema()
+        await ensure_file_storage_schema()
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
             
@@ -22767,12 +23382,37 @@ async def media_gallery(request: Request, current_user: User = Depends(get_curre
                 FROM CONVERSATIONS c
                 JOIN USERS u ON c.user_id = u.id
                 WHERE c.user_id = ?
+                  AND COALESCE(c.hidden_from_history, 0) = 0
             ''', (current_user.id,))
             
             async for row in cursor:
                 conversations.append({
                     'id': row['id'],
                     'username': row['username']
+                })
+
+            await cursor.execute('''
+                SELECT fa.public_id, fa.original_filename, fa.message_id,
+                       m.type, m.date
+                FROM FILE_ATTACHMENTS fa
+                JOIN CONVERSATIONS c ON c.id = fa.conversation_id
+                JOIN MESSAGES m ON m.id = fa.message_id
+                WHERE c.user_id = ?
+                  AND COALESCE(c.hidden_from_history, 0) = 0
+                  AND fa.attachment_type = 'image'
+                  AND fa.status = 'active'
+                ORDER BY m.date DESC, fa.id DESC
+            ''', (current_user.id,))
+
+            async for row in cursor:
+                images.append({
+                    'id': row['message_id'],
+                    'attachment_ref': row['public_id'],
+                    'url': attachment_content_url(row['public_id'], variant=THUMB_VARIANT),
+                    'fullsize_url': attachment_content_url(row['public_id']),
+                    'name': row['original_filename'],
+                    'type': row['type'],
+                    'date': row['date'],
                 })
             
             # Get images
@@ -22781,6 +23421,7 @@ async def media_gallery(request: Request, current_user: User = Depends(get_curre
             FROM MESSAGES m
             JOIN CONVERSATIONS c ON m.conversation_id = c.id
             WHERE c.user_id = ? AND m.message LIKE '%"type": "image_url"%'
+              AND COALESCE(c.hidden_from_history, 0) = 0
             ORDER BY m.date DESC
             ''', (current_user.id,))
 
@@ -22802,9 +23443,13 @@ async def media_gallery(request: Request, current_user: User = Depends(get_curre
                     if isinstance(processed_message_data, list):
                         for item in processed_message_data:
                             if isinstance(item, dict) and item.get('type') == 'image_url':
+                                if item.get('image_url', {}).get('attachment_ref'):
+                                    continue
                                 image_url = item['image_url']['url']
                                 add_image_if_valid(image_url, row)
                     elif isinstance(processed_message_data, dict) and processed_message_data.get('type') == 'image_url':
+                        if processed_message_data.get('image_url', {}).get('attachment_ref'):
+                            continue
                         image_url = processed_message_data['image_url']['url']
                         add_image_if_valid(image_url, row)
                 except orjson.JSONDecodeError:
@@ -22832,6 +23477,8 @@ async def get_pdfs(request: Request, current_user: User = Depends(get_current_us
     pdfs = []
     pdf_token = None
     try:
+        await ensure_conversation_privacy_schema()
+        await ensure_file_storage_schema()
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
             
@@ -22841,6 +23488,7 @@ async def get_pdfs(request: Request, current_user: User = Depends(get_current_us
                 FROM CONVERSATIONS c
                 JOIN USERS u ON c.user_id = u.id
                 WHERE c.user_id = ?
+                  AND COALESCE(c.hidden_from_history, 0) = 0
             ''', (current_user.id,))
             
             conversations = []
@@ -22848,6 +23496,33 @@ async def get_pdfs(request: Request, current_user: User = Depends(get_current_us
                 conversations.append({
                     'id': row['id'],
                     'username': row['username']
+                })
+
+            await cursor.execute('''
+                SELECT fa.public_id, fa.original_filename, fa.message_id,
+                       fa.created_at, fb.page_count
+                FROM FILE_ATTACHMENTS fa
+                JOIN FILE_BLOBS fb ON fb.id = fa.blob_id
+                JOIN CONVERSATIONS c ON c.id = fa.conversation_id
+                WHERE c.user_id = ?
+                  AND COALESCE(c.hidden_from_history, 0) = 0
+                  AND fa.attachment_type = 'pdf'
+                  AND fa.status = 'active'
+                  AND fb.status = 'ready'
+                ORDER BY fa.created_at DESC, fa.id DESC
+            ''', (current_user.id,))
+
+            async for row in cursor:
+                public_id = row['public_id']
+                pdfs.append({
+                    'path': public_id,
+                    'nginx_path': attachment_download_url(public_id),
+                    'url': attachment_download_url(public_id),
+                    'name': row['original_filename'],
+                    'attachment_ref': public_id,
+                    'message_id': row['message_id'],
+                    'pages': row['page_count'] or 0,
+                    'kind': 'attachment',
                 })
 
         if conversations:
@@ -22891,6 +23566,7 @@ async def get_mp3s(request: Request, current_user: User = Depends(get_current_us
     mp3s = []
     mp3_token = None
     try:
+        await ensure_conversation_privacy_schema()
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.cursor()
             
@@ -22900,6 +23576,7 @@ async def get_mp3s(request: Request, current_user: User = Depends(get_current_us
                 FROM CONVERSATIONS c
                 JOIN USERS u ON c.user_id = u.id
                 WHERE c.user_id = ?
+                  AND COALESCE(c.hidden_from_history, 0) = 0
             ''', (current_user.id,))
             
             conversations = []
@@ -22947,6 +23624,94 @@ async def generate_file_url(file_path: str, token: str) -> str:
     Generate an authenticated URL for a file.
     """
     return f"{CLOUDFLARE_BASE_URL}{quote(file_path)}?token={token}"
+
+
+async def _serve_attachment_file(
+    public_id: str,
+    current_user: User,
+    *,
+    variant: Optional[str] = None,
+    download: bool = False,
+) -> FileResponse:
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    is_admin_user = await is_admin(current_user.id)
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            resolved = await get_attachment_path_for_user(
+                conn,
+                public_id=public_id,
+                user_id=current_user.id,
+                variant=variant,
+                allow_admin=is_admin_user,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    path, attachment = resolved
+    if variant == THUMB_VARIANT and attachment.get("attachment_type") != "image":
+        raise HTTPException(status_code=404, detail="Attachment variant not found")
+    media_type = "image/webp" if variant == THUMB_VARIANT else attachment.get("mime_detected")
+    filename = attachment.get("original_filename") or path.name
+    if download:
+        return FileResponse(path, media_type=media_type, filename=filename)
+    return FileResponse(path, media_type=media_type)
+
+
+@app.get("/api/attachments/{public_id}/content")
+async def attachment_content(
+    public_id: str,
+    variant: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    return await _serve_attachment_file(
+        public_id,
+        current_user,
+        variant=variant,
+        download=False,
+    )
+
+
+@app.get("/api/attachments/{public_id}/download")
+async def attachment_download(
+    public_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    return await _serve_attachment_file(
+        public_id,
+        current_user,
+        download=True,
+    )
+
+
+@app.delete("/api/attachments/{public_id}")
+async def delete_attachment(public_id: str, current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    async with get_db_connection() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            deleted = await delete_attachment_and_rewrite_message(
+                conn,
+                public_id=public_id,
+                user_id=current_user.id,
+                allow_admin=await is_admin(current_user.id),
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    await prune_unreferenced_blobs()
+    return JSONResponse(content={"success": True, "message": "Attachment deleted"})
+
 
 @app.get("/download-pdf")
 async def download_pdf(path: str, current_user: User = Depends(get_current_user)):
@@ -23263,7 +24028,11 @@ async def delete_file_variants(variants: List[Path], user_dir: Path) -> Tuple[in
     return deleted, failed
 
 @app.delete("/api/delete-image/{message_id}")
-async def delete_image(message_id: int, current_user: User = Depends(get_current_user)):
+async def delete_image(
+    message_id: int,
+    attachment_ref: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -23284,6 +24053,40 @@ async def delete_image(message_id: int, current_user: User = Depends(get_current
         user_dir = Path(get_user_directory(current_user.username))
         message_data = orjson.loads(result['message'])
         deleted_count = failed_count = 0
+        attachment_refs = [
+            item.get('image_url', {}).get('attachment_ref')
+            for item in (message_data if isinstance(message_data, list) else [message_data])
+            if isinstance(item, dict) and item.get('type') == 'image_url'
+            and item.get('image_url', {}).get('attachment_ref')
+        ]
+
+        if attachment_refs:
+            if attachment_ref:
+                refs_to_delete = [attachment_ref] if attachment_ref in attachment_refs else []
+                if not refs_to_delete:
+                    raise HTTPException(status_code=404, detail="Attachment not found in this message")
+            elif len(attachment_refs) == 1:
+                refs_to_delete = attachment_refs
+            else:
+                raise HTTPException(status_code=400, detail="attachment_ref is required for multi-image messages")
+
+            for public_id in refs_to_delete:
+                deleted = await delete_attachment_and_rewrite_message(
+                    conn,
+                    public_id=public_id,
+                    user_id=current_user.id,
+                    allow_admin=False,
+                )
+                if deleted:
+                    deleted_count += 1
+                else:
+                    failed_count += 1
+            await conn.commit()
+            await prune_unreferenced_blobs()
+            return {
+                "success": True,
+                "message": f"Successfully deleted: {deleted_count}, Failed: {failed_count}"
+            }
 
         for url in extract_image_urls(message_data):
             try:
@@ -23343,6 +24146,29 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
         for message in await cursor.fetchall():
             message_data = orjson.loads(message['message'])
             message_deleted = False
+            attachment_refs = [
+                item.get('image_url', {}).get('attachment_ref')
+                for item in (message_data if isinstance(message_data, list) else [message_data])
+                if isinstance(item, dict) and item.get('type') == 'image_url'
+                and item.get('image_url', {}).get('attachment_ref')
+            ]
+
+            if attachment_refs:
+                if len(attachment_refs) == 1:
+                    deleted = await delete_attachment_and_rewrite_message(
+                        conn,
+                        public_id=attachment_refs[0],
+                        user_id=current_user.id,
+                        allow_admin=False,
+                    )
+                    if deleted:
+                        deleted_count += 1
+                        message_deleted = True
+                    else:
+                        failed_count += 1
+                else:
+                    failed_count += len(attachment_refs)
+                continue
             
             for url in extract_image_urls(message_data):
                 try:
@@ -23364,7 +24190,9 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
                 "UPDATE MESSAGES SET message = ? WHERE id = ?",
                 replacements_to_apply
             )
+        if replacements_to_apply or deleted_count > 0:
             await conn.commit()
+            await prune_unreferenced_blobs()
 
         return {
             "success": True,
@@ -23380,13 +24208,33 @@ async def delete_pdfs(request: Request, current_user: User = Depends(get_current
     try:
         body = await request.json()
         pdf_paths = body.get('pdf_paths', [])
+        attachment_refs = body.get('attachment_refs', [])
         
-        if not pdf_paths:
+        if not pdf_paths and not attachment_refs:
             raise HTTPException(status_code=400, detail="No PDF paths provided")
 
         user_base_path = Path(get_user_directory(current_user.username))
         deleted_count = 0
         failed_count = 0
+
+        for public_id in attachment_refs:
+            try:
+                async with get_db_connection() as conn:
+                    await conn.execute("BEGIN IMMEDIATE")
+                    deleted = await delete_attachment_and_rewrite_message(
+                        conn,
+                        public_id=public_id,
+                        user_id=current_user.id,
+                        allow_admin=await is_admin(current_user.id),
+                    )
+                    await conn.commit()
+                if deleted:
+                    deleted_count += 1
+                else:
+                    failed_count += 1
+            except Exception as exc:
+                logger.error(f"Error deleting PDF attachment {public_id}: {exc}")
+                failed_count += 1
 
         for pdf_path in pdf_paths:
             path = Path(pdf_path)
@@ -23399,16 +24247,26 @@ async def delete_pdfs(request: Request, current_user: User = Depends(get_current
                 failed_count += 1
                 continue
             
-            if not str(path.resolve()).startswith(str(user_base_path.resolve())):
+            try:
+                resolved_path = path.resolve()
+                user_base_resolved = user_base_path.resolve()
+            except OSError:
+                failed_count += 1
+                continue
+
+            if not resolved_path.is_relative_to(user_base_resolved):
                 failed_count += 1
                 continue
 
             try:
-                await aiofiles.os.remove(str(path))
+                await aiofiles.os.remove(str(resolved_path))
                 deleted_count += 1
             except Exception as e:
                 logger.error(f"Error deleting PDF {path}: {e}")
                 failed_count += 1
+
+        if attachment_refs:
+            await prune_unreferenced_blobs()
 
         return {"message": f"Successfully deleted: {deleted_count}, Failed: {failed_count}"}
 
@@ -23443,12 +24301,19 @@ async def delete_mp3s(request: Request, current_user: User = Depends(get_current
                 failed_count += 1
                 continue
             
-            if not str(path.resolve()).startswith(str(user_base_path.resolve())):
+            try:
+                resolved_path = path.resolve()
+                user_base_resolved = user_base_path.resolve()
+            except OSError:
+                failed_count += 1
+                continue
+
+            if not resolved_path.is_relative_to(user_base_resolved):
                 failed_count += 1
                 continue
 
             try:
-                await aiofiles.os.remove(str(path))
+                await aiofiles.os.remove(str(resolved_path))
                 deleted_count += 1
             except Exception as e:
                 logger.error(f"Error deleting MP3 {path}: {e}")
@@ -24493,6 +25358,7 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
     if current_user is None:
         return unauthenticated_response()
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
         user_id = current_user.id
@@ -24613,10 +25479,28 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
         favorites = [row['prompt_id'] for row in await cursor.fetchall()]
 
         # Stats
-        await cursor.execute("SELECT COUNT(*) as cnt FROM CONVERSATIONS WHERE user_id = ?", (user_id,))
+        await cursor.execute(
+            """
+            SELECT COUNT(*) as cnt
+            FROM CONVERSATIONS
+            WHERE user_id = ?
+              AND COALESCE(hidden_from_history, 0) = 0
+            """,
+            (user_id,),
+        )
         conv_count = (await cursor.fetchone())['cnt']
 
-        await cursor.execute("SELECT COUNT(*) as cnt FROM MESSAGES WHERE user_id = ? AND is_bookmarked = 1", (user_id,))
+        await cursor.execute(
+            """
+            SELECT COUNT(*) as cnt
+            FROM MESSAGES m
+            JOIN CONVERSATIONS c ON c.id = m.conversation_id
+            WHERE m.user_id = ?
+              AND m.is_bookmarked = 1
+              AND COALESCE(c.hidden_from_history, 0) = 0
+            """,
+            (user_id,),
+        )
         bookmarks_count = (await cursor.fetchone())['cnt']
 
         # Latest public marketplace prompts
@@ -24813,6 +25697,7 @@ async def get_home_pack(pack_id: int, request: Request, current_user: User = Dep
     if current_user is None:
         return unauthenticated_response()
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
 
@@ -24918,6 +25803,7 @@ async def get_home_pack(pack_id: int, request: Request, current_user: User = Dep
             LEFT JOIN PROMPTS pr ON c.role_id = pr.id
             LEFT JOIN PROMPT_EXTENSIONS pe ON c.active_extension_id = pe.id
             WHERE c.user_id = ? AND pi.is_active = 1
+              AND COALESCE(c.hidden_from_history, 0) = 0
             ORDER BY c.last_activity DESC
             LIMIT 10
         ''', (pack_id, current_user.id))
@@ -24947,6 +25833,7 @@ async def get_home_prompt(prompt_id: int, request: Request, current_user: User =
     if current_user is None:
         return unauthenticated_response()
 
+    await ensure_conversation_privacy_schema()
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
 
@@ -25006,6 +25893,7 @@ async def get_home_prompt(prompt_id: int, request: Request, current_user: User =
             FROM CONVERSATIONS c
             LEFT JOIN PROMPT_EXTENSIONS pe ON c.active_extension_id = pe.id
             WHERE c.user_id = ? AND c.role_id = ?
+              AND COALESCE(c.hidden_from_history, 0) = 0
             ORDER BY c.last_activity DESC
             LIMIT 10
         ''', (current_user.id, prompt_id))

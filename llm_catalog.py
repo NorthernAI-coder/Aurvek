@@ -314,7 +314,7 @@ async def get_selector_llms(
         SELECT id, machine, model, vision, enabled, display_name
         FROM LLM
         WHERE {where_sql}
-        ORDER BY machine, model
+        ORDER BY machine, COALESCE(display_name, model)
         """,
         params,
     )

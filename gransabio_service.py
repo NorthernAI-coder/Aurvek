@@ -1356,6 +1356,8 @@ async def process_gransabio_external(
             context_messages=context_messages_dicts,
             user_api_keys=None,  # External channels don't have user API keys
         )
+        if prompt_ctx.get("atagia_context_active"):
+            context_messages_dicts = []
 
         # Override gransabio_config_raw from prompt_ctx (authoritative source)
         gransabio_config_raw = prompt_ctx["gransabio_config_raw"]

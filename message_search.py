@@ -71,6 +71,7 @@ JOIN MESSAGES m ON m.id = f.rowid
 JOIN CONVERSATIONS c ON c.id = m.conversation_id
 WHERE MESSAGES_FTS MATCH :fts_query
   AND c.user_id = :user_id
+  {privacy_filter}
   {conv_filter}
 ORDER BY rank ASC, m.id DESC
 LIMIT :limit OFFSET :offset
@@ -105,7 +106,20 @@ async def execute_search(
     else:
         conv_filter = ""
 
-    sql = SEARCH_SQL.replace("{conv_filter}", conv_filter)
+    privacy_filter = ""
+    try:
+        cursor = await conn.execute("PRAGMA table_info(CONVERSATIONS)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "hidden_from_history" in columns:
+            privacy_filter = "AND COALESCE(c.hidden_from_history, 0) = 0"
+    except Exception:
+        privacy_filter = ""
+
+    sql = (
+        SEARCH_SQL
+        .replace("{privacy_filter}", privacy_filter)
+        .replace("{conv_filter}", conv_filter)
+    )
 
     params = {
         "fts_query": fts_query,

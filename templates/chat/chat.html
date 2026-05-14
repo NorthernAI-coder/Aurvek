@@ -204,6 +204,12 @@
 				  <li><h6 class="dropdown-header">New Chat Settings <i class="fas fa-info-circle" data-bs-toggle="tooltip" data-bs-placement="right" title="These settings will be used when creating a new chat"></i></h6></li>
 				  <li><hr class="dropdown-divider"></li>
 				  <li>
+					<button type="button" class="dropdown-item" id="new-incognito-chat-btn">
+					  <i class="fas fa-user-secret"></i> New incognito chat
+					</button>
+				  </li>
+				  <li><hr class="dropdown-divider"></li>
+				  <li>
 					<h6 class="dropdown-header">Select Prompt</h6>
 					<select class="form-select" id="promptDropdown" name="prompt_id">
 					  {% set fav_prompts = prompts|selectattr('is_favorite')|list %}
@@ -239,10 +245,24 @@
 				  <li>
 					<h6 class="dropdown-header">Select LLM Engine</h6>
 					<select class="form-select" id="llmDropdown" name="type_of_model">
-					  {% for model in llm_models %}
-					  <option value="{{ model['id'] }}" {% if current_model_type == model['id'] %}selected{% endif %}>
-						{{ model['machine'] }} - {{ model['model'] }}
-					  </option>
+					  {% set priority_machines = ['GPT', 'O1'] %}
+					  {% for machine, models in llm_models|groupby('machine') if machine in priority_machines %}
+					  <optgroup label="{{ machine }}">
+						{% for model in models %}
+						<option value="{{ model['id'] }}" {% if current_model_type == model['id'] %}selected{% endif %}>
+						  {{ model.display_name | default(model.model, true) }}
+						</option>
+						{% endfor %}
+					  </optgroup>
+					  {% endfor %}
+					  {% for machine, models in llm_models|groupby('machine') if machine not in priority_machines %}
+					  <optgroup label="{{ machine }}">
+						{% for model in models %}
+						<option value="{{ model['id'] }}" {% if current_model_type == model['id'] %}selected{% endif %}>
+						  {{ model.display_name | default(model.model, true) }}
+						</option>
+						{% endfor %}
+					  </optgroup>
 					  {% endfor %}
 					</select>
 				  </li>
@@ -366,7 +386,15 @@
             <div class="chat-title-container">
                 <div id="chat-title-avatar" class="chat-title-avatar"></div>
                 <div class="chat-title-info">
-                    <h4 class="mb-0" id="chat-title" title="">Prompt Tests</h4>
+                    <div class="chat-title-main-row">
+                        <h4 class="mb-0" id="chat-title" title="">Prompt Tests</h4>
+                        <span id="incognito-chat-badge" class="incognito-chat-badge" hidden>
+                            <i class="fas fa-user-secret"></i> Incognito
+                        </span>
+                        <button type="button" id="close-incognito-chat-btn" class="btn-close-incognito" title="Close incognito chat" hidden>
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
                     <div class="model-selector-container">
                         <small id="chat-model" class="chat-model-info"></small>
                         <i class="fas fa-chevron-down model-dropdown-icon" id="model-dropdown-icon" title="Change AI model"></i>
