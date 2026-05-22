@@ -403,6 +403,11 @@
         </button>
     </li>
     <li class="nav-item" role="presentation">
+        <button class="nav-link" id="wellbeing-tab" data-bs-toggle="tab" data-bs-target="#wellbeing" type="button" role="tab" aria-controls="wellbeing" aria-selected="false">
+            <i class="fas fa-heart-pulse me-1"></i> Break Reminders
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
         <button class="nav-link" id="memory-tab" data-bs-toggle="tab" data-bs-target="#memory" type="button" role="tab" aria-controls="memory" aria-selected="false">
             <i class="fas fa-brain me-1"></i> Memory
         </button>
@@ -592,6 +597,7 @@
                             <small class="text-muted d-block">Go straight to your conversations</small>
                         </label>
                     </div>
+                    {% if marketplace.discovery_enabled|default(false) %}
                     <div class="form-check mt-2">
                         <input class="form-check-input" type="radio" name="afterLogin" id="afterLoginExplore" value="/explore">
                         <label class="form-check-label" for="afterLoginExplore">
@@ -599,6 +605,7 @@
                             <small class="text-muted d-block">Browse and discover public products</small>
                         </label>
                     </div>
+                    {% endif %}
                     <div class="form-check mt-2">
                         <input class="form-check-input" type="radio" name="afterLogin" id="afterLoginDashboard" value="/dashboard">
                         <label class="form-check-label" for="afterLoginDashboard">
@@ -902,6 +909,68 @@
                     <i class="fas fa-spinner fa-spin me-2"></i>Loading...
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- ==================== Break Reminders Tab ==================== -->
+    <div class="tab-pane fade" id="wellbeing" role="tabpanel" aria-labelledby="wellbeing-tab">
+        <div class="section-container">
+            <div class="section-title"><i class="fas fa-heart-pulse me-2"></i>Break Reminders</div>
+            <form id="wellbeingPreferencesForm">
+                <div class="row">
+                    <div class="col-lg-6 mb-3">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="wellbeingRemindersEnabled">
+                            <label class="form-check-label" for="wellbeingRemindersEnabled">Enable break reminders</label>
+                        </div>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="wellbeingIntenseEnabled">
+                            <label class="form-check-label" for="wellbeingIntenseEnabled">Allow intense-session reminders</label>
+                        </div>
+                        <div class="mb-3">
+                            <label for="wellbeingPreferredSoftMinutes" class="form-label">Preferred first reminder minutes</label>
+                            <input type="number" class="form-control" id="wellbeingPreferredSoftMinutes" min="5" max="1440" placeholder="Use platform default">
+                        </div>
+                        <div class="d-flex gap-2 flex-wrap">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="fas fa-save me-1"></i> Save
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary" id="wellbeingResetSessionBtn">
+                                <i class="fas fa-rotate-left me-1"></i> Reset Current Counter
+                            </button>
+                        </div>
+                    </div>
+                    <div class="col-lg-6 mb-3">
+                        <div class="row">
+                            <div class="col-md-6 col-6 mb-3">
+                                <div class="stat-card primary">
+                                    <div class="label">Active Minutes</div>
+                                    <div class="amount" id="wellbeingActiveMinutes">-</div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 col-6 mb-3">
+                                <div class="stat-card info">
+                                    <div class="label">User Messages</div>
+                                    <div class="amount" id="wellbeingUserMessages">-</div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 col-6 mb-3">
+                                <div class="stat-card warning">
+                                    <div class="label">Reminders</div>
+                                    <div class="amount" id="wellbeingRemindersShown">-</div>
+                                </div>
+                            </div>
+                            <div class="col-md-6 col-6 mb-3">
+                                <div class="stat-card success">
+                                    <div class="label">Session Status</div>
+                                    <div class="amount" id="wellbeingSeverity">-</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="text-muted small" id="wellbeingStatusText">Loading break reminder status...</div>
+                    </div>
+                </div>
+            </form>
         </div>
     </div>
 

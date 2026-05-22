@@ -15,6 +15,7 @@ from log_config import logger
 
 NONTERMINAL_JOB_STATUSES = {"queued", "running", "retrying"}
 ERROR_JOB_STATUSES = {"failed", "dead_lettered"}
+REVIEW_MEMORY_STATUSES = {"pending_user_confirmation", "review_required"}
 KNOWN_TABLES = {
     "messages",
     "memory_objects",
@@ -81,6 +82,8 @@ async def _get_atagia_local_db_diagnostics(config: Any) -> dict[str, Any]:
             )
             job_type_counts = await _job_type_counts(conn, tables)
             active_jobs = await _active_jobs(conn, tables)
+            review_items = await _memory_review_items(conn, tables)
+            pending_confirmations = await _pending_confirmation_items(conn, tables)
     except Exception as exc:
         logger.warning("Failed to load Atagia admin diagnostics", exc_info=True)
         return {
@@ -100,6 +103,10 @@ async def _get_atagia_local_db_diagnostics(config: Any) -> dict[str, Any]:
         "job_status_counts": job_status_counts,
         "job_type_counts": job_type_counts,
         "active_jobs": active_jobs,
+        "review": {
+            "memory_items": review_items,
+            "pending_confirmations": pending_confirmations,
+        },
         "processing": processing,
     }
 
@@ -280,9 +287,149 @@ def _job_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     }
 
 
+async def _memory_review_items(
+    conn: aiosqlite.Connection,
+    tables: set[str],
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    if "memory_objects" not in tables:
+        return []
+    columns = await _table_columns(conn, "memory_objects")
+    if "status" not in columns:
+        return []
+
+    selected_columns = _review_select_columns(
+        columns,
+        preferred=(
+            "id",
+            "status",
+            "user_id",
+            "conversation_id",
+            "character_id",
+            "memory_type",
+            "content",
+            "text",
+            "summary",
+            "value",
+            "confidence",
+            "created_at",
+            "updated_at",
+            "source_message_ids_json",
+            "metadata_json",
+        ),
+    )
+    order_column = _first_existing_column(columns, ("updated_at", "created_at", "id"))
+    order_sql = f"ORDER BY {_quote_identifier(order_column)} DESC" if order_column else ""
+    status_placeholders = ", ".join("?" for _ in REVIEW_MEMORY_STATUSES)
+    cursor = await conn.execute(
+        f"""
+        SELECT {", ".join(_quote_identifier(column) for column in selected_columns)}
+        FROM memory_objects
+        WHERE status IN ({status_placeholders})
+        {order_sql}
+        LIMIT ?
+        """,
+        tuple(sorted(REVIEW_MEMORY_STATUSES)) + (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [_review_row_to_dict(row) for row in rows]
+
+
+async def _pending_confirmation_items(
+    conn: aiosqlite.Connection,
+    tables: set[str],
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    if "pending_memory_confirmations" not in tables:
+        return []
+
+    columns = await _table_columns(conn, "pending_memory_confirmations")
+    if not columns:
+        return []
+
+    selected_columns = _review_select_columns(
+        columns,
+        preferred=(
+            "id",
+            "memory_id",
+            "user_id",
+            "conversation_id",
+            "character_id",
+            "status",
+            "content",
+            "text",
+            "summary",
+            "created_at",
+            "expires_at",
+            "source_message_ids_json",
+            "metadata_json",
+        ),
+    )
+    order_column = _first_existing_column(columns, ("created_at", "updated_at", "id"))
+    order_sql = f"ORDER BY {_quote_identifier(order_column)} DESC" if order_column else ""
+    cursor = await conn.execute(
+        f"""
+        SELECT {", ".join(_quote_identifier(column) for column in selected_columns)}
+        FROM pending_memory_confirmations
+        {order_sql}
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [_review_row_to_dict(row) for row in rows]
+
+
+def _review_select_columns(
+    columns: set[str],
+    *,
+    preferred: tuple[str, ...],
+    limit: int = 16,
+) -> list[str]:
+    selected = [column for column in preferred if column in columns]
+    for column in sorted(columns):
+        if column not in selected:
+            selected.append(column)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _review_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
+    data = {
+        key: _review_value(row[key])
+        for key in row.keys()
+        if row[key] not in (None, "")
+    }
+    source_messages = _parse_json_list(
+        data.get("source_message_ids_json") or data.get("source_messages_json")
+    )
+    if source_messages:
+        data["source_messages"] = source_messages[:5]
+    return data
+
+
+def _review_value(value: Any) -> Any:
+    if isinstance(value, (int, float, bool)):
+        return value
+    text = str(value)
+    if text.startswith("{") or text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return _truncate(text, 260)
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return _truncate(text, 260)
+
+
 def _parse_json_list(value: Any) -> list[str]:
     if not value:
         return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
     try:
         parsed = json.loads(str(value))
     except (TypeError, ValueError):
@@ -372,6 +519,17 @@ async def _table_columns(conn: aiosqlite.Connection, table: str) -> set[str]:
     cursor = await conn.execute(f"PRAGMA table_info({table})")
     rows = await cursor.fetchall()
     return {str(row["name"]) for row in rows}
+
+
+def _first_existing_column(columns: set[str], candidates: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _truncate(value: Any, limit: int) -> str | None:

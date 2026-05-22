@@ -178,6 +178,10 @@ def _clean_tables(db_path):
     """Wipe all data between tests (keeps schema)."""
     conn = sqlite3.connect(db_path)
     for table in (
+        "USER_WELLBEING_EVENTS",
+        "USER_ACTIVITY_SESSION_CONVERSATIONS",
+        "USER_ACTIVITY_SESSIONS",
+        "USER_WELLBEING_PREFERENCES",
         "ATAGIA_SYNC_STATE",
         "ATAGIA_SYNC_RUNS",
         "ATAGIA_MESSAGE_LINKS",
@@ -225,10 +229,13 @@ def mock_db(db_path):
     # Also patch in the modules that import it directly
     patcher2 = patch("tools.watchdog.get_db_connection", _get_test_conn)
     patcher3 = patch("common.get_db_connection", _get_test_conn)
+    patcher4 = patch("wellbeing_service.get_db_connection", _get_test_conn)
     patcher.start()
     patcher2.start()
     patcher3.start()
+    patcher4.start()
     yield _get_test_conn
+    patcher4.stop()
     patcher3.stop()
     patcher2.stop()
     patcher.stop()

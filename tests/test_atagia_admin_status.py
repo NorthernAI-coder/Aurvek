@@ -120,6 +120,8 @@ async def test_atagia_admin_status_includes_local_processing_stats(mock_db, tmp_
     assert atagia["processing"]["failed_jobs"] == 1
     assert atagia["processing"]["pending_jobs_by_type"] == {"project_contract": 1}
     assert atagia["active_jobs"][0]["job_id"] == "job_running"
+    assert {item["id"] for item in atagia["review"]["memory_items"]} == {"mem_3", "mem_4"}
+    assert atagia["review"]["pending_confirmations"] == [{"id": "pending_1"}]
     assert status["sync"]["linked_messages"] == 0
 
 

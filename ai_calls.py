@@ -24,6 +24,8 @@ import re
 import os
 import logging
 import hashlib
+import shutil
+import time
 from typing import Any, List, Optional
 import traceback
 import sqlite3
@@ -31,7 +33,7 @@ import uuid
 import requests
 import urllib.parse
 import contextvars
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 # Import own modules
@@ -107,14 +109,18 @@ from chat_warmup import (
 from atagia_bridge import get_atagia_bridge
 from conversation_privacy import ensure_conversation_privacy_schema
 from file_storage import (
+    attachment_record_to_block,
     create_pending_image_attachment,
     create_pending_pdf_attachment,
     create_pending_text_attachment,
     discard_pending_attachments,
+    discard_pending_attachments_for_user,
     finalize_message_attachments,
     image_block_to_provider_block,
     read_attachment_bytes,
+    read_pending_attachment_bytes,
 )
+from wellbeing_service import get_active_pause, record_chat_turn
 
 ATAGIA_LIVE_INGEST_ORIGIN = "live_turn"
 ATAGIA_LIVE_CONFIRMATION_STRATEGY = "live_prompt_allowed"
@@ -128,6 +134,53 @@ openai = OpenAI(api_key=openai_key)
 anthropic.api_key = claude_key
 
 PDF_RETRY_TOKEN_TTL_SECONDS = 30 * 60
+SSE_KEEPALIVE_INTERVAL_SECONDS = 15
+ATTACHMENT_UPLOAD_CHUNK_SIZE_MB = max(1, int(os.getenv("ATTACHMENT_UPLOAD_CHUNK_SIZE_MB", "4")))
+ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES = ATTACHMENT_UPLOAD_CHUNK_SIZE_MB * 1024 * 1024
+ATTACHMENT_UPLOAD_MAX_CHUNKS = max(1, int(os.getenv("ATTACHMENT_UPLOAD_MAX_CHUNKS", "128")))
+ATTACHMENT_UPLOAD_TTL_SECONDS = max(60, int(os.getenv("ATTACHMENT_UPLOAD_TTL_SECONDS", str(2 * 60 * 60))))
+ATTACHMENT_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+_ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW = Path(os.getenv("ATTACHMENT_UPLOAD_CHUNK_ROOT", "data/upload_chunks"))
+ATTACHMENT_UPLOAD_CHUNK_ROOT = (
+    _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW
+    if _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW.is_absolute()
+    else Path(__file__).resolve().parent / _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW
+)
+
+
+async def _stream_with_sse_keepalives(source, interval: int = SSE_KEEPALIVE_INTERVAL_SECONDS):
+    """Yield SSE comments while waiting for slow provider chunks.
+
+    Cloudflare can time out long-running proxied requests that do not emit
+    response bytes. SSE comments are ignored by the chat renderer but keep the
+    HTTP stream active while uploads, PDF handling, or provider thinking take
+    longer than usual.
+    """
+    iterator = source.__aiter__()
+    pending = asyncio.create_task(iterator.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield ": keep-alive\n\n"
+                continue
+
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                break
+
+            yield chunk
+            pending = asyncio.create_task(iterator.__anext__())
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            with suppress(Exception):
+                await aclose()
 
 def safe_log_headers(headers: dict) -> dict:
     """Return a copy of headers with sensitive values masked."""
@@ -798,7 +851,7 @@ from system_prompt_defaults import (
     DEFAULT_SYSTEM_BLOCKS, SYSTEM_BLOCK_METADATA, MANDATORY_SYSTEM_KEYS
 )
 
-_BLOCK_VAR_PATTERN = re.compile(r'\{(user_level)\}')
+_BLOCK_VAR_PATTERN = re.compile(r'\{(user_level|current_datetime_utc)\}')
 
 
 TEXT_FILE_EXTENSIONS = {
@@ -849,6 +902,266 @@ def decode_text_file(data: bytes, filename: str) -> str:
         return data.decode('windows-1252')
     except UnicodeDecodeError:
         raise ValueError(f"File '{filename}' could not be decoded (unsupported encoding)")
+
+
+def _json_error(message: str, status_code: int = 400, **extra):
+    payload = {"success": False, "message": message}
+    payload.update(extra)
+    return JSONResponse(content=payload, status_code=status_code)
+
+
+def _parse_attachment_refs_value(value: str | list[str] | None) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        refs = value
+    else:
+        try:
+            refs = orjson.loads(value)
+        except orjson.JSONDecodeError as exc:
+            raise ValueError("Invalid attachment_refs JSON") from exc
+    if not isinstance(refs, list):
+        raise ValueError("attachment_refs must be a JSON array")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if not isinstance(ref, str) or not ref.startswith("att_") or len(ref) > 128:
+            raise ValueError("Invalid attachment reference")
+        if ref in seen:
+            continue
+        seen.add(ref)
+        cleaned.append(ref)
+    return cleaned
+
+
+def _normalize_upload_content_type(content_type: str | None, filename: str | None) -> str:
+    ct = (content_type or "").split(";")[0].strip().lower()
+    lower_name = (filename or "").lower()
+    if not ct or ct == "application/octet-stream":
+        if lower_name.endswith(".pdf"):
+            return "application/pdf"
+        if is_text_file("text/plain", filename or ""):
+            return "text/plain"
+    return ct
+
+
+def _max_upload_bytes_for_attachment(content_type: str, filename: str) -> int:
+    if content_type == "application/pdf":
+        return MAX_PDF_SIZE_MB * 1024 * 1024
+    if is_text_file(content_type, filename):
+        return MAX_TEXT_FILE_SIZE_MB * 1024 * 1024
+    if content_type.startswith("image/"):
+        return MAX_RAW_UPLOAD_SIZE_MB * 1024 * 1024
+    raise ValueError(f"Unsupported file type: {content_type or 'unknown'}")
+
+
+def _validate_chunk_upload_metadata(
+    *,
+    upload_id: str,
+    chunk_index: int,
+    total_chunks: int,
+    filename: str,
+    content_type: str,
+    total_size: int,
+) -> tuple[str, int]:
+    if not ATTACHMENT_UPLOAD_ID_RE.match(upload_id or ""):
+        raise ValueError("Invalid upload id")
+    if not filename:
+        raise ValueError("Filename is required")
+    if chunk_index < 0:
+        raise ValueError("Invalid chunk index")
+    if total_chunks < 1 or total_chunks > ATTACHMENT_UPLOAD_MAX_CHUNKS:
+        raise ValueError("Invalid chunk count")
+    if chunk_index >= total_chunks:
+        raise ValueError("Chunk index exceeds chunk count")
+    if total_size < 0:
+        raise ValueError("Invalid file size")
+    normalized_type = _normalize_upload_content_type(content_type, filename)
+    max_bytes = _max_upload_bytes_for_attachment(normalized_type, filename)
+    if total_size > max_bytes:
+        raise ValueError(f"File '{filename}' exceeds the {max_bytes // (1024 * 1024)}MB size limit")
+    expected_chunks = max(1, (total_size + ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES - 1) // ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES)
+    if total_chunks != expected_chunks:
+        raise ValueError("Chunk metadata does not match file size")
+    return normalized_type, max_bytes
+
+
+def _attachment_upload_dir(user_id: int, conversation_id: int, upload_id: str) -> Path:
+    root = ATTACHMENT_UPLOAD_CHUNK_ROOT.resolve()
+    target = (root / str(user_id) / str(conversation_id) / upload_id).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Invalid upload path") from exc
+    return target
+
+
+def _prune_stale_attachment_upload_dirs(root: Path, ttl_seconds: int) -> int:
+    if not root.exists():
+        return 0
+    cutoff = time.time() - ttl_seconds
+    pruned = 0
+    for upload_dir in root.glob("*/*/*"):
+        try:
+            if not upload_dir.is_dir():
+                continue
+            if upload_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(upload_dir, ignore_errors=True)
+                pruned += 1
+        except OSError:
+            logger.debug("Could not prune stale attachment upload dir %s", upload_dir, exc_info=True)
+    return pruned
+
+
+async def _delete_attachment_upload_dir(upload_dir: Path) -> None:
+    await asyncio.to_thread(shutil.rmtree, upload_dir, True)
+
+
+async def prune_stale_attachment_upload_chunks() -> int:
+    return await asyncio.to_thread(
+        _prune_stale_attachment_upload_dirs,
+        ATTACHMENT_UPLOAD_CHUNK_ROOT,
+        ATTACHMENT_UPLOAD_TTL_SECONDS,
+    )
+
+
+async def _ensure_attachment_upload_allowed(conversation_id: int, current_user: User):
+    if current_user is None:
+        return _json_error("Not authenticated", status_code=401, redirect="/login")
+    if not current_user.can_send_files:
+        return _json_error("File uploads are not enabled for your account", status_code=403)
+    async with get_db_connection(readonly=True) as conn:
+        try:
+            cursor = await conn.execute(
+                """
+                SELECT c.locked, c.user_id, COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled
+                FROM CONVERSATIONS c
+                LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
+                LEFT JOIN PROMPTS ep ON ep.id = COALESCE(c.role_id, ud.current_prompt_id)
+                WHERE c.id = ?
+                """,
+                (conversation_id,),
+            )
+        except sqlite3.OperationalError:
+            cursor = await conn.execute(
+                "SELECT c.locked, c.user_id, 0 AS gransabio_enabled FROM CONVERSATIONS c WHERE c.id = ?",
+                (conversation_id,),
+            )
+        row = await cursor.fetchone()
+    if not row or int(row["user_id"]) != int(current_user.id):
+        return _json_error("Conversation not found.", status_code=404)
+    if row["locked"]:
+        return _json_error("Conversation is locked.", status_code=403)
+    if bool(row["gransabio_enabled"]):
+        return _json_error("File attachments are not supported with GranSabio mode. Send text only.", status_code=400)
+    return None
+
+
+async def _create_pending_attachment_from_upload(
+    *,
+    user_id: int,
+    conversation_id: int,
+    data: bytes,
+    filename: str,
+    content_type: str,
+):
+    normalized_type = _normalize_upload_content_type(content_type, filename)
+    max_bytes = _max_upload_bytes_for_attachment(normalized_type, filename)
+    if len(data) > max_bytes:
+        raise ValueError(f"File '{filename}' exceeds the {max_bytes // (1024 * 1024)}MB size limit")
+
+    if normalized_type == "application/pdf":
+        page_count = validate_pdf(data, enforce_page_limit=False)
+        return await create_pending_pdf_attachment(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            data=data,
+            filename=filename,
+            page_count=page_count,
+            declared_mime=normalized_type,
+        )
+
+    if is_text_file(normalized_type, filename):
+        text_content = decode_text_file(data, filename)
+        return await create_pending_text_attachment(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            text_content=text_content,
+            filename=filename,
+            declared_mime=normalized_type,
+        )
+
+    if normalized_type.startswith("image/"):
+        image_data, image_media_type, width, height, _actual_format, _was_compressed = await asyncio.to_thread(
+            _validate_and_compress_image,
+            data,
+            filename,
+        )
+        if len(image_data) > MAX_API_IMAGE_SIZE_MB * 1024 * 1024:
+            raise ValueError("Image is too large. Please use a smaller or lower-resolution image.")
+        return await create_pending_image_attachment(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            data=image_data,
+            filename=filename,
+            mime_detected=image_media_type,
+            declared_mime=normalized_type,
+            width=width,
+            height=height,
+        )
+
+    raise ValueError(f"Unsupported file type: {normalized_type or 'unknown'}")
+
+
+def _pending_attachment_upload_payload(pending) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": True,
+        "attachment_ref": pending.public_id,
+        "attachment_type": pending.kind,
+        "filename": pending.original_filename,
+        "size_bytes": pending.size_bytes,
+        "block": pending.block,
+    }
+    if pending.kind == "pdf":
+        payload["pages"] = pending.block.get("document_url", {}).get("pages")
+    elif pending.kind == "text":
+        payload["lines"] = pending.block.get("text_file", {}).get("lines")
+    return payload
+
+
+async def _load_pending_attachment_files(
+    *,
+    attachment_refs: list[str],
+    user_id: int,
+    conversation_id: int,
+) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for ref in attachment_refs:
+        result = await read_pending_attachment_bytes(
+            ref,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        if not result:
+            raise ValueError("Attachment upload expired or is not available. Please attach the file again.")
+        data, attachment = result
+        kind = str(attachment.get("attachment_type") or "")
+        if kind == "pdf":
+            content_type = "application/pdf"
+        elif kind == "text":
+            content_type = attachment.get("declared_mime") or "text/plain"
+        elif kind == "image":
+            content_type = attachment.get("mime_detected") or attachment.get("declared_mime") or "image/webp"
+        else:
+            raise ValueError("Unsupported attachment reference")
+        files.append({
+            "data": data,
+            "content_type": str(content_type).lower(),
+            "filename": attachment.get("original_filename") or attachment.get("display_name") or "attachment",
+            "attachment_ref": ref,
+            "attachment_record": attachment,
+        })
+    return files
 
 
 # ---------------------------------------------------------------------------
@@ -2417,7 +2730,10 @@ async def watchdog_takeover_response(
         user_level = "user"
     else:
         user_level = "customer"
-    variables = {"user_level": user_level}
+    variables = {
+        "user_level": user_level,
+        "current_datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
 
     takeover_base = TAKEOVER_PROMPT_TEMPLATE.format(
         original_prompt=original_prompt[:5000],
@@ -2593,7 +2909,10 @@ async def watchdog_takeover_response_requestfree(
     # 4. Build system prompt via global blocks
     blocks = await get_effective_blocks()
     takeover_blocks = [b for b in blocks if b.get("system_key") in SYSTEM_BLOCK_METADATA]
-    variables = {"user_level": user_level}
+    variables = {
+        "user_level": user_level,
+        "current_datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
 
     takeover_base = TAKEOVER_PROMPT_TEMPLATE.format(
         original_prompt=original_prompt[:5000],
@@ -2788,6 +3107,20 @@ async def _validate_message_request(
                 content={'redirect': '/login'},
                 status_code=401
             )
+
+    active_pause = await get_active_pause(current_user.id)
+    if active_pause:
+        pause_reason = active_pause.get("reason") or "pause_active"
+        return JSONResponse(
+            content={
+                "error": "wellbeing_pause_active" if pause_reason == "pause_active" else "wellbeing_pause_required",
+                "message": active_pause.get("message") or "A break pause is required before continuing.",
+                "pause_until": active_pause.get("pause_until"),
+                "session_id": active_pause.get("session_id"),
+                "reason": pause_reason,
+            },
+            status_code=429,
+        )
 
     # Check rate limit (120 AI calls per minute)
     if not await check_rate_limit(current_user.id, action="ai_call", limit=120, window_minutes=1):
@@ -3440,6 +3773,7 @@ async def process_save_message(
     pdf_page_start: Optional[int] = None,
     pdf_page_end: Optional[int] = None,
     pdf_retry_token: Optional[str] = None,
+    attachment_refs: Optional[list[str]] = None,
 ):
     """
     Pure business logic function for processing and saving messages.
@@ -3447,7 +3781,13 @@ async def process_save_message(
     """
     logger.debug("enters into process_save_message")
 
-    if files and not current_user.can_send_files:
+    files = list(files or [])
+    try:
+        attachment_refs = _parse_attachment_refs_value(attachment_refs)
+    except ValueError as exc:
+        return JSONResponse(content={'success': False, 'message': str(exc)}, status_code=400)
+
+    if (files or attachment_refs) and not current_user.can_send_files:
         return JSONResponse(
             content={'success': False, 'message': 'File uploads are not enabled for your account'},
             status_code=403
@@ -3505,7 +3845,7 @@ async def process_save_message(
             raise ValueError("[process_save_message] - No message provided")
 
         # Reject empty messages when no files are attached
-        if (not user_message or not user_message.strip()) and not files:
+        if (not user_message or not user_message.strip()) and not files and not attachment_refs:
             raise ValueError("Message content cannot be empty")
 
         message_size = len(user_message.encode('utf-8'))
@@ -3519,10 +3859,15 @@ async def process_save_message(
     message_list_to_save = []
     message_list_to_send = []
     pending_attachment_refs: list[str] = []
+    discardable_attachment_refs: list[str] = []
 
     async def _attachment_error_response(message: str, status_code: int = 400):
-        await discard_pending_attachments(pending_attachment_refs, "message_upload_aborted")
+        await discard_pending_attachments(discardable_attachment_refs, "message_upload_aborted")
         return JSONResponse(content={'success': False, 'message': message}, status_code=status_code)
+
+    async def _attachment_json_error_response(content: dict, status_code: int = 400):
+        await discard_pending_attachments(discardable_attachment_refs, "message_upload_aborted")
+        return JSONResponse(content=content, status_code=status_code)
 
     logger.debug("Before entering into get_db_connection")
 
@@ -3586,6 +3931,26 @@ async def process_save_message(
             logger.info(f"You cannot save messages to another user's conversation. current_user.id: {current_user.id}, conversation_user_id: {conversation_user_id}")
             return JSONResponse(content={'success': False, 'message': 'You cannot save messages to another user\'s conversation.'}, status_code=403)
 
+        MAX_FILES_PER_MESSAGE = 16
+        if len(files) + len(attachment_refs) > MAX_FILES_PER_MESSAGE:
+            return JSONResponse(
+                content={'success': False, 'message': f'Maximum {MAX_FILES_PER_MESSAGE} files per message.'},
+                status_code=400,
+            )
+
+        if attachment_refs:
+            try:
+                files.extend(
+                    await _load_pending_attachment_files(
+                        attachment_refs=attachment_refs,
+                        user_id=current_user.id,
+                        conversation_id=conversation_id,
+                    )
+                )
+                discardable_attachment_refs.extend(attachment_refs)
+            except ValueError as exc:
+                return JSONResponse(content={'success': False, 'message': str(exc)}, status_code=400)
+
         logger.debug(f"text en process_save_message: {user_message}")
 
         input_tokens = estimate_message_tokens(user_message)
@@ -3610,21 +3975,12 @@ async def process_save_message(
 
         if pdf_range_requested_preflight:
             if pdf_file_count != 1:
-                return JSONResponse(
-                    content={'success': False, 'message': 'Page range retry supports one PDF at a time.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('Page range retry supports one PDF at a time.')
             if pdf_page_start is None or pdf_page_end is None:
-                return JSONResponse(
-                    content={'success': False, 'message': 'Both PDF page start and end are required.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('Both PDF page start and end are required.')
             pdf_retry_payload = _decode_pdf_retry_token(pdf_retry_token, current_user, conversation_id)
             if not pdf_retry_payload:
-                return JSONResponse(
-                    content={'success': False, 'message': 'PDF range retry expired. Please resend the original PDF and wait for the range prompt again.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('PDF range retry expired. Please resend the original PDF and wait for the range prompt again.')
 
         if files:
             for f in files:
@@ -3632,10 +3988,7 @@ async def process_save_message(
                     input_tokens += int(len(f['data']) / 4 * 1.1 + 0.5)
                 elif f['content_type'] == 'application/pdf':
                     if len(f['data']) > MAX_PDF_SIZE_MB * 1024 * 1024:
-                        return JSONResponse(
-                            content={'success': False, 'message': f'PDF exceeds {MAX_PDF_SIZE_MB}MB limit.'},
-                            status_code=400
-                    )
+                        return await _attachment_error_response(f'PDF exceeds {MAX_PDF_SIZE_MB}MB limit.')
                     try:
                         page_count_for_cost = validate_pdf(
                             f['data'],
@@ -3648,21 +4001,15 @@ async def process_save_message(
                                 page_count_for_cost,
                             )
                             if retry_validation_error:
-                                return JSONResponse(
-                                    content={'success': False, 'message': retry_validation_error},
-                                    status_code=400
-                                )
+                                return await _attachment_error_response(retry_validation_error)
                             range_start = int(pdf_page_start)
                             range_end = int(pdf_page_end)
                             if range_start < 1 or range_end < range_start or range_end > page_count_for_cost:
-                                return JSONResponse(
-                                    content={'success': False, 'message': f'PDF page range exceeds document length ({page_count_for_cost} pages)'},
-                                    status_code=400
-                                )
+                                return await _attachment_error_response(f'PDF page range exceeds document length ({page_count_for_cost} pages)')
                             page_count_for_cost = range_end - range_start + 1
                             if page_count_for_cost > MAX_PDF_PAGES:
-                                return JSONResponse(
-                                    content=_pdf_upload_too_large_payload(
+                                return await _attachment_json_error_response(
+                                    _pdf_upload_too_large_payload(
                                         f'PDF page range exceeds {MAX_PDF_PAGES} page limit ({page_count_for_cost} pages)',
                                         pdf_file_count,
                                         page_count_for_cost,
@@ -3674,8 +4021,8 @@ async def process_save_message(
                                     status_code=400
                                 )
                         elif page_count_for_cost > MAX_PDF_PAGES:
-                            return JSONResponse(
-                                content=_pdf_upload_too_large_payload(
+                            return await _attachment_json_error_response(
+                                _pdf_upload_too_large_payload(
                                     f'PDF exceeds {MAX_PDF_PAGES} page limit ({page_count_for_cost} pages)',
                                     pdf_file_count,
                                     page_count_for_cost,
@@ -3687,14 +4034,14 @@ async def process_save_message(
                                 status_code=400
                             )
                     except ValueError as e:
-                        return JSONResponse(
-                            content={'success': False, 'message': str(e), 'error_code': 'pdf_validation_error'},
-                            status_code=400
+                        return await _attachment_json_error_response(
+                            {'success': False, 'message': str(e), 'error_code': 'pdf_validation_error'},
+                            status_code=400,
                         )
                     pdf_pages_in_request += page_count_for_cost
                     if pdf_pages_in_request > MAX_PDF_PAGES:
-                        return JSONResponse(
-                            content=_pdf_upload_too_large_payload(
+                        return await _attachment_json_error_response(
+                            _pdf_upload_too_large_payload(
                                 f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({pdf_pages_in_request} pages)',
                                 pdf_file_count,
                                 pdf_pages_in_request,
@@ -3751,8 +4098,8 @@ async def process_save_message(
                     context_pdf_count += 1
                     context_pdf_pages += page_count_for_cost
                     if context_pdf_pages + pdf_pages_in_request > MAX_PDF_PAGES:
-                        return JSONResponse(
-                            content=_pdf_upload_too_large_payload(
+                        return await _attachment_json_error_response(
+                            _pdf_upload_too_large_payload(
                                 f'PDF page total exceeds {MAX_PDF_PAGES} page limit ({context_pdf_pages + pdf_pages_in_request} pages including conversation context)',
                                 pdf_file_count,
                                 pdf_pages_in_request,
@@ -3783,23 +4130,14 @@ async def process_save_message(
             # because Telegram/WhatsApp webhooks call process_save_message directly)
             own_only_error = await check_own_only_gransabio(current_user.id, conversation_id)
             if own_only_error:
-                return JSONResponse(
-                    content={'success': False, 'message': own_only_error},
-                    status_code=403
-                )
+                return await _attachment_error_response(own_only_error, status_code=403)
             if files:
-                return JSONResponse(
-                    content={'success': False, 'message': 'File attachments are not supported with GranSabio mode. Send text only.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('File attachments are not supported with GranSabio mode. Send text only.')
             is_byok = False
             from common import get_effective_billing_info
             billing_info = await get_effective_billing_info(current_user.id)
             if billing_info['effective_balance'] <= 0:
-                return JSONResponse(
-                    content={'success': False, 'message': 'Insufficient balance.'},
-                    status_code=402
-                )
+                return await _attachment_error_response('Insufficient balance.', status_code=402)
             output_tokens = model_output_cap
             _log_output_limit_decision(
                 source="single_gransabio",
@@ -3844,21 +4182,15 @@ async def process_save_message(
                 and preflight_use_system
                 and not openrouter_key
             ):
-                return JSONResponse(
-                    content={'success': False, 'message': 'PDF files with this model require OpenRouter integration. Use Claude, Gemini, or select an OpenRouter model directly.'},
-                    status_code=400
-                )
+                return await _attachment_error_response('PDF files with this model require OpenRouter integration. Use Claude, Gemini, or select an OpenRouter model directly.')
             if not preflight_key and not preflight_use_system:
-                return JSONResponse(
-                    content={'success': False, 'message': f'API key required for {preflight_provider}.'},
-                    status_code=400
-                )
+                return await _attachment_error_response(f'API key required for {preflight_provider}.')
             is_byok = preflight_key is not None
 
             if is_byok:
                 # BYOK: no API cost to platform. Only need balance for paid prompt markup.
                 if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
-                    return JSONResponse(content={'success': False, 'message': 'Insufficient balance for creator markup.'}, status_code=402)
+                    return await _attachment_error_response('Insufficient balance for creator markup.', status_code=402)
                 # For free prompts with BYOK, no balance needed at all
                 output_tokens = model_output_cap
                 logger.debug(f"BYOK mode: max_tokens={output_tokens}, Balance: {current_balance}")
@@ -3887,15 +4219,12 @@ async def process_save_message(
                 )
                 if guard_error:
                     logger.error(guard_error)
-                    return JSONResponse(
-                        content={'success': False, 'message': guard_error},
-                        status_code=500,
-                    )
+                    return await _attachment_error_response(guard_error, status_code=500)
 
                 if input_token_cost == 0 and output_token_cost == 0:
                     # Free model: no API cost. Only need balance for paid prompt markup.
                     if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
-                        return JSONResponse(content={'success': False, 'message': 'Insufficient balance for creator markup.'}, status_code=402)
+                        return await _attachment_error_response('Insufficient balance for creator markup.', status_code=402)
                     output_tokens = model_output_cap
                     total_cost = 0
                     logger.debug(f"Free model: max_tokens={output_tokens}, Balance: {current_balance}")
@@ -3915,17 +4244,17 @@ async def process_save_message(
                     # Validate output_token_cost to prevent division by zero
                     if output_token_cost is None or output_token_cost <= 0:
                         logger.error(f"Invalid output_token_cost ({output_token_cost}) for LLM {conversation_llm_id}")
-                        return JSONResponse(content={'success': False, 'message': 'LLM configuration error: invalid token cost'}, status_code=500)
+                        return await _attachment_error_response('LLM configuration error: invalid token cost', status_code=500)
 
                     max_affordable_tokens = int(((current_balance - input_cost) / output_token_cost) * 1000000)
                     output_tokens = int(min(model_output_cap, max(0, max_affordable_tokens)))  # Ensure non-negative
                     if output_tokens < 1:
-                        return JSONResponse(content={'success': False, 'message': 'Insufficient balance to send the message.'}, status_code=402)
+                        return await _attachment_error_response('Insufficient balance to send the message.', status_code=402)
                     output_cost = (output_tokens / 1000000) * output_token_cost
                     total_cost = input_cost + output_cost
 
                     if total_cost >= current_balance:
-                        return JSONResponse(content={'success': False, 'message': 'Insufficient balance to send the message.'}, status_code=402)
+                        return await _attachment_error_response('Insufficient balance to send the message.', status_code=402)
 
                     logger.debug(f"Total cost: {total_cost}, Balance: {current_balance}")
                     _log_output_limit_decision(
@@ -4016,6 +4345,8 @@ async def process_save_message(
             try:
                 pdf_data = pdf['data']
                 filename = pdf['filename'] or 'document.pdf'
+                existing_ref = pdf.get('attachment_ref')
+                existing_attachment = pdf.get('attachment_record')
                 original_pdf_data = pdf_data
                 original_pdf_hash = hashlib.sha1(original_pdf_data).hexdigest()
                 page_count = validate_pdf(
@@ -4052,23 +4383,31 @@ async def process_save_message(
             if machine == "O1":
                 extracted_text = extract_pdf_text_local(pdf_data)
 
-            try:
-                pending_pdf = await create_pending_pdf_attachment(
-                    user_id=current_user.id,
-                    conversation_id=conversation_id,
-                    data=pdf_data,
-                    filename=filename,
-                    page_count=page_count,
-                    declared_mime=pdf.get('content_type') or 'application/pdf',
-                )
-            except Exception as exc:
-                logger.error("[process_save_message] Could not save PDF attachment: %s", exc)
-                return await _attachment_error_response('Failed to save PDF.', status_code=500)
-            pending_attachment_refs.append(pending_pdf.public_id)
+            if existing_ref and existing_attachment and not pdf_range_requested:
+                pending_attachment_refs.append(existing_ref)
+                discardable_attachment_refs.append(existing_ref)
+                save_block = attachment_record_to_block(existing_attachment, data=pdf_data)
+            else:
+                try:
+                    pending_pdf = await create_pending_pdf_attachment(
+                        user_id=current_user.id,
+                        conversation_id=conversation_id,
+                        data=pdf_data,
+                        filename=filename,
+                        page_count=page_count,
+                        declared_mime=pdf.get('content_type') or 'application/pdf',
+                    )
+                except Exception as exc:
+                    logger.error("[process_save_message] Could not save PDF attachment: %s", exc)
+                    return await _attachment_error_response('Failed to save PDF.', status_code=500)
+                pending_attachment_refs.append(pending_pdf.public_id)
+                discardable_attachment_refs.append(pending_pdf.public_id)
+                if existing_ref:
+                    discardable_attachment_refs.append(existing_ref)
+                save_block = pending_pdf.block
             _, content_to_send = format_pdf_for_provider(
                 machine, "", pdf_b64, filename, page_count, extracted_text
             )
-            save_block = pending_pdf.block
             if pdf_range_requested:
                 save_block["document_url"]["retry_source_hash"] = original_pdf_hash
                 save_block["document_url"]["retry_source_pages"] = original_page_count
@@ -4102,20 +4441,28 @@ async def process_save_message(
 
                 filename = tf['filename'] or 'unnamed.txt'
                 line_count = text_content.count('\n') + 1
+                existing_ref = tf.get('attachment_ref')
+                existing_attachment = tf.get('attachment_record')
 
-                try:
-                    pending_text = await create_pending_text_attachment(
-                        user_id=current_user.id,
-                        conversation_id=conversation_id,
-                        text_content=text_content,
-                        filename=filename,
-                        declared_mime=tf.get('content_type') or 'text/plain',
-                    )
-                except Exception as exc:
-                    logger.error("[process_save_message] Could not save text attachment: %s", exc)
-                    return await _attachment_error_response('Failed to save text file.', status_code=500)
-                pending_attachment_refs.append(pending_text.public_id)
-                message_list_to_save.append(pending_text.block)
+                if existing_ref and existing_attachment:
+                    pending_attachment_refs.append(existing_ref)
+                    discardable_attachment_refs.append(existing_ref)
+                    message_list_to_save.append(attachment_record_to_block(existing_attachment, data=tf['data']))
+                else:
+                    try:
+                        pending_text = await create_pending_text_attachment(
+                            user_id=current_user.id,
+                            conversation_id=conversation_id,
+                            text_content=text_content,
+                            filename=filename,
+                            declared_mime=tf.get('content_type') or 'text/plain',
+                        )
+                    except Exception as exc:
+                        logger.error("[process_save_message] Could not save text attachment: %s", exc)
+                        return await _attachment_error_response('Failed to save text file.', status_code=500)
+                    pending_attachment_refs.append(pending_text.public_id)
+                    discardable_attachment_refs.append(pending_text.public_id)
+                    message_list_to_save.append(pending_text.block)
 
                 content_to_send = {
                     "type": "text",
@@ -4130,14 +4477,26 @@ async def process_save_message(
         for file_item in images:
             image_data = file_item['data']
             filename = file_item.get('filename', 'image.jpg')
+            existing_ref = file_item.get('attachment_ref')
+            existing_attachment = file_item.get('attachment_record')
 
-            # Validate + compress in thread (does NOT block event loop)
-            try:
-                image_data, image_media_type, w, h, actual_format, was_compressed = await asyncio.to_thread(
-                    _validate_and_compress_image, image_data, filename
+            if existing_ref and existing_attachment:
+                image_media_type = (
+                    existing_attachment.get('mime_detected')
+                    or existing_attachment.get('declared_mime')
+                    or file_item.get('content_type')
+                    or 'image/webp'
                 )
-            except ValueError as e:
-                return await _attachment_error_response(str(e))
+                w = h = None
+                actual_format = image_media_type
+            else:
+                # Validate + compress in thread (does NOT block event loop)
+                try:
+                    image_data, image_media_type, w, h, actual_format, was_compressed = await asyncio.to_thread(
+                        _validate_and_compress_image, image_data, filename
+                    )
+                except ValueError as e:
+                    return await _attachment_error_response(str(e))
 
             # Post-compression size check
             if len(image_data) > MAX_API_IMAGE_SIZE_MB * 1024 * 1024:
@@ -4151,21 +4510,28 @@ async def process_save_message(
             # Base64 encode (fast, stays on event loop)
             image1_data = base64.b64encode(image_data).decode("utf-8")
 
-            try:
-                pending_image = await create_pending_image_attachment(
-                    user_id=current_user.id,
-                    conversation_id=conversation_id,
-                    data=image_data,
-                    filename=filename,
-                    mime_detected=image_media_type,
-                    declared_mime=file_item.get('content_type'),
-                    width=w,
-                    height=h,
-                )
-            except Exception as e:
-                logger.error(f"[process_save_message] Could not save image: {e}")
-                return await _attachment_error_response('Failed to save image.', status_code=500)
-            pending_attachment_refs.append(pending_image.public_id)
+            if existing_ref and existing_attachment:
+                pending_attachment_refs.append(existing_ref)
+                discardable_attachment_refs.append(existing_ref)
+                save_block = attachment_record_to_block(existing_attachment, data=image_data)
+            else:
+                try:
+                    pending_image = await create_pending_image_attachment(
+                        user_id=current_user.id,
+                        conversation_id=conversation_id,
+                        data=image_data,
+                        filename=filename,
+                        mime_detected=image_media_type,
+                        declared_mime=file_item.get('content_type'),
+                        width=w,
+                        height=h,
+                    )
+                except Exception as e:
+                    logger.error(f"[process_save_message] Could not save image: {e}")
+                    return await _attachment_error_response('Failed to save image.', status_code=500)
+                pending_attachment_refs.append(pending_image.public_id)
+                discardable_attachment_refs.append(pending_image.public_id)
+                save_block = pending_image.block
 
             # Format for provider (in thread -- xAI may need Pillow JPEG conversion)
             # NOTE: image_media_type here is the Pillow-detected/compression-derived type,
@@ -4178,7 +4544,7 @@ async def process_save_message(
             except ValueError:
                 return await _attachment_error_response(f'Unsupported AI provider for images: {machine}')
 
-            message_list_to_save.append(pending_image.block)
+            message_list_to_save.append(save_block)
             message_list_to_send.append(image_content_to_send)
 
         if user_message:
@@ -4249,7 +4615,7 @@ async def process_save_message(
             # If none are flagged, proceed
         except Exception as e:
             logger.error(f"[process_save_message] - Error calling moderation API: {e}")
-            await discard_pending_attachments(pending_attachment_refs, "moderation_error")
+            await discard_pending_attachments(discardable_attachment_refs, "moderation_error")
             return JSONResponse(content={'success': False, 'message': f'Failed to process message: {str(e)}'}, status_code=400)
     # --- End of Moderation API Integration ---
 
@@ -4324,6 +4690,8 @@ async def process_save_message(
                     logger.error(f"[process_save_message] - Unexpected error updating chat_name: {exc}")
 
     async def stream_response():
+        yield ": stream-ready\n\n"
+
         if updated_chat_name:
             yield f"data: {orjson.dumps({'updated_chat_name': updated_chat_name}).decode()}\n\n"
 
@@ -4376,12 +4744,26 @@ async def process_save_message(
                                 pass
                         logger.error(f"[process_save_message] - Error saving messages to database: {e}")
 
+            try:
+                await record_chat_turn(
+                    user_id=current_user.id,
+                    conversation_id=conversation_id,
+                    user_message=blocked_message,
+                    assistant_message=rejection_message,
+                )
+            except Exception:
+                logger.warning(
+                    "[wellbeing] Failed to record moderated chat turn for conversation_id=%s",
+                    conversation_id,
+                    exc_info=True,
+                )
+
             # Yield the rejection message
             yield f"data: {orjson.dumps({'content': rejection_message}).decode()}\n\n"
         else:
             # Proceed to get AI response
             try:
-                async for chunk in get_ai_response(
+                response_stream = get_ai_response(
                     message_list_to_send,
                     context_messages_dicts,
                     conversation_id,
@@ -4398,15 +4780,215 @@ async def process_save_message(
                     llm_id=conversation_llm_id,
                     byok=is_byok,
                     pending_attachment_refs=pending_attachment_refs,
-                ):
+                )
+                async for chunk in _stream_with_sse_keepalives(response_stream):
                     yield chunk
             except asyncio.CancelledError:
                 logger.info("Client disconnected")
                 raise
             finally:
-                await discard_pending_attachments(pending_attachment_refs, "stream_finished")
+                await discard_pending_attachments(discardable_attachment_refs, "stream_finished")
 
     return StreamingResponse(stream_response(), media_type='text/event-stream')
+
+
+@router.post("/api/conversations/{conversation_id}/attachments/chunk")
+async def upload_attachment_chunk(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+    content_type: str = Form(""),
+    total_size: int = Form(...),
+    chunk: UploadFile = File(...),
+):
+    guard_response = await _ensure_attachment_upload_allowed(conversation_id, current_user)
+    if guard_response is not None:
+        return guard_response
+
+    try:
+        normalized_type, _max_bytes = _validate_chunk_upload_metadata(
+            upload_id=upload_id,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            filename=filename,
+            content_type=content_type,
+            total_size=total_size,
+        )
+        upload_dir = _attachment_upload_dir(current_user.id, conversation_id, upload_id)
+    except ValueError as exc:
+        return _json_error(str(exc), status_code=400)
+
+    start = chunk_index * ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES
+    expected_size = min(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES, max(0, total_size - start))
+    data = await chunk.read(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES + 1)
+    if len(data) > ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES:
+        return _json_error("Chunk exceeds upload size limit", status_code=400)
+    if len(data) != expected_size:
+        return _json_error("Chunk size does not match metadata", status_code=400)
+
+    try:
+        if chunk_index == 0:
+            await asyncio.to_thread(
+                _prune_stale_attachment_upload_dirs,
+                ATTACHMENT_UPLOAD_CHUNK_ROOT,
+                ATTACHMENT_UPLOAD_TTL_SECONDS,
+            )
+        await asyncio.to_thread(upload_dir.mkdir, parents=True, exist_ok=True)
+        meta_path = upload_dir / "meta.json"
+        metadata = {
+            "upload_id": upload_id,
+            "filename": filename,
+            "content_type": normalized_type,
+            "total_size": int(total_size),
+            "total_chunks": int(total_chunks),
+            "user_id": int(current_user.id),
+            "conversation_id": int(conversation_id),
+        }
+        if meta_path.exists():
+            existing = orjson.loads(await asyncio.to_thread(meta_path.read_bytes))
+            comparable_keys = ("filename", "content_type", "total_size", "total_chunks", "user_id", "conversation_id")
+            if any(existing.get(key) != metadata.get(key) for key in comparable_keys):
+                await _delete_attachment_upload_dir(upload_dir)
+                return _json_error("Upload metadata changed during transfer", status_code=400)
+        else:
+            await asyncio.to_thread(meta_path.write_bytes, orjson.dumps(metadata))
+        part_path = upload_dir / f"{chunk_index:06d}.part"
+        await asyncio.to_thread(part_path.write_bytes, data)
+    except Exception as exc:
+        logger.error("[upload_attachment_chunk] Could not persist chunk: %s", exc)
+        return _json_error("Failed to store upload chunk", status_code=500)
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "upload_id": upload_id,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+        }
+    )
+
+
+@router.post("/api/conversations/{conversation_id}/attachments/complete")
+async def complete_attachment_upload(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    upload_id: str = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+    content_type: str = Form(""),
+    total_size: int = Form(...),
+):
+    guard_response = await _ensure_attachment_upload_allowed(conversation_id, current_user)
+    if guard_response is not None:
+        return guard_response
+
+    try:
+        normalized_type, _max_bytes = _validate_chunk_upload_metadata(
+            upload_id=upload_id,
+            chunk_index=0,
+            total_chunks=total_chunks,
+            filename=filename,
+            content_type=content_type,
+            total_size=total_size,
+        )
+        upload_dir = _attachment_upload_dir(current_user.id, conversation_id, upload_id)
+    except ValueError as exc:
+        return _json_error(str(exc), status_code=400)
+
+    meta_path = upload_dir / "meta.json"
+    if not meta_path.exists():
+        return _json_error("Upload chunks were not found. Please attach the file again.", status_code=400)
+
+    try:
+        metadata = orjson.loads(await asyncio.to_thread(meta_path.read_bytes))
+    except Exception:
+        await _delete_attachment_upload_dir(upload_dir)
+        return _json_error("Upload metadata is corrupted. Please attach the file again.", status_code=400)
+
+    expected_metadata = {
+        "filename": filename,
+        "content_type": normalized_type,
+        "total_size": int(total_size),
+        "total_chunks": int(total_chunks),
+        "user_id": int(current_user.id),
+        "conversation_id": int(conversation_id),
+    }
+    if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+        await _delete_attachment_upload_dir(upload_dir)
+        return _json_error("Upload metadata changed during transfer", status_code=400)
+
+    parts: list[bytes] = []
+    for index in range(total_chunks):
+        part_path = upload_dir / f"{index:06d}.part"
+        if not part_path.exists():
+            return _json_error("Upload is incomplete. Please retry the file upload.", status_code=400)
+        part_data = await asyncio.to_thread(part_path.read_bytes)
+        start = index * ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES
+        expected_size = min(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES, max(0, total_size - start))
+        if len(part_data) != expected_size:
+            await _delete_attachment_upload_dir(upload_dir)
+            return _json_error("Upload chunk size mismatch. Please attach the file again.", status_code=400)
+        parts.append(part_data)
+
+    data = b"".join(parts)
+    if len(data) != total_size:
+        await _delete_attachment_upload_dir(upload_dir)
+        return _json_error("Upload size mismatch. Please attach the file again.", status_code=400)
+
+    try:
+        pending = await _create_pending_attachment_from_upload(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            data=data,
+            filename=filename,
+            content_type=normalized_type,
+        )
+    except ValueError as exc:
+        await _delete_attachment_upload_dir(upload_dir)
+        return _json_error(str(exc), status_code=400)
+    except Exception as exc:
+        await _delete_attachment_upload_dir(upload_dir)
+        logger.error("[complete_attachment_upload] Could not create pending attachment: %s", exc)
+        return _json_error("Failed to finalize uploaded attachment", status_code=500)
+
+    await _delete_attachment_upload_dir(upload_dir)
+    return JSONResponse(content=_pending_attachment_upload_payload(pending))
+
+
+@router.post("/api/conversations/{conversation_id}/attachments/discard")
+async def discard_uploaded_attachments(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    attachment_refs: str = Form("[]"),
+):
+    if current_user is None:
+        return _json_error("Not authenticated", status_code=401, redirect="/login")
+    try:
+        refs = _parse_attachment_refs_value(attachment_refs)
+    except ValueError as exc:
+        return _json_error(str(exc), status_code=400)
+    if not refs:
+        return JSONResponse(content={"success": True, "discarded": 0})
+
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.execute(
+            "SELECT user_id FROM CONVERSATIONS WHERE id = ?",
+            (conversation_id,),
+        )
+        row = await cursor.fetchone()
+    if not row or int(row["user_id"]) != int(current_user.id):
+        return _json_error("Conversation not found.", status_code=404)
+
+    discarded = await discard_pending_attachments_for_user(
+        refs,
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        reason="client_discard",
+    )
+    return JSONResponse(content={"success": True, "discarded": discarded})
 
 
 @router.post("/api/conversations/{conversation_id}/messages")
@@ -4424,6 +5006,7 @@ async def save_message(
     pdf_page_start: Optional[int] = Form(None),
     pdf_page_end: Optional[int] = Form(None),
     pdf_retry_token: Optional[str] = Form(None),
+    attachment_refs: Optional[str] = Form(None),
 ):
     """
     FastAPI endpoint that handles HTTP request and delegates to process_save_message.
@@ -4498,6 +5081,11 @@ async def save_message(
     if guard_response is not None:
         return guard_response
 
+    try:
+        parsed_attachment_refs = _parse_attachment_refs_value(attachment_refs)
+    except ValueError as exc:
+        return JSONResponse(content={'success': False, 'message': str(exc)}, status_code=400)
+
     # ===========================================
     # Multi-AI routing (before normal flow)
     # ===========================================
@@ -4544,6 +5132,8 @@ async def save_message(
 
             # Block file attachments in Multi-AI v1
             if file and any(f for f in file if f and f.filename):
+                return JSONResponse(content={"error": "File attachments are not supported in Multi-AI mode"}, status_code=400)
+            if parsed_attachment_refs:
                 return JSONResponse(content={"error": "File attachments are not supported in Multi-AI mode"}, status_code=400)
 
             # Decompress message if needed (same pattern as existing code)
@@ -4607,6 +5197,11 @@ async def save_message(
                 content={'success': False, 'message': f'Maximum {MAX_FILES_PER_MESSAGE} files per message.'},
                 status_code=400
             )
+        if len(valid_files) + len(parsed_attachment_refs) > MAX_FILES_PER_MESSAGE:
+            return JSONResponse(
+                content={'success': False, 'message': f'Maximum {MAX_FILES_PER_MESSAGE} files per message.'},
+                status_code=400
+            )
 
         files = []
         for f in valid_files:
@@ -4652,6 +5247,7 @@ async def save_message(
         pdf_page_start=pdf_page_start,
         pdf_page_end=pdf_page_end,
         pdf_retry_token=pdf_retry_token,
+        attachment_refs=parsed_attachment_refs,
     )
 
 
@@ -4970,7 +5566,10 @@ async def build_full_prompt_context(
 
             # --- Final assembly with global system prompt blocks ---
             blocks = await get_effective_blocks()
-            variables = {"user_level": user_level}
+            variables = {
+                "user_level": user_level,
+                "current_datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            }
             full_prompt = assemble_system_prompt(
                 blocks, variables, prompt_base, watchdog_enabled, watchdog_hint_block
             )
@@ -5343,7 +5942,10 @@ async def get_ai_response(
 
                     # Assemble full_prompt via global system prompt blocks
                     blocks = await get_effective_blocks()
-                    variables = {"user_level": user_level}
+                    variables = {
+                        "user_level": user_level,
+                        "current_datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    }
                     full_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                                         watchdog_enabled, watchdog_hint_block)
                     atagia_decision = await _resolve_atagia_context(
@@ -9352,6 +9954,20 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                                 role="assistant",
                             )
 
+                    try:
+                        await record_chat_turn(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            user_message=user_message,
+                            assistant_message=content,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[wellbeing] Failed to record chat turn for conversation_id=%s",
+                            conversation_id,
+                            exc_info=True,
+                        )
+
                     return user_message_id, message_id
 
                 except sqlite3.OperationalError as exc:
@@ -9652,6 +10268,20 @@ async def save_multi_ai_to_db(
                                 user_id=user_id,
                                 role="assistant",
                             )
+
+                    try:
+                        await record_chat_turn(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            user_message=user_message,
+                            assistant_message=combined_json,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[wellbeing] Failed to record multi-ai chat turn for conversation_id=%s",
+                            conversation_id,
+                            exc_info=True,
+                        )
 
                     return (user_msg_id, bot_msg_id)
 
@@ -10185,7 +10815,10 @@ async def process_multi_ai_message(
             user_level = "customer"
         # Assemble system_prompt via global system prompt blocks
         blocks = await get_effective_blocks()
-        variables = {"user_level": user_level}
+        variables = {
+            "user_level": user_level,
+            "current_datetime_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
         system_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                               watchdog_enabled, watchdog_hint_block)
 

@@ -175,9 +175,11 @@
                 <a href="/home" class="btn-home-sidebar" title="Home">
                     <i class="fas fa-home"></i>
                 </a>
+                {% if marketplace.discovery_enabled|default(false) %}
                 <a href="/explore" class="btn-home-sidebar" title="Explore">
                     <i class="fas fa-compass"></i>
                 </a>
+                {% endif %}
                 {% if is_admin or is_user %}
                 <a href="/dashboard" class="btn-home-sidebar" title="Dashboard">
                     <i class="fas fa-tachometer-alt"></i>
@@ -249,7 +251,7 @@
 					  {% for machine, models in llm_models|groupby('machine') if machine in priority_machines %}
 					  <optgroup label="{{ machine }}">
 						{% for model in models %}
-						<option value="{{ model['id'] }}" {% if current_model_type == model['id'] %}selected{% endif %}>
+						<option value="{{ model['id'] }}" {% if new_chat_model_type == model['id'] %}selected{% endif %}>
 						  {{ model.display_name | default(model.model, true) }}
 						</option>
 						{% endfor %}
@@ -258,7 +260,7 @@
 					  {% for machine, models in llm_models|groupby('machine') if machine not in priority_machines %}
 					  <optgroup label="{{ machine }}">
 						{% for model in models %}
-						<option value="{{ model['id'] }}" {% if current_model_type == model['id'] %}selected{% endif %}>
+						<option value="{{ model['id'] }}" {% if new_chat_model_type == model['id'] %}selected{% endif %}>
 						  {{ model.display_name | default(model.model, true) }}
 						</option>
 						{% endfor %}
@@ -750,6 +752,7 @@
     <script src="{{ get_static_url('/static/js/nekoglass-controls.js') }}"></script>
     <script src="/sdk/elevenlabs-client.js"></script>
     <script src="{{ get_static_url('/static/js/chat/voice-call.js') }}"></script>
+    <script src="{{ get_static_url('/static/js/chat/wellbeing.js') }}"></script>
     <script>
         // CDN Configuration for JavaScript
         window.CDN_CONFIG = {
@@ -764,6 +767,7 @@
         Config.can_send_files = {{ can_send_files | tojson }};
         Config.max_api_image_size_mb = {{ max_api_image_size_mb | tojson }};
         Config.max_chat_image_dimension = {{ max_chat_image_dimension | tojson }};
+        Config.attachment_upload_chunk_size_bytes = {{ attachment_upload_chunk_size_bytes | tojson }};
         var user_id = {{ user_id }};
         var username = "{{ username }}";
         var userProfilePicture = "{{ user_profile_picture | default('', true) }}";

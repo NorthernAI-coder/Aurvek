@@ -19,6 +19,7 @@ AtagiaRole = Literal["user", "assistant"]
 
 RECENT_ERROR_LIMIT = 20
 DEFAULT_BATCH_SIZE = 100
+TRANSIENT_INGEST_RETRY_DELAYS_SECONDS = (1.0, 3.0, 7.0)
 
 _sync_lock = asyncio.Lock()
 _sync_task: asyncio.Task | None = None
@@ -234,18 +235,24 @@ async def _sync_one_message(
         await _update_sync_state(conversation_id, message_id)
         return
 
+    ingest_kwargs = {
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "role": role,
+        "text": text,
+        "occurred_at": row["date"],
+        "prompt_id": prompt_id,
+        "message_id": message_id,
+        "source_seq": message_id,
+        "ingest_origin": "backfill",
+        "confirmation_strategy": "admin_review_only",
+    }
+
     try:
-        ok = await bridge.ingest_message(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            role=role,
-            text=text,
-            occurred_at=row["date"],
-            prompt_id=prompt_id,
+        ok = await _ingest_with_transient_retries(
+            bridge,
             message_id=message_id,
-            source_seq=message_id,
-            ingest_origin="backfill",
-            confirmation_strategy="admin_review_only",
+            ingest_kwargs=ingest_kwargs,
         )
     except Exception as exc:
         ok = False
@@ -279,6 +286,75 @@ async def _sync_one_message(
     summary.linked_messages += 1 if changed else 0
     summary.skipped_messages += 0 if changed else 1
     await _update_sync_state(conversation_id, message_id)
+
+
+async def _ingest_with_transient_retries(
+    bridge: Any,
+    *,
+    message_id: int,
+    ingest_kwargs: dict[str, Any],
+) -> bool:
+    for attempt_index, delay_seconds in enumerate(
+        (*TRANSIENT_INGEST_RETRY_DELAYS_SECONDS, None)
+    ):
+        try:
+            ok = await bridge.ingest_message(**ingest_kwargs)
+        except Exception as exc:
+            if delay_seconds is None or not _is_transient_sqlite_lock_error(exc):
+                raise
+            logger.info(
+                "Atagia history sync hit a transient SQLite lock for message %s; "
+                "retrying in %.1fs (attempt %s).",
+                message_id,
+                delay_seconds,
+                attempt_index + 2,
+            )
+            await _sleep_before_retry(delay_seconds)
+            continue
+
+        if ok:
+            return True
+
+        if delay_seconds is None or not _is_transient_sqlite_lock_error(
+            getattr(bridge, "last_error", None)
+        ):
+            return False
+
+        logger.info(
+            "Atagia history sync hit a transient SQLite lock for message %s; "
+            "retrying in %.1fs (attempt %s).",
+            message_id,
+            delay_seconds,
+            attempt_index + 2,
+        )
+        await _sleep_before_retry(delay_seconds)
+
+    return False
+
+
+async def _sleep_before_retry(delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+
+
+def _is_transient_sqlite_lock_error(value: Any) -> bool:
+    if isinstance(value, Exception) and database.is_lock_error(value):
+        return True
+
+    if isinstance(value, dict):
+        error_type = str(value.get("error_type") or "")
+        message = str(value.get("message") or "").lower()
+    else:
+        error_type = str(getattr(value, "error_type", "") or "")
+        message = str(
+            getattr(value, "message", None)
+            or getattr(value, "details", None)
+            or value
+            or ""
+        ).lower()
+
+    if error_type and error_type != "OperationalError":
+        return False
+    return any(token in message for token in database.LOCK_ERROR_MESSAGES)
 
 
 async def _ensure_schema(conn: aiosqlite.Connection) -> None:

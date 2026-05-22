@@ -16,10 +16,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Literal
 
-# Project paths
-PROJECT_ROOT = Path(__file__).parent.absolute()
+# Project paths. This module lives under marketplace/landing/.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOBS_DIR = PROJECT_ROOT / "data" / "jobs" / "landing"
-LANDING_WIZARD_PATH = PROJECT_ROOT / "landing_wizard.py"
+LANDING_WIZARD_PATH = PROJECT_ROOT / "marketplace" / "landing" / "wizard.py"
 
 # Ensure jobs directory exists
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -381,11 +381,11 @@ sys.path.insert(0, r"{project_root}")
 TARGET = "{target}"
 
 if TARGET == "welcome":
-    from landing_wizard import generate_welcome as generate_fn, modify_welcome as modify_fn, list_prompt_files
+    from marketplace.landing.wizard import generate_welcome as generate_fn, modify_welcome as modify_fn, list_prompt_files
 else:
-    from landing_wizard import generate_landing as generate_fn, modify_landing as modify_fn, list_prompt_files
+    from marketplace.landing.wizard import generate_landing as generate_fn, modify_landing as modify_fn, list_prompt_files
 
-from landing_jobs import update_job
+from marketplace.landing.jobs import update_job
 
 def run_job(task_id, job_type, prompt_dir, params):
     """Execute the wizard job and update status."""

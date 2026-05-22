@@ -22,7 +22,8 @@ from auth import get_current_user
 from models import User
 from database import get_db_connection
 from common import deduct_balance, get_balance, record_daily_usage
-from middleware.custom_domains import invalidate_domain_cache
+from marketplace.middleware.custom_domains import invalidate_domain_cache
+from marketplace.config import require_creator_tools_enabled, require_public_landings_enabled
 
 # Configuration from environment
 CNAME_TARGET = os.getenv("CLOUDFLARE_CNAME_TARGET", "")
@@ -49,6 +50,11 @@ router = APIRouter(prefix="/api/domains", tags=["Custom Domains"])
 
 # Router for admin endpoints
 admin_router = APIRouter(prefix="/admin/domains", tags=["Admin - Custom Domains"])
+
+
+def _require_custom_domain_tools_enabled() -> None:
+    require_creator_tools_enabled()
+    require_public_landings_enabled()
 
 
 # =============================================================================
@@ -233,6 +239,8 @@ async def get_slots_info(
     Get domain slots information for the current user.
     Returns purchased, used, and available slots.
     """
+    _require_custom_domain_tools_enabled()
+
     if not current_user:
         raise HTTPException(401, "Authentication required")
 
@@ -253,6 +261,8 @@ async def purchase_slot(
     Purchase a domain slot.
     Deducts SLOT_PRICE from user balance and adds 1 slot.
     """
+    _require_custom_domain_tools_enabled()
+
     if not current_user:
         raise HTTPException(401, "Authentication required")
 
@@ -624,6 +634,8 @@ async def list_all_domains(
     current_user: User = Depends(get_current_user)
 ):
     """List all configured custom domains (admin only)."""
+    _require_custom_domain_tools_enabled()
+
     if not current_user or not await current_user.is_admin:
         raise HTTPException(403, "Admin only")
 
@@ -664,6 +676,8 @@ async def admin_activate_free(
     current_user: User = Depends(get_current_user)
 ):
     """Activate a domain for free (admin only, bypasses payment)."""
+    _require_custom_domain_tools_enabled()
+
     if not current_user or not await current_user.is_admin:
         raise HTTPException(403, "Admin only")
 
@@ -710,6 +724,8 @@ async def admin_deactivate(
     current_user: User = Depends(get_current_user)
 ):
     """Deactivate a domain (admin only)."""
+    _require_custom_domain_tools_enabled()
+
     if not current_user or not await current_user.is_admin:
         raise HTTPException(403, "Admin only")
 
@@ -747,6 +763,8 @@ async def admin_deactivate(
 
 async def _verify_prompt_access(prompt_id: int, user: User):
     """Verify user has edit access to prompt."""
+    _require_custom_domain_tools_enabled()
+
     is_admin = await user.is_admin
     if is_admin:
         return

@@ -178,6 +178,7 @@ async def _create_conversation_core(
     prompt_id: int | None = None,
     folder_id: int | None = None,
     strict_prompt_access: bool = False,
+    llm_id: int | None = None,
 ) -> int:
     """Create a conversation using user defaults and return its ID."""
     await cursor.execute(
@@ -188,7 +189,7 @@ async def _create_conversation_core(
     if not user_details:
         raise ValueError("User details not found")
 
-    llm_id = user_details[0]
+    effective_llm_id = llm_id if llm_id is not None else user_details[0]
     effective_prompt_id = prompt_id if prompt_id is not None else user_details[1]
 
     if effective_prompt_id:
@@ -216,13 +217,13 @@ async def _create_conversation_core(
         prompt_row = await cursor.fetchone()
         if prompt_row:
             if prompt_row[0]:
-                llm_id = prompt_row[0]
-                logger.info(f"[FORCED_LLM] Prompt {effective_prompt_id} has forced_llm_id={llm_id}, overriding user default")
+                effective_llm_id = prompt_row[0]
+                logger.info(f"[FORCED_LLM] Prompt {effective_prompt_id} has forced_llm_id={effective_llm_id}, overriding user default")
             elif prompt_row[1]:
                 allowed_ids = orjson.loads(prompt_row[1])
-                if allowed_ids and int(llm_id) not in allowed_ids:
-                    llm_id = allowed_ids[0]
-                    logger.info(f"[ALLOWED_LLMS] User default LLM not in allowed list for prompt {effective_prompt_id}, using first allowed: {llm_id}")
+                if allowed_ids and int(effective_llm_id) not in allowed_ids:
+                    effective_llm_id = allowed_ids[0]
+                    logger.info(f"[ALLOWED_LLMS] Selected LLM not in allowed list for prompt {effective_prompt_id}, using first allowed: {effective_llm_id}")
 
             if prompt_row[2]:
                 await cursor.execute(
@@ -251,12 +252,22 @@ async def _create_conversation_core(
                     default_extension_id = ext[0]
 
     await cursor.execute(
+        "SELECT COALESCE(enabled, 1) FROM LLM WHERE id = ?",
+        (effective_llm_id,),
+    )
+    llm_row = await cursor.fetchone()
+    if not llm_row:
+        raise ValueError("LLM model not found")
+    if not bool(llm_row[0]) and int(effective_llm_id) != int(user_details[0] or 0):
+        raise ValueError("This LLM model is disabled")
+
+    await cursor.execute(
         """
         INSERT INTO CONVERSATIONS (user_id, llm_id, role_id, folder_id, active_extension_id, last_activity)
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         RETURNING id
         """,
-        (user_id, llm_id, effective_prompt_id, folder_id, default_extension_id),
+        (user_id, effective_llm_id, effective_prompt_id, folder_id, default_extension_id),
     )
     row = await cursor.fetchone()
     return row[0]

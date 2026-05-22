@@ -109,7 +109,7 @@ from ultra_admin import (
     generate_elevation_code, verify_elevation_code, is_elevated,
     revoke_elevation, get_elevation_ttl, get_active_lock_owner, ELEVATION_TTL
 )
-from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, sanitize_name, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags, get_auth_base_url, get_request_base_url
+from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, sanitize_name, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags, get_auth_base_url, get_request_base_url, _get_marketplace_template_flags
 from common import SCRIPT_DIR, DATA_DIR, CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL, CLOUDFLARE_ZONE_ID, CLOUDFLARE_API_URL, CLOUDFLARE_FOR_IMAGES, CLOUDFLARE_SECRET, CLOUDFLARE_IMAGE_SUBDOMAIN, CLOUDFLARE_BASE_URL, generate_cloudflare_signature, generate_signed_url_cloudflare, CLOUDFLARE_DOMAIN, CLOUDFLARE_CNAME_TARGET
 from common import ALGORITHM, MAX_TOKENS, MAX_MESSAGE_SIZE, MAX_IMAGE_UPLOAD_SIZE, MAX_IMAGE_PIXELS, PERPLEXITY_API_KEY, elevenlabs_key, openai_key, claude_key, gemini_key, openrouter_key, service_sid, twilio_sid, twilio_auth, twilio_messaging_service_sid, decode_jwt_cached, verify_token_expiration, validate_twilio_media_url, AVATAR_TOKEN_EXPIRE_HOURS, MEDIA_TOKEN_EXPIRE_HOURS
 from common import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
@@ -166,7 +166,7 @@ from llm_catalog import (
 )
 
 from ai_calls import router as ai_router
-from ai_calls import save_message, process_save_message, get_ai_response, handle_function_call, call_o1_api, call_gpt_api, call_claude_api, call_gemini_api, stop_signals, get_last_message_id, conversation_write_lock
+from ai_calls import save_message, process_save_message, get_ai_response, handle_function_call, call_o1_api, call_gpt_api, call_claude_api, call_gemini_api, stop_signals, get_last_message_id, conversation_write_lock, ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES, prune_stale_attachment_upload_chunks
 from external_chat_management import (
     _create_conversation_core,
     can_use_platform,
@@ -178,25 +178,41 @@ from external_chat_management import (
 )
 
 from prompts import router as prompts_router
-from packs_router import router as packs_router
-from packs_router import warmup_pack_landing_cache, _pack_landing_cache_stats, _pack_landing_cache, PACK_LANDING_CACHE_SIZE
+from marketplace.routes.packs import router as packs_router
+from marketplace.routes.packs import warmup_pack_landing_cache, _pack_landing_cache_stats, _pack_landing_cache, PACK_LANDING_CACHE_SIZE
 from prompts import get_user_accessible_prompts as get_user_role_accessible_prompts, get_user_owned_prompts, create_prompt_directory, get_prompt_info, get_prompt_path, get_pack_path, get_prompt_templates_dir, get_prompt_components_dir, can_manage_prompt, get_manageable_prompts
 from prompts import get_user_directory, get_user_prompts_directory, list_prompts, process_prompt_image_upload, create_prompt, create_prompt_post, edit_prompt, update_prompt, delete_prompt, delete_prompt_image
 from prompts import get_landing_registration_config, set_landing_registration_config, get_prompt_owner_id, DEFAULT_LANDING_REGISTRATION_CONFIG
 from prompts import can_user_access_prompt
-from landing_wizard import is_claude_available, list_prompt_files, delete_all_landing_files, list_welcome_files, delete_all_welcome_files
-from landing_jobs import start_job, get_job, get_active_job_for_prompt, get_active_welcome_job_for_prompt, cleanup_old_jobs
+from marketplace.landing.wizard import is_claude_available, list_prompt_files, delete_all_landing_files, list_welcome_files, delete_all_welcome_files
+from marketplace.landing.jobs import start_job, get_job, get_active_job_for_prompt, get_active_welcome_job_for_prompt, cleanup_old_jobs
 from security_guard_llm import check_security, is_security_guard_enabled
-from ranking import maybe_trigger_recalculation, get_ranking_config, start_scheduled_ranking_loop, recalculate_ranking_scores, invalidate_ranking_config_cache
+from ranking import get_ranking_config, start_scheduled_ranking_loop, recalculate_ranking_scores
 from rate_limiter import (
     check_rate_limits, check_failure_limit, record_failure,
     RateLimitConfig as RLC, get_client_ip, rate_limiter
 )
 from captcha_service import verify_captcha, get_captcha_config, set_captcha_enabled, get_captcha_runtime_status
 from cloudflare_geo import get_all_geo_data, validate_country_codes, validate_continent_codes, geo_sync_engine, CloudflareGeoClient, get_countries_for_continent
+from wellbeing_service import (
+    ensure_wellbeing_schema,
+    get_admin_events as get_wellbeing_admin_events,
+    get_admin_live_sessions,
+    get_admin_overview as get_wellbeing_admin_overview,
+    get_active_pause,
+    get_status as get_wellbeing_status,
+    get_user_preferences as get_wellbeing_user_preferences,
+    get_user_wellbeing_summary,
+    get_wellbeing_config,
+    record_activity as record_wellbeing_activity,
+    record_user_action as record_wellbeing_user_action,
+    reset_user_session as reset_wellbeing_user_session,
+    update_user_preferences as update_wellbeing_user_preferences,
+    update_wellbeing_config,
+)
 
 # Custom domains for landing pages
-from middleware.custom_domains import CustomDomainMiddleware, set_primary_domains
+from marketplace.middleware.custom_domains import CustomDomainMiddleware, set_primary_domains
 # Security middleware for scanner/bot protection
 from middleware.security import (
     SecurityMiddleware,
@@ -210,11 +226,32 @@ from middleware.security import (
 )
 # Security config for forbidden names
 from security_config import is_forbidden_username
-from routes.custom_domains import router as custom_domains_router, admin_router as custom_domains_admin_router
+from marketplace.routes.admin import create_router as create_marketplace_admin_router
+from marketplace.routes.analytics import router as marketplace_analytics_router
+from marketplace.routes.checkout import router as marketplace_checkout_router
+from marketplace.routes.custom_domains import router as custom_domains_router, admin_router as custom_domains_admin_router
+from marketplace.routes.discovery import router as marketplace_discovery_router
+from marketplace.routes.geo import router as marketplace_geo_router
+from marketplace.routes.marketing import router as marketplace_marketing_router
+from marketplace.routes.ranking import router as marketplace_ranking_router
+from marketplace.routes.storefronts import router as marketplace_storefronts_router
+from marketplace.payments.webhooks import record_disabled_marketplace_checkout
+from marketplace.services.acquisition import apply_landing_config_to_user
+from marketplace.config import (
+    get_marketplace_flags,
+    marketplace_checkout_enabled,
+    marketplace_discovery_enabled,
+    marketplace_public_landings_enabled,
+    require_checkout_enabled,
+    require_creator_tools_enabled,
+    require_public_landings_enabled,
+)
+from marketplace.runtime import load_marketplace_config_from_db, refresh_marketplace_config_loop
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _marketplace_refresh_task = None
     # Check which system to use based on configuration
     use_redis = os.getenv('REDIS_IMG_TOKEN', '0') == '1'
     
@@ -252,7 +289,11 @@ async def lifespan(app: FastAPI):
     await ensure_wal_mode()
     await ensure_file_storage_schema()
     await discard_stale_pending_attachments()
+    pruned_upload_dirs = await prune_stale_attachment_upload_chunks()
+    if pruned_upload_dirs:
+        logger.info("Pruned %d stale attachment upload chunk directorie(s)", pruned_upload_dirs)
     await ensure_conversation_privacy_schema()
+    await ensure_wellbeing_schema()
 
     # Keep additive schema migrations available for existing installs. The
     # standalone runner still handles deployment migrations; this guard keeps
@@ -307,11 +348,17 @@ async def lifespan(app: FastAPI):
         """)
         await conn.commit()
 
-    # Warm up landing page cache with most visited prompts
-    await warmup_landing_cache()
+    await load_marketplace_config_from_db()
+    _marketplace_refresh_task = asyncio.create_task(refresh_marketplace_config_loop())
 
-    # Warm up pack landing page cache with most visited packs
-    await warmup_pack_landing_cache()
+    if marketplace_public_landings_enabled():
+        # Warm up landing page cache with most visited prompts
+        await warmup_landing_cache()
+
+        # Warm up pack landing page cache with most visited packs
+        await warmup_pack_landing_cache()
+    else:
+        logger.info("Marketplace public landing cache warmup skipped (public landings disabled)")
 
     # Ranking system startup — elect ONE worker as leader via atomic file lock.
     # Without this, all N workers redundantly recalculate rankings at startup
@@ -349,6 +396,13 @@ async def lifespan(app: FastAPI):
     await check_gransabio_worker_config(dual_mode_active=_dual_mode_active)
 
     yield
+
+    if _marketplace_refresh_task:
+        _marketplace_refresh_task.cancel()
+        try:
+            await _marketplace_refresh_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown IP Reputation system
     from middleware.ip_reputation import reputation_manager
@@ -401,6 +455,13 @@ app.include_router(prompts_router)
 app.include_router(packs_router)
 app.include_router(custom_domains_router)
 app.include_router(custom_domains_admin_router)
+app.include_router(marketplace_discovery_router)
+app.include_router(marketplace_marketing_router)
+app.include_router(marketplace_storefronts_router)
+app.include_router(marketplace_analytics_router)
+app.include_router(marketplace_ranking_router)
+app.include_router(marketplace_checkout_router)
+app.include_router(marketplace_geo_router)
 
 # CORS configuration - use ALLOWED_ORIGINS env var (comma-separated) or default to same-origin only
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
@@ -643,7 +704,8 @@ def handle_error(request: Request, error_code: int, error_message: str):
     context = {
         "request": request,
         "error_code": error_code,
-        "error_message": error_message
+        "error_message": error_message,
+        "marketplace": _get_marketplace_template_flags(),
     }
     return templates.TemplateResponse("error.html", context, status_code=error_code)
 
@@ -727,6 +789,9 @@ async def log_admin_action(
     except Exception as e:
         # Don't fail the main operation if audit logging fails
         logger.error(f"[AUDIT] Failed to log admin action: {e}")
+
+
+app.include_router(create_marketplace_admin_router(log_admin_action))
 
 
 async def add_user(username, prompt_id, all_prompts_access, public_prompts_access, llm_id, allow_file_upload, allow_image_generation, balance, phone, role_name, authentication_mode="magic_link_only", initial_password=None, can_change_password=False, email=None, company_id=None, current_user=None, api_key_mode="both_prefer_own", category_access=None, billing_account_id=None, billing_limit=None, billing_limit_action='block', billing_auto_refill_amount=10.0, billing_max_limit=None):
@@ -879,7 +944,7 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
         '''
         params = [user.id, user.id, user.id, user.id, user.id, user.id]
 
-        if public_prompts_access:
+        if public_prompts_access and marketplace_discovery_enabled():
             if category_access is None:
                 query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
             else:
@@ -922,7 +987,7 @@ async def get_user_accessible_prompts(user: User, cursor, all_prompts_access: bo
         '''
         params = [user.id, user.id, user.id, user.id, user.id, user.id]
 
-        if public_prompts_access:
+        if public_prompts_access and marketplace_discovery_enabled():
             if category_access is None:
                 query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
             else:
@@ -959,102 +1024,6 @@ async def can_user_access_pack(user: User, pack_id: int, cursor) -> bool:
     )
     return await cursor.fetchone() is not None
 
-
-async def _apply_landing_config_to_user(conn, config: dict, user_id: int,
-                                         creator_user_id: int = None,
-                                         discount_pct: float = 0,
-                                         creator_share: float = None):
-    """Apply a prompt/pack landing_registration_config to an existing user.
-    Expand-only: never restricts existing permissions or overwrites billing.
-    Does NOT commit -- caller manages the transaction.
-
-    Args:
-        config: Parsed landing_registration_config dict
-        creator_user_id: For billing_mode=user_pays
-        discount_pct: 0-100, scales initial_balance
-        creator_share: If set, clamps initial_balance to this amount (for paid purchases)
-    Returns:
-        initial_balance_cost: The actual balance credited (for creator earnings deduction)
-    """
-    ud_cursor = await conn.execute(
-        """SELECT public_prompts_access, billing_account_id,
-                  allow_file_upload, allow_image_generation
-           FROM USER_DETAILS WHERE user_id = ?""", (user_id,))
-    ud_row = await ud_cursor.fetchone()
-    if not ud_row:
-        return 0
-
-    cur_public, cur_billing, cur_file, cur_imggen = ud_row
-    updates = []
-    params = []
-    initial_balance_cost = 0
-
-    # Initial balance (scaled by discount, optionally clamped to creator_share)
-    ib = float(config.get("initial_balance", 0))
-    if ib > 0:
-        scaled_ib = ib * (1 - discount_pct / 100) if discount_pct > 0 else ib
-        if creator_share is not None and scaled_ib > creator_share:
-            logger.warning(
-                "Landing config: initial_balance %.2f exceeds creator_share %.2f, clamping",
-                scaled_ib, creator_share)
-            scaled_ib = creator_share
-        if scaled_ib > 0:
-            initial_balance_cost = scaled_ib
-            updates.append("balance = balance + ?")
-            params.append(scaled_ib)
-
-    # Billing mode: user_pays (full setup including limits)
-    if config.get("billing_mode") == "user_pays" and creator_user_id:
-        creator_balance = await get_balance(creator_user_id)
-        if creator_balance <= 0:
-            logger.warning(
-                "Landing config: creator %s has zero balance, skipping billing setup for user %s",
-                creator_user_id, user_id)
-        elif cur_billing is not None:
-            logger.warning(
-                "Landing config: billing_account_id not overwritten for user %s (already %s)",
-                user_id, cur_billing)
-        else:
-            updates.append("billing_account_id = ?")
-            params.append(creator_user_id)
-            bl = config.get("billing_limit")
-            if bl is not None:
-                updates.append("billing_limit = ?")
-                params.append(float(bl))
-            bla = config.get("billing_limit_action", "block")
-            updates.append("billing_limit_action = ?")
-            params.append(bla)
-            bara = config.get("billing_auto_refill_amount", 10.0)
-            updates.append("billing_auto_refill_amount = ?")
-            params.append(float(bara))
-            bml = config.get("billing_max_limit")
-            if bml is not None:
-                updates.append("billing_max_limit = ?")
-                params.append(float(bml))
-
-    # Expand-only boolean permissions (never restrict, log downgrade attempts)
-    if "public_prompts_access" in config:
-        if config["public_prompts_access"] and not cur_public:
-            updates.append("public_prompts_access = 1")
-        elif not config["public_prompts_access"] and cur_public:
-            logger.warning("Landing config: skipping public_prompts_access downgrade for user %s", user_id)
-    if "allow_file_upload" in config:
-        if config["allow_file_upload"] and not cur_file:
-            updates.append("allow_file_upload = 1")
-        elif not config["allow_file_upload"] and cur_file:
-            logger.warning("Landing config: skipping allow_file_upload downgrade for user %s", user_id)
-    if "allow_image_generation" in config:
-        if config["allow_image_generation"] and not cur_imggen:
-            updates.append("allow_image_generation = 1")
-        elif not config["allow_image_generation"] and cur_imggen:
-            logger.warning("Landing config: skipping allow_image_generation downgrade for user %s", user_id)
-
-    if updates:
-        params.append(user_id)
-        sql = f"UPDATE USER_DETAILS SET {', '.join(updates)} WHERE user_id = ?"
-        await conn.execute(sql, params)
-
-    return initial_balance_cost
 
 
 @app.get("/health")
@@ -1846,6 +1815,8 @@ async def delete_all_user_credentials(request: Request, current_user: User = Dep
 @app.get("/api/user/curation-settings")
 async def get_curation_settings(request: Request, current_user: User = Depends(get_current_user)):
     """Get curation markup settings for the current user."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -1886,6 +1857,8 @@ async def update_curation_settings(
     current_user: User = Depends(get_current_user)
 ):
     """Update curation markup settings for the current user."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -1925,6 +1898,8 @@ async def update_curation_settings(
 @app.get("/curation-settings", response_class=HTMLResponse)
 async def curation_settings_page(request: Request, current_user: User = Depends(get_current_user)):
     """Page for users to configure their curation markup settings."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
@@ -2260,198 +2235,6 @@ async def update_my_branding(request: Request, current_user: User = Depends(get_
     return JSONResponse(content={"success": True, "message": "Branding settings saved successfully"})
 
 
-# ============================================================================
-# Phase 04: Creator Profile & Storefront Management
-# ============================================================================
-
-@app.get("/my-storefront")
-async def my_storefront_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the creator storefront management page."""
-    if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-    if not await current_user.is_user and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only users can manage storefronts")
-
-    context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("my_storefront.html", context)
-
-
-@app.get("/api/creator-profile")
-async def get_creator_profile_api(request: Request, current_user: User = Depends(get_current_user)):
-    """Get current user's creator profile data."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_user and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only users can access creator profiles"}, status_code=403)
-
-    from storefront_service import get_own_creator_profile
-    profile = await get_own_creator_profile(current_user.id)
-
-    return JSONResponse(content={"profile": profile})
-
-
-@app.put("/api/creator-profile")
-async def update_creator_profile(request: Request, current_user: User = Depends(get_current_user)):
-    """Update current user's creator profile. UPSERT pattern."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_user and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Only users can update creator profiles"}, status_code=403)
-
-    data = await request.json()
-
-    from storefront_service import (
-        generate_unique_creator_slug, validate_social_links
-    )
-
-    display_name = data.get('display_name', '').strip()
-    if not display_name or len(display_name) > 200:
-        return JSONResponse(content={"error": "Display name is required (max 200 characters)"}, status_code=400)
-
-    bio = data.get('bio', '').strip()
-    if len(bio) > 2000:
-        return JSONResponse(content={"error": "Bio must be 2000 characters or less"}, status_code=400)
-
-    # Slug handling
-    slug = data.get('slug', '').strip().lower()
-    if slug:
-        # Validate slug format (only a-z, 0-9, hyphens)
-        if not re.match(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$', slug) and len(slug) > 1:
-            return JSONResponse(content={"error": "Invalid slug format. Use only lowercase letters, numbers, and hyphens."}, status_code=400)
-        if len(slug) > 64:
-            return JSONResponse(content={"error": "Slug must be 64 characters or less"}, status_code=400)
-
-        from security_config import is_forbidden_prompt_name
-        if is_forbidden_prompt_name(slug):
-            return JSONResponse(content={"error": "This slug is reserved"}, status_code=400)
-
-        # Check uniqueness (excluding current user)
-        async with get_db_connection(readonly=True) as conn:
-            cursor = await conn.execute(
-                "SELECT 1 FROM CREATOR_PROFILES WHERE slug = ? AND user_id != ?",
-                (slug, current_user.id)
-            )
-            if await cursor.fetchone():
-                return JSONResponse(content={"error": "This slug is already taken"}, status_code=409)
-    else:
-        slug = await generate_unique_creator_slug(display_name, exclude_user_id=current_user.id)
-
-    # Social links validation
-    social_links_raw = data.get('social_links', {})
-    social_links = validate_social_links(social_links_raw) if social_links_raw else {}
-
-    social_links_json = orjson.dumps(social_links).decode() if social_links else None
-
-    is_public = bool(data.get('is_public', False))
-
-    # UPSERT
-    async with get_db_connection() as conn:
-        cursor = await conn.execute(
-            "SELECT 1 FROM CREATOR_PROFILES WHERE user_id = ?", (current_user.id,)
-        )
-        exists = await cursor.fetchone()
-
-        if exists:
-            await conn.execute("""
-                UPDATE CREATOR_PROFILES
-                SET display_name = ?, slug = ?, bio = ?, social_links = ?,
-                    is_public = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-            """, (display_name, slug, bio or None, social_links_json, is_public, current_user.id))
-        else:
-            await conn.execute("""
-                INSERT INTO CREATOR_PROFILES (user_id, slug, display_name, bio, social_links, is_public)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (current_user.id, slug, display_name, bio or None, social_links_json, is_public))
-
-        await conn.commit()
-
-    return JSONResponse(content={"success": True, "slug": slug})
-
-
-@app.post("/api/creator-profile/avatar")
-async def upload_creator_avatar(
-    file: UploadFile,
-    request: Request,
-    current_user: User = Depends(get_current_user),
-):
-    """Upload creator profile avatar. Saves 4 sizes like profile pictures."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    if not await current_user.is_user and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only users can upload creator avatars")
-
-    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
-    profile_dir = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "profile")
-
-    if not os.path.exists(profile_dir):
-        os.makedirs(profile_dir)
-
-    content = await file.read()
-
-    if len(content) > MAX_IMAGE_UPLOAD_SIZE:
-        raise HTTPException(status_code=400, detail=f"Image too large. Maximum size is {MAX_IMAGE_UPLOAD_SIZE // (1024*1024)}MB")
-
-    try:
-        image = PilImage.open(io.BytesIO(content))
-        width, height = image.size
-        if width * height > MAX_IMAGE_PIXELS:
-            raise HTTPException(status_code=400, detail=f"Image dimensions too large. Maximum is {MAX_IMAGE_PIXELS:,} pixels")
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Invalid image file")
-
-    sizes = [32, 64, 128, 'fullsize']
-    ext = 'webp'
-    suffix = "_creator"
-
-    base_url = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/profile/{user_hash}{suffix}"
-
-    try:
-        for size in sizes:
-            if size == 'fullsize':
-                resized = image
-                filename = f"{user_hash}{suffix}_fullsize.{ext}"
-            else:
-                resized = resize_image(image, size)
-                filename = f"{user_hash}{suffix}_{size}.{ext}"
-
-            file_path = os.path.join(profile_dir, filename)
-            resized.save(file_path, ext.upper())
-    except Exception as e:
-        logger.error(f"Error saving creator avatar: {e}")
-        raise HTTPException(status_code=500, detail="Error processing image")
-
-    # Update CREATOR_PROFILES.avatar_url
-    async with get_db_connection() as conn:
-        await conn.execute(
-            "UPDATE CREATOR_PROFILES SET avatar_url = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-            (base_url, current_user.id)
-        )
-        await conn.commit()
-
-    return JSONResponse(content={"avatar_url": base_url})
-
-
-@app.get("/api/creator-profile/check-slug")
-async def check_creator_slug(slug: str, current_user: User = Depends(get_current_user)):
-    """Check if a slug is available."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    from security_config import is_forbidden_prompt_name
-    if is_forbidden_prompt_name(slug):
-        return JSONResponse(content={"available": False, "reason": "reserved"})
-
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.execute(
-            "SELECT 1 FROM CREATOR_PROFILES WHERE slug = ? AND user_id != ?",
-            (slug, current_user.id)
-        )
-        taken = await cursor.fetchone()
-
-    return JSONResponse(content={"available": not taken})
-
-
 @app.get("/api/user/init")
 async def get_user_init(request: Request, current_user: User = Depends(get_current_user), context_type: str = None, context_id: str = None):
     """
@@ -2637,634 +2420,6 @@ async def get_user_theme_config(request: Request, current_user: User = Depends(g
     })
 
 
-# ============================================================================
-# Phase 5: Landing Page Analytics Endpoints
-# ============================================================================
-
-@app.get("/user/landing-analytics")
-async def user_landing_analytics_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the landing page analytics dashboard."""
-    if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-
-    if not await current_user.is_user and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only users can access analytics")
-
-    context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("user_landing_analytics.html", context)
-
-
-@app.post("/api/analytics/track-visit")
-async def track_landing_visit(request: Request):
-    """
-    Track a landing page visit. Called from landing page JavaScript.
-    This is a public endpoint (no auth required) for anonymous tracking.
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
-
-    prompt_id = data.get('prompt_id')
-    pack_id = data.get('pack_id')
-    if prompt_id and pack_id:
-        return JSONResponse(content={"error": "Cannot track both prompt_id and pack_id in a single visit"}, status_code=400)
-    if not prompt_id and not pack_id:
-        return JSONResponse(content={"error": "prompt_id or pack_id required"}, status_code=400)
-
-    # Generate anonymous visitor ID from cookies or create new
-    visitor_id = request.cookies.get('_aurvek_visitor')
-    if not visitor_id:
-        visitor_id = secrets.token_urlsafe(16)
-
-    # Hash IP for privacy
-    client_ip = get_client_ip(request)
-    ip_hash = hashlib.sha256((client_ip + os.getenv('PEPPER', 'aurvek')).encode()).hexdigest()[:16]
-
-    page_path = data.get('page_path', '/')
-    referrer = data.get('referrer', '')
-    user_agent = request.headers.get('user-agent', '')[:500]  # Truncate for safety
-
-    async with get_db_connection() as conn:
-        cursor = await conn.cursor()
-
-        # Validate pack_id if provided
-        if pack_id:
-            await cursor.execute(
-                "SELECT 1 FROM PACKS WHERE id = ? AND status = 'published' AND is_public = 1",
-                (pack_id,),
-            )
-            if not await cursor.fetchone():
-                pack_id = None
-
-        # Validate prompt_id if provided
-        if prompt_id:
-            await cursor.execute(
-                "SELECT 1 FROM PROMPTS WHERE id = ? AND public = 1",
-                (prompt_id,),
-            )
-            if not await cursor.fetchone():
-                prompt_id = None
-
-        # At least one valid entity required
-        if not pack_id and not prompt_id:
-            return JSONResponse(content={"error": "Invalid or missing entity"}, status_code=400)
-
-        # Check if this visitor already visited recently (within 30 minutes)
-        # De-duplicate by pack_id or prompt_id depending on which is provided
-        if pack_id:
-            await cursor.execute('''
-                SELECT id FROM LANDING_PAGE_ANALYTICS
-                WHERE pack_id = ? AND visitor_id = ?
-                AND visit_timestamp > datetime('now', '-30 minutes')
-            ''', (pack_id, visitor_id))
-        else:
-            await cursor.execute('''
-                SELECT id FROM LANDING_PAGE_ANALYTICS
-                WHERE prompt_id = ? AND visitor_id = ?
-                AND visit_timestamp > datetime('now', '-30 minutes')
-            ''', (prompt_id, visitor_id))
-
-        if await cursor.fetchone():
-            # Already tracked recently, skip to avoid duplicate counts
-            response = JSONResponse(content={"status": "already_tracked"})
-        else:
-            # Insert new visit record
-            await cursor.execute('''
-                INSERT INTO LANDING_PAGE_ANALYTICS
-                (prompt_id, pack_id, visitor_id, page_path, referrer, user_agent, ip_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (prompt_id, pack_id, visitor_id, page_path, referrer, user_agent, ip_hash))
-            await conn.commit()
-
-            response = JSONResponse(content={"status": "tracked"})
-
-    # Set visitor cookie if not already set (1 year expiry)
-    if not request.cookies.get('_aurvek_visitor'):
-        response.set_cookie(
-            key='_aurvek_visitor',
-            value=visitor_id,
-            max_age=365 * 24 * 60 * 60,
-            httponly=True,
-            samesite='lax',
-            secure=SECURE_COOKIES
-        )
-
-    return response
-
-
-@app.post("/api/analytics/mark-conversion")
-async def mark_analytics_conversion(request: Request):
-    """
-    Mark a visitor as converted (registered). Called after successful registration.
-    """
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
-
-    prompt_id = data.get('prompt_id')
-    pack_id = data.get('pack_id')
-    user_id = data.get('user_id')
-    visitor_id = request.cookies.get('_aurvek_visitor')
-
-    if (not prompt_id and not pack_id) or not visitor_id:
-        return JSONResponse(content={"status": "skip", "reason": "missing_data"})
-
-    async with get_db_connection() as conn:
-        cursor = await conn.cursor()
-
-        # Update the most recent visit from this visitor to mark as converted
-        if pack_id:
-            await cursor.execute('''
-                UPDATE LANDING_PAGE_ANALYTICS
-                SET converted = 1, converted_user_id = ?
-                WHERE pack_id = ? AND visitor_id = ?
-                AND converted = 0
-                ORDER BY visit_timestamp DESC
-                LIMIT 1
-            ''', (user_id, pack_id, visitor_id))
-        else:
-            await cursor.execute('''
-                UPDATE LANDING_PAGE_ANALYTICS
-                SET converted = 1, converted_user_id = ?
-                WHERE prompt_id = ? AND visitor_id = ?
-                AND converted = 0
-                ORDER BY visit_timestamp DESC
-                LIMIT 1
-            ''', (user_id, prompt_id, visitor_id))
-
-        await conn.commit()
-
-    return JSONResponse(content={"status": "marked"})
-
-
-@app.get("/api/user/landing-analytics")
-async def get_landing_analytics(request: Request, current_user: User = Depends(get_current_user)):
-    """Get landing page analytics summary for all prompts owned by the user."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_user and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Access denied"}, status_code=403)
-
-    from datetime import datetime, timedelta
-
-    today = datetime.now().strftime('%Y-%m-%d')
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.cursor()
-
-        # Get all prompts owned by this user with analytics
-        # Use direct timestamp comparisons instead of date() to leverage indexes
-        await cursor.execute('''
-            SELECT
-                p.id,
-                p.name,
-                COUNT(DISTINCT CASE WHEN a.visit_timestamp >= ? AND a.visit_timestamp < ? THEN a.visitor_id END) as today_visitors,
-                COUNT(DISTINCT CASE WHEN a.visit_timestamp >= ? THEN a.visitor_id END) as week_visitors,
-                COUNT(DISTINCT CASE WHEN a.visit_timestamp >= ? THEN a.visitor_id END) as month_visitors,
-                COUNT(CASE WHEN a.visit_timestamp >= ? THEN 1 END) as month_visits,
-                COUNT(CASE WHEN a.converted = 1 AND a.visit_timestamp >= ? THEN 1 END) as month_conversions
-            FROM PROMPTS p
-            LEFT JOIN LANDING_PAGE_ANALYTICS a ON p.id = a.prompt_id
-            WHERE p.created_by_user_id = ?
-            GROUP BY p.id, p.name
-            ORDER BY month_visitors DESC
-        ''', (today, tomorrow, week_ago, month_ago, month_ago, month_ago, current_user.id))
-
-        prompts_data = []
-        total_today = 0
-        total_week = 0
-        total_month = 0
-        total_conversions = 0
-
-        for row in await cursor.fetchall():
-            prompt_id, name, today_v, week_v, month_v, month_visits, month_conv = row
-            conversion_rate = (month_conv / month_visits * 100) if month_visits > 0 else 0
-
-            prompts_data.append({
-                'id': prompt_id,
-                'name': name,
-                'today_visitors': today_v or 0,
-                'week_visitors': week_v or 0,
-                'month_visitors': month_v or 0,
-                'month_visits': month_visits or 0,
-                'conversions': month_conv or 0,
-                'conversion_rate': round(conversion_rate, 1)
-            })
-
-            total_today += today_v or 0
-            total_week += week_v or 0
-            total_month += month_v or 0
-            total_conversions += month_conv or 0
-
-        # Get top referrers for all prompts (last 30 days)
-        await cursor.execute('''
-            SELECT a.referrer, COUNT(*) as count
-            FROM LANDING_PAGE_ANALYTICS a
-            JOIN PROMPTS p ON a.prompt_id = p.id
-            WHERE p.created_by_user_id = ?
-            AND a.visit_timestamp >= ?
-            AND a.referrer IS NOT NULL AND a.referrer != ''
-            GROUP BY a.referrer
-            ORDER BY count DESC
-            LIMIT 10
-        ''', (current_user.id, month_ago))
-
-        top_referrers = []
-        for row in await cursor.fetchall():
-            referrer = row[0]
-            # Truncate long referrers
-            if len(referrer) > 50:
-                referrer = referrer[:47] + '...'
-            top_referrers.append({
-                'referrer': referrer,
-                'count': row[1]
-            })
-
-        # Get daily visits for chart (last 14 days)
-        await cursor.execute('''
-            SELECT substr(a.visit_timestamp, 1, 10) as day, COUNT(*) as visits
-            FROM LANDING_PAGE_ANALYTICS a
-            JOIN PROMPTS p ON a.prompt_id = p.id
-            WHERE p.created_by_user_id = ?
-            AND a.visit_timestamp >= date('now', '-14 days')
-            GROUP BY day
-            ORDER BY day ASC
-        ''', (current_user.id,))
-
-        daily_visits = []
-        for row in await cursor.fetchall():
-            daily_visits.append({
-                'date': row[0],
-                'visits': row[1]
-            })
-
-    return JSONResponse(content={
-        'summary': {
-            'today_visitors': total_today,
-            'week_visitors': total_week,
-            'month_visitors': total_month,
-            'total_conversions': total_conversions
-        },
-        'prompts': prompts_data,
-        'top_referrers': top_referrers,
-        'daily_visits': daily_visits
-    })
-
-
-@app.get("/api/user/landing-analytics/{prompt_id}")
-async def get_prompt_analytics(prompt_id: int, request: Request, current_user: User = Depends(get_current_user)):
-    """Get detailed analytics for a specific prompt."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_user and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Access denied"}, status_code=403)
-
-    from datetime import datetime, timedelta
-
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.cursor()
-
-        # Verify prompt belongs to this user
-        await cursor.execute('SELECT name FROM PROMPTS WHERE id = ? AND created_by_user_id = ?', (prompt_id, current_user.id))
-        prompt = await cursor.fetchone()
-        if not prompt:
-            return JSONResponse(content={"error": "Prompt not found"}, status_code=404)
-
-        prompt_name = prompt[0]
-        month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-
-        # Get visits and conversions
-        await cursor.execute('''
-            SELECT
-                COUNT(*) as total_visits,
-                COUNT(DISTINCT visitor_id) as unique_visitors,
-                COUNT(CASE WHEN converted = 1 THEN 1 END) as conversions
-            FROM LANDING_PAGE_ANALYTICS
-            WHERE prompt_id = ? AND date(visit_timestamp) >= ?
-        ''', (prompt_id, month_ago))
-
-        stats = await cursor.fetchone()
-
-        # Get daily breakdown
-        await cursor.execute('''
-            SELECT
-                date(visit_timestamp) as day,
-                COUNT(*) as visits,
-                COUNT(DISTINCT visitor_id) as visitors,
-                COUNT(CASE WHEN converted = 1 THEN 1 END) as conversions
-            FROM LANDING_PAGE_ANALYTICS
-            WHERE prompt_id = ? AND date(visit_timestamp) >= date('now', '-30 days')
-            GROUP BY day
-            ORDER BY day DESC
-        ''', (prompt_id,))
-
-        daily_data = []
-        for row in await cursor.fetchall():
-            daily_data.append({
-                'date': row[0],
-                'visits': row[1],
-                'visitors': row[2],
-                'conversions': row[3]
-            })
-
-        # Get referrers for this prompt
-        await cursor.execute('''
-            SELECT referrer, COUNT(*) as count
-            FROM LANDING_PAGE_ANALYTICS
-            WHERE prompt_id = ? AND date(visit_timestamp) >= ?
-            AND referrer IS NOT NULL AND referrer != ''
-            GROUP BY referrer
-            ORDER BY count DESC
-            LIMIT 15
-        ''', (prompt_id, month_ago))
-
-        referrers = []
-        for row in await cursor.fetchall():
-            referrers.append({'referrer': row[0], 'count': row[1]})
-
-    conversion_rate = (stats[2] / stats[0] * 100) if stats[0] > 0 else 0
-
-    return JSONResponse(content={
-        'prompt_id': prompt_id,
-        'prompt_name': prompt_name,
-        'stats': {
-            'total_visits': stats[0] or 0,
-            'unique_visitors': stats[1] or 0,
-            'conversions': stats[2] or 0,
-            'conversion_rate': round(conversion_rate, 1)
-        },
-        'daily': daily_data,
-        'referrers': referrers
-    })
-
-
-@app.get("/api/user/pack-landing-analytics")
-async def get_pack_landing_analytics(current_user: User = Depends(get_current_user)):
-    """Get landing page analytics for packs owned by the current user."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin and not await current_user.is_user:
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    async with get_db_connection(readonly=True) as conn:
-        # Get pack analytics grouped by pack
-        # Admin sees all packs, user sees only their own
-        if await current_user.is_admin:
-            packs_query = """
-                SELECT p.id, p.name,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-1 day') THEN a.visitor_id END) as today_visitors,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-7 days') THEN a.visitor_id END) as week_visitors,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-30 days') THEN a.visitor_id END) as month_visitors,
-                    COUNT(CASE WHEN a.visit_timestamp > datetime('now', '-30 days') THEN a.id END) as month_visits,
-                    SUM(CASE WHEN a.converted = 1 AND a.visit_timestamp > datetime('now', '-30 days') THEN 1 ELSE 0 END) as conversions
-                FROM PACKS p
-                LEFT JOIN LANDING_PAGE_ANALYTICS a ON a.pack_id = p.id
-                GROUP BY p.id, p.name
-                ORDER BY month_visitors DESC
-            """
-            rows = await conn.execute(packs_query)
-        else:
-            packs_query = """
-                SELECT p.id, p.name,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-1 day') THEN a.visitor_id END) as today_visitors,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-7 days') THEN a.visitor_id END) as week_visitors,
-                    COUNT(DISTINCT CASE WHEN a.visit_timestamp > datetime('now', '-30 days') THEN a.visitor_id END) as month_visitors,
-                    COUNT(CASE WHEN a.visit_timestamp > datetime('now', '-30 days') THEN a.id END) as month_visits,
-                    SUM(CASE WHEN a.converted = 1 AND a.visit_timestamp > datetime('now', '-30 days') THEN 1 ELSE 0 END) as conversions
-                FROM PACKS p
-                LEFT JOIN LANDING_PAGE_ANALYTICS a ON a.pack_id = p.id
-                WHERE p.created_by_user_id = ?
-                GROUP BY p.id, p.name
-                ORDER BY month_visitors DESC
-            """
-            rows = await conn.execute(packs_query, (current_user.id,))
-
-        packs = []
-        for row in await rows.fetchall():
-            month_visits = row[5] or 0
-            conversions = row[6] or 0
-            packs.append({
-                "id": row[0],
-                "name": row[1],
-                "today_visitors": row[2] or 0,
-                "week_visitors": row[3] or 0,
-                "month_visitors": row[4] or 0,
-                "month_visits": month_visits,
-                "conversions": conversions,
-                "conversion_rate": round((conversions / month_visits * 100) if month_visits > 0 else 0, 1)
-            })
-
-        return {"packs": packs}
-
-
-@app.get("/api/user/pack-landing-analytics/{pack_id}")
-async def get_pack_analytics_detail(pack_id: int, current_user: User = Depends(get_current_user)):
-    """Get detailed analytics for a specific pack landing page."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin and not await current_user.is_user:
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    async with get_db_connection(readonly=True) as conn:
-        # Verify ownership (unless admin)
-        if not await current_user.is_admin:
-            pack = await conn.execute("SELECT created_by_user_id FROM PACKS WHERE id = ?", (pack_id,))
-            pack_row = await pack.fetchone()
-            if not pack_row or pack_row[0] != current_user.id:
-                raise HTTPException(status_code=404, detail="Pack not found")
-
-        # Get pack name
-        pack_info = await conn.execute("SELECT name FROM PACKS WHERE id = ?", (pack_id,))
-        pack_name_row = await pack_info.fetchone()
-        if not pack_name_row:
-            raise HTTPException(status_code=404, detail="Pack not found")
-
-        # Stats
-        stats_query = """
-            SELECT
-                COUNT(id) as total_visits,
-                COUNT(DISTINCT visitor_id) as unique_visitors,
-                SUM(CASE WHEN converted = 1 THEN 1 ELSE 0 END) as conversions
-            FROM LANDING_PAGE_ANALYTICS WHERE pack_id = ?
-        """
-        stats = await (await conn.execute(stats_query, (pack_id,))).fetchone()
-
-        total = stats[0] or 0
-        unique = stats[1] or 0
-        convs = stats[2] or 0
-
-        # Daily breakdown (last 30 days)
-        daily_query = """
-            SELECT DATE(visit_timestamp) as date,
-                COUNT(id) as visits,
-                COUNT(DISTINCT visitor_id) as visitors,
-                SUM(CASE WHEN converted = 1 THEN 1 ELSE 0 END) as conversions
-            FROM LANDING_PAGE_ANALYTICS
-            WHERE pack_id = ? AND visit_timestamp > datetime('now', '-30 days')
-            GROUP BY DATE(visit_timestamp)
-            ORDER BY date DESC
-        """
-        daily_rows = await (await conn.execute(daily_query, (pack_id,))).fetchall()
-
-        # Top referrers
-        ref_query = """
-            SELECT COALESCE(referrer, 'direct') as referrer, COUNT(*) as count
-            FROM LANDING_PAGE_ANALYTICS
-            WHERE pack_id = ? AND visit_timestamp > datetime('now', '-30 days')
-            GROUP BY referrer
-            ORDER BY count DESC
-            LIMIT 10
-        """
-        ref_rows = await (await conn.execute(ref_query, (pack_id,))).fetchall()
-
-        return {
-            "pack_id": pack_id,
-            "pack_name": pack_name_row[0],
-            "stats": {
-                "total_visits": total,
-                "unique_visitors": unique,
-                "conversions": convs,
-                "conversion_rate": round((convs / total * 100) if total > 0 else 0, 1)
-            },
-            "daily": [
-                {"date": r[0], "visits": r[1], "visitors": r[2], "conversions": r[3]}
-                for r in daily_rows
-            ],
-            "referrers": [
-                {"referrer": r[0], "count": r[1]}
-                for r in ref_rows
-            ]
-        }
-
-
-# ============================================================================
-# Creator Earnings Endpoints
-# ============================================================================
-
-@app.get("/my-earnings")
-async def my_earnings_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the creator earnings dashboard page."""
-    if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-
-    # Only users and admins can access (they are the ones who can create prompts)
-    if not await current_user.is_user and not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Only creators can access earnings dashboard")
-
-    context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("creator_earnings.html", context)
-
-
-@app.get("/api/my-earnings")
-async def get_my_earnings(request: Request, current_user: User = Depends(get_current_user)):
-    """Get creator earnings data for the dashboard."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_user and not await current_user.is_admin:
-        return JSONResponse(content={"error": "Access denied"}, status_code=403)
-
-    async with get_db_connection(readonly=True) as conn:
-        # Get pending earnings from USER_DETAILS
-        cursor = await conn.execute(
-            "SELECT pending_earnings FROM USER_DETAILS WHERE user_id = ?",
-            (current_user.id,)
-        )
-        result = await cursor.fetchone()
-        pending_earnings = float(result[0] or 0) if result else 0
-
-        # Get total earned (all time) from CREATOR_EARNINGS
-        cursor = await conn.execute(
-            "SELECT COALESCE(SUM(net_earnings), 0) FROM CREATOR_EARNINGS WHERE creator_id = ?",
-            (current_user.id,)
-        )
-        result = await cursor.fetchone()
-        total_earned = float(result[0] or 0)
-
-        # Get this month's earnings
-        cursor = await conn.execute(
-            """SELECT COALESCE(SUM(net_earnings), 0) FROM CREATOR_EARNINGS
-               WHERE creator_id = ? AND created_at >= date('now', 'start of month')""",
-            (current_user.id,)
-        )
-        result = await cursor.fetchone()
-        this_month = float(result[0] or 0)
-
-        # Get earnings by prompt
-        cursor = await conn.execute(
-            """SELECT
-                ce.prompt_id,
-                p.name as prompt_name,
-                p.is_paid,
-                COUNT(DISTINCT ce.consumer_id) as unique_users,
-                SUM(ce.tokens_consumed) as total_tokens,
-                SUM(ce.net_earnings) as total_earned,
-                p.purchase_price
-               FROM CREATOR_EARNINGS ce
-               JOIN PROMPTS p ON ce.prompt_id = p.id
-               WHERE ce.creator_id = ?
-               GROUP BY ce.prompt_id
-               ORDER BY total_earned DESC
-               LIMIT 20""",
-            (current_user.id,)
-        )
-        rows = await cursor.fetchall()
-        by_prompt = [
-            {
-                "prompt_id": row[0],
-                "prompt_name": row[1],
-                "is_paid": bool(row[2]),
-                "unique_users": row[3],
-                "total_tokens": row[4],
-                "total_earned": float(row[5] or 0),
-                "purchase_price": float(row[6]) if row[6] is not None else None
-            }
-            for row in rows
-        ]
-
-        # Get recent transactions
-        cursor = await conn.execute(
-            """SELECT
-                ce.id,
-                p.name as prompt_name,
-                ce.net_earnings,
-                ce.created_at
-               FROM CREATOR_EARNINGS ce
-               JOIN PROMPTS p ON ce.prompt_id = p.id
-               WHERE ce.creator_id = ?
-               ORDER BY ce.created_at DESC
-               LIMIT 10""",
-            (current_user.id,)
-        )
-        rows = await cursor.fetchall()
-        recent = [
-            {
-                "id": row[0],
-                "prompt_name": row[1],
-                "net_earnings": float(row[2] or 0),
-                "created_at": row[3]
-            }
-            for row in rows
-        ]
-
-    return JSONResponse(content={
-        "total_earned": total_earned,
-        "this_month": this_month,
-        "pending_earnings": pending_earnings,
-        "by_prompt": by_prompt,
-        "recent": recent
-    })
-
-
 # =============================================================================
 # User Usage Dashboard
 # =============================================================================
@@ -3365,12 +2520,205 @@ async def get_my_usage_data(
             for row in rows
         ]
 
+    wellbeing_days = days if days and days > 0 else 3650
+    wellbeing = await get_user_wellbeing_summary(current_user.id, wellbeing_days)
+
     return JSONResponse(content={
         "balance": balance,
         "stats": stats,
         "by_type": by_type,
-        "daily": daily
+        "daily": daily,
+        "wellbeing": wellbeing
     })
+
+
+# =============================================================================
+# Session Health / Break Reminders
+# =============================================================================
+
+@app.get("/admin/session-health", response_class=HTMLResponse)
+async def get_admin_session_health_page(request: Request, current_user: User = Depends(get_current_user)):
+    """Admin page for continuous-session health and break reminder policy."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    context = await get_template_context(request, current_user)
+    return templates.TemplateResponse("admin_session_health.html", context)
+
+
+@app.get("/api/admin/session-health/config")
+async def get_admin_session_health_config(current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Admin access required"}, status_code=403)
+    return JSONResponse(content={"config": await get_wellbeing_config()})
+
+
+@app.put("/api/admin/session-health/config")
+async def update_admin_session_health_config(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Admin access required"}, status_code=403)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    config = await update_wellbeing_config(payload)
+    return JSONResponse(content={"success": True, "config": config})
+
+
+@app.get("/api/admin/session-health/live")
+async def get_admin_session_health_live(
+    limit: int = 50,
+    search: str = None,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Admin access required"}, status_code=403)
+    return JSONResponse(content={
+        "overview": await get_wellbeing_admin_overview(),
+        "sessions": await get_admin_live_sessions(limit=limit, search=search),
+    })
+
+
+@app.get("/api/admin/session-health/events")
+async def get_admin_session_health_events(
+    page: int = 1,
+    per_page: int = 50,
+    event_type: str = None,
+    severity: str = None,
+    search: str = None,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(content={"error": "Admin access required"}, status_code=403)
+    return JSONResponse(content=await get_wellbeing_admin_events(
+        page=page,
+        per_page=per_page,
+        event_type=event_type,
+        severity=severity,
+        search=search,
+    ))
+
+
+@app.get("/api/wellbeing/status")
+async def api_wellbeing_status(
+    conversation_id: int = None,
+    client_active: bool = True,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    return JSONResponse(content=await get_wellbeing_status(
+        current_user.id,
+        conversation_id,
+        allow_reminder=client_active,
+    ))
+
+
+@app.post("/api/wellbeing/activity")
+async def api_wellbeing_activity(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    conversation_id = payload.get("conversation_id")
+    if conversation_id in ("", None):
+        conversation_id = None
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+    status_payload = await record_wellbeing_activity(
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        activity_type=str(payload.get("activity_type") or "chat_presence"),
+        metadata=metadata,
+    )
+    return JSONResponse(content=status_payload)
+
+
+@app.post("/api/wellbeing/events")
+async def api_wellbeing_events(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    action = str(payload.get("action") or payload.get("event_type") or "")
+    try:
+        status_payload = await record_wellbeing_user_action(
+            user_id=current_user.id,
+            action=action,
+            session_id=payload.get("session_id"),
+            conversation_id=payload.get("conversation_id"),
+            severity=payload.get("severity"),
+            threshold_key=payload.get("threshold_key"),
+            threshold_value=payload.get("threshold_value"),
+            observed_value=payload.get("observed_value"),
+            snooze_minutes=payload.get("snooze_minutes"),
+            pause_minutes=payload.get("pause_minutes"),
+            metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+        )
+    except ValueError as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=400)
+    return JSONResponse(content=status_payload)
+
+
+@app.get("/api/wellbeing/preferences")
+async def api_get_wellbeing_preferences(current_user: User = Depends(get_current_user)):
+    if current_user is None:
+        return unauthenticated_response()
+    return JSONResponse(content={
+        "preferences": await get_wellbeing_user_preferences(current_user.id),
+        "status": await get_wellbeing_status(current_user.id),
+    })
+
+
+@app.put("/api/wellbeing/preferences")
+async def api_update_wellbeing_preferences(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    preferences = await update_wellbeing_user_preferences(current_user.id, payload)
+    return JSONResponse(content={
+        "success": True,
+        "preferences": preferences,
+        "status": await get_wellbeing_status(current_user.id),
+    })
+
+
+@app.post("/api/wellbeing/reset-session")
+async def api_reset_wellbeing_session(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+    payload = await request.json()
+    conversation_id = payload.get("conversation_id") if isinstance(payload, dict) else None
+    try:
+        return JSONResponse(content=await reset_wellbeing_user_session(current_user.id, conversation_id))
+    except ValueError as exc:
+        return JSONResponse(content={"error": str(exc)}, status_code=409)
 
 
 # =============================================================================
@@ -3618,6 +2966,8 @@ async def get_cache_stats(current_user: User = Depends(get_current_user)):
 @app.post("/api/creator/request-payout")
 async def request_creator_payout(request: Request, current_user: User = Depends(get_current_user)):
     """Request a payout of pending earnings via Stripe Connect Transfer."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -3725,6 +3075,8 @@ async def stripe_connect_onboard(request: Request, current_user: User = Depends(
     """
     Create or retrieve Stripe Connect Express account and return onboarding URL.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -3804,6 +3156,8 @@ async def stripe_connect_return(request: Request, current_user: User = Depends(g
     Callback when user completes Stripe Connect onboarding.
     Verifies account status and redirects to creator earnings page.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return RedirectResponse(url="/login?next=/creator-earnings", status_code=302)
 
@@ -3863,6 +3217,8 @@ async def stripe_connect_refresh(request: Request):
     Redirect when onboarding link expires.
     User should restart the onboarding process.
     """
+    require_creator_tools_enabled()
+
     return RedirectResponse(url="/creator-earnings?warning=link_expired", status_code=302)
 
 
@@ -3871,6 +3227,8 @@ async def stripe_connect_status(request: Request, current_user: User = Depends(g
     """
     Get current Stripe Connect account status.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -4840,7 +4198,7 @@ async def check_session(request: Request, current_user: User = Depends(get_curre
 # Sitemap XML — public, no auth required
 # =============================================================================
 
-_sitemap_cache: dict = {"xml": None, "generated_at": 0.0}
+_sitemap_cache: dict = {"xml": None, "generated_at": 0.0, "flags": None}
 _SITEMAP_CACHE_TTL = 3600  # 1 hour in seconds
 
 
@@ -4858,9 +4216,20 @@ async def sitemap_xml():
     Cached in-memory for 1 hour to avoid DB load on every crawl.
     """
     now = time.time()
+    flags = get_marketplace_flags()
+    flag_key = (
+        flags.public_landings_enabled,
+        flags.discovery_enabled,
+        flags.storefronts_enabled,
+        flags.creator_tools_enabled,
+    )
 
     # Return cached version if still fresh
-    if _sitemap_cache["xml"] and (now - _sitemap_cache["generated_at"]) < _SITEMAP_CACHE_TTL:
+    if (
+        _sitemap_cache["xml"]
+        and _sitemap_cache["flags"] == flag_key
+        and (now - _sitemap_cache["generated_at"]) < _SITEMAP_CACHE_TTL
+    ):
         return Response(
             content=_sitemap_cache["xml"],
             media_type="application/xml",
@@ -4877,87 +4246,90 @@ async def sitemap_xml():
 
     # -- Static marketing pages --
     urls.append({"loc": f"{base_url}/", "priority": "1.0", "changefreq": "daily"})
-    urls.append({"loc": f"{base_url}/for-creators", "priority": "0.8", "changefreq": "monthly"})
     urls.append({"loc": f"{base_url}/for-teams", "priority": "0.8", "changefreq": "monthly"})
-    urls.append({"loc": f"{base_url}/for-agencies", "priority": "0.8", "changefreq": "monthly"})
-    urls.append({"loc": f"{base_url}/explore-landing.html", "priority": "0.8", "changefreq": "weekly"})
+    if flags.creator_tools_enabled:
+        urls.append({"loc": f"{base_url}/for-creators", "priority": "0.8", "changefreq": "monthly"})
+        urls.append({"loc": f"{base_url}/for-agencies", "priority": "0.8", "changefreq": "monthly"})
+    if flags.discovery_enabled:
+        urls.append({"loc": f"{base_url}/explore-landing.html", "priority": "0.8", "changefreq": "weekly"})
 
     try:
         async with get_db_connection(readonly=True) as conn:
 
-            # -- Public prompt landing pages --
-            # public=1, is_unlisted=0, has_landing_page=1, public_id IS NOT NULL
-            cursor = await conn.execute("""
-                SELECT p.public_id, p.name, p.created_at,
-                       CASE WHEN pcd.custom_domain IS NOT NULL AND pcd.is_active = 1
-                            AND pcd.verification_status = 1
-                            THEN pcd.custom_domain ELSE NULL END AS custom_domain
-                FROM PROMPTS p
-                LEFT JOIN PROMPT_CUSTOM_DOMAINS pcd ON p.id = pcd.prompt_id
-                WHERE p.public = 1
-                  AND p.is_unlisted = 0
-                  AND p.has_landing_page = 1
-                  AND p.public_id IS NOT NULL
-            """)
-            prompt_rows = await cursor.fetchall()
+            if flags.public_landings_enabled:
+                # -- Public prompt landing pages --
+                # public=1, is_unlisted=0, has_landing_page=1, public_id IS NOT NULL
+                cursor = await conn.execute("""
+                    SELECT p.public_id, p.name, p.created_at,
+                           CASE WHEN pcd.custom_domain IS NOT NULL AND pcd.is_active = 1
+                                AND pcd.verification_status = 1
+                                THEN pcd.custom_domain ELSE NULL END AS custom_domain
+                    FROM PROMPTS p
+                    LEFT JOIN PROMPT_CUSTOM_DOMAINS pcd ON p.id = pcd.prompt_id
+                    WHERE p.public = 1
+                      AND p.is_unlisted = 0
+                      AND p.has_landing_page = 1
+                      AND p.public_id IS NOT NULL
+                """)
+                prompt_rows = await cursor.fetchall()
 
-            for row in prompt_rows:
-                public_id = row[0]
-                name = row[1]
-                created_at = row[2]
-                custom_domain = row[3]
+                for row in prompt_rows:
+                    public_id = row[0]
+                    name = row[1]
+                    created_at = row[2]
 
-                slug = slugify(name) if name else ""
+                    slug = slugify(name) if name else ""
 
-                # Always use the main domain for the sitemap.
-                # Custom domains should have their own sitemaps or be
-                # configured separately in Google Search Console.
-                loc = f"{base_url}/p/{public_id}/{slug}/"
+                    # Always use the main domain for the sitemap.
+                    # Custom domains should have their own sitemaps or be
+                    # configured separately in Google Search Console.
+                    loc = f"{base_url}/p/{public_id}/{slug}/"
 
-                entry = {"loc": loc, "priority": "0.7", "changefreq": "weekly"}
-                if created_at:
-                    entry["lastmod"] = str(created_at)[:10]  # YYYY-MM-DD
-                urls.append(entry)
+                    entry = {"loc": loc, "priority": "0.7", "changefreq": "weekly"}
+                    if created_at:
+                        entry["lastmod"] = str(created_at)[:10]  # YYYY-MM-DD
+                    urls.append(entry)
 
-            # -- Public published packs with landing pages --
-            cursor = await conn.execute("""
-                SELECT public_id, slug, updated_at
-                FROM PACKS
-                WHERE status = 'published'
-                  AND is_public = 1
-                  AND public_id IS NOT NULL
-                  AND has_custom_landing = 1
-            """)
-            pack_rows = await cursor.fetchall()
+                # -- Public published packs with landing pages --
+                cursor = await conn.execute("""
+                    SELECT public_id, slug, updated_at
+                    FROM PACKS
+                    WHERE status = 'published'
+                      AND is_public = 1
+                      AND public_id IS NOT NULL
+                      AND has_custom_landing = 1
+                """)
+                pack_rows = await cursor.fetchall()
 
-            for row in pack_rows:
-                pack_public_id = row[0]
-                pack_slug = row[1]
-                pack_updated_at = row[2]
+                for row in pack_rows:
+                    pack_public_id = row[0]
+                    pack_slug = row[1]
+                    pack_updated_at = row[2]
 
-                loc = f"{base_url}/pack/{pack_public_id}/{pack_slug}/"
-                entry = {"loc": loc, "priority": "0.6", "changefreq": "weekly"}
-                if pack_updated_at:
-                    entry["lastmod"] = str(pack_updated_at)[:10]
-                urls.append(entry)
+                    loc = f"{base_url}/pack/{pack_public_id}/{pack_slug}/"
+                    entry = {"loc": loc, "priority": "0.6", "changefreq": "weekly"}
+                    if pack_updated_at:
+                        entry["lastmod"] = str(pack_updated_at)[:10]
+                    urls.append(entry)
 
-            # -- Public creator storefronts --
-            cursor = await conn.execute("""
-                SELECT slug, updated_at
-                FROM CREATOR_PROFILES
-                WHERE is_public = 1
-            """)
-            storefront_rows = await cursor.fetchall()
+            if flags.storefronts_enabled:
+                # -- Public creator storefronts --
+                cursor = await conn.execute("""
+                    SELECT slug, updated_at
+                    FROM CREATOR_PROFILES
+                    WHERE is_public = 1
+                """)
+                storefront_rows = await cursor.fetchall()
 
-            for row in storefront_rows:
-                store_slug = row[0]
-                store_updated_at = row[1]
+                for row in storefront_rows:
+                    store_slug = row[0]
+                    store_updated_at = row[1]
 
-                loc = f"{base_url}/store/{store_slug}"
-                entry = {"loc": loc, "priority": "0.6", "changefreq": "weekly"}
-                if store_updated_at:
-                    entry["lastmod"] = str(store_updated_at)[:10]
-                urls.append(entry)
+                    loc = f"{base_url}/store/{store_slug}"
+                    entry = {"loc": loc, "priority": "0.6", "changefreq": "weekly"}
+                    if store_updated_at:
+                        entry["lastmod"] = str(store_updated_at)[:10]
+                    urls.append(entry)
 
     except Exception as e:
         logger.error(f"Sitemap generation DB error: {e}")
@@ -4988,6 +4360,7 @@ async def sitemap_xml():
     # Cache it
     _sitemap_cache["xml"] = xml_content
     _sitemap_cache["generated_at"] = now
+    _sitemap_cache["flags"] = flag_key
 
     return Response(
         content=xml_content,
@@ -4997,6 +4370,7 @@ async def sitemap_xml():
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/index.html", response_class=HTMLResponse)
 async def home(request: Request, current_user: User = Depends(get_current_user)):
     # Handle custom domain landing pages
     if getattr(request.state, 'custom_domain', False):
@@ -5044,6 +4418,9 @@ async def home(request: Request, current_user: User = Depends(get_current_user))
         return _landing_404_response()
 
     if current_user is None:
+        if not get_marketplace_flags().enabled:
+            return RedirectResponse(url="/login", status_code=302)
+
         # Fallback: serve static landing if request reaches FastAPI without auth
         landing_path = Path("data/index.html")
         if landing_path.is_file():
@@ -5058,6 +4435,7 @@ async def dashboard(request: Request, current_user: User = Depends(get_current_u
     if current_user is None:
         return RedirectResponse(url="/login", status_code=302)
 
+    await load_marketplace_config_from_db()
     base_ctx = await get_template_context(request, current_user)
 
     if not base_ctx["is_admin"] and not base_ctx["is_user"]:
@@ -5078,7 +4456,7 @@ async def dashboard(request: Request, current_user: User = Depends(get_current_u
             "prompts": prompts,
             "manageable_prompts": manageable_prompts,
             "user_balance": user_balance,
-            "captcha_enabled": get_captcha_runtime_status()
+            "captcha_enabled": get_captcha_runtime_status(),
         })
         return templates.TemplateResponse("index.html", base_ctx)
 
@@ -5105,7 +4483,10 @@ async def _get_after_login_redirect(user_id: int) -> str:
             if row and row["home_preferences"]:
                 prefs = json.loads(row["home_preferences"])
                 after_login = prefs.get("after_login")
-                if after_login in ("/home", "/chat", "/explore", "/dashboard"):
+                allowed_routes = {"/home", "/chat", "/dashboard"}
+                if marketplace_discovery_enabled():
+                    allowed_routes.add("/explore")
+                if after_login in allowed_routes:
                     return after_login
     except Exception:
         pass
@@ -6847,7 +6228,8 @@ async def chat(request: Request, current_user: Optional[User] = Depends(get_curr
         # Return generic error response
         return templates.TemplateResponse("/error.html", {
             "request": request,
-            "error_message": "An unexpected error occurred. Please try again later."
+            "error_message": "An unexpected error occurred. Please try again later.",
+            "marketplace": _get_marketplace_template_flags(),
         }, status_code=500)
     
 @app.post("/chat")
@@ -7062,6 +6444,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 ud.category_access,
                 ud.allow_image_generation,
                 COALESCE(c.llm_id, ud.llm_id) AS current_model_type,
+                ud.llm_id AS new_chat_model_type,
                 COALESCE(ud.web_search_enabled, 1) AS web_search_enabled,
                 (SELECT COUNT(*)
                  FROM conversations
@@ -7285,6 +6668,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             "is_user": await current_user.is_user,
             "llm_models": llm_models,
             "current_model_type": full_data['current_model_type'],
+            "new_chat_model_type": full_data['new_chat_model_type'],
             "user_balance": full_data['balance'],
             "available_voices": available_voices,
             "can_send_files": current_user.can_send_files,
@@ -7305,6 +6689,8 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             "readonly_mode": READONLY_MODE,
             "max_api_image_size_mb": MAX_API_IMAGE_SIZE_MB,
             "max_chat_image_dimension": MAX_CHAT_IMAGE_DIMENSION,
+            "attachment_upload_chunk_size_bytes": ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES,
+            "marketplace": _get_marketplace_template_flags(),
         }
     # print("Debug - Prompt Description:", full_data['prompt_description'])
     # print("Debug - Context:", {
@@ -8412,6 +7798,16 @@ def _format_atagia_bridge_error(error: Any) -> dict[str, Any] | None:
     return {"message": str(error)}
 
 
+async def _read_atagia_json_body(request: Request) -> dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise ValueError("Invalid JSON payload.") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Invalid JSON payload.")
+    return data
+
+
 @app.get("/admin/atagia")
 async def admin_atagia_get(request: Request, current_user: User = Depends(get_current_user)):
     if current_user is None or not await current_user.is_admin:
@@ -8428,10 +7824,10 @@ async def admin_atagia_post(request: Request, current_user: User = Depends(get_c
     if current_user is None or not await current_user.is_admin:
         return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
     from atagia_bridge import reset_atagia_bridge
-    from atagia_config import save_atagia_admin_config
+    from atagia_config import get_atagia_config, save_atagia_admin_config, template_config
 
-    data = await request.json()
     try:
+        data = await _read_atagia_json_body(request)
         await save_atagia_admin_config(data)
     except ValueError as exc:
         return JSONResponse(content={"success": False, "message": str(exc)}, status_code=400)
@@ -8443,7 +7839,39 @@ async def admin_atagia_post(request: Request, current_user: User = Depends(get_c
         )
 
     await reset_atagia_bridge()
-    return JSONResponse(content={"success": True, "message": "Atagia configuration saved."})
+    return JSONResponse(
+        content={
+            "success": True,
+            "message": "Atagia configuration saved.",
+            "config": template_config(await get_atagia_config()),
+        }
+    )
+
+
+@app.post("/admin/atagia/defaults")
+async def admin_atagia_defaults(request: Request, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"success": False, "message": "Admin only"}, status_code=403)
+    from atagia_bridge import reset_atagia_bridge
+    from atagia_config import reset_atagia_admin_config, template_config
+
+    try:
+        config = await reset_atagia_admin_config()
+    except Exception as exc:
+        logger.error("Failed to reset Atagia configuration: %s", exc, exc_info=True)
+        return JSONResponse(
+            content={"success": False, "message": "Failed to restore Atagia defaults."},
+            status_code=500,
+        )
+
+    await reset_atagia_bridge()
+    return JSONResponse(
+        content={
+            "success": True,
+            "message": "Atagia configuration restored to defaults.",
+            "config": template_config(config),
+        }
+    )
 
 
 @app.post("/admin/atagia/test-connection")
@@ -8453,8 +7881,8 @@ async def admin_atagia_test(request: Request, current_user: User = Depends(get_c
     from atagia_bridge import AtagiaBridge
     from atagia_config import preview_bridge_config_from_admin_payload
 
-    data = await request.json()
     try:
+        data = await _read_atagia_json_body(request)
         config = await preview_bridge_config_from_admin_payload(data)
     except ValueError as exc:
         return JSONResponse(content={"success": False, "message": str(exc)}, status_code=400)
@@ -11013,6 +10441,20 @@ async def get_elevenlabs_config(conversation_id: int, current_user: User = Depen
     if conversation.get("locked"):
         return JSONResponse(content={'error': 'This conversation is locked'}, status_code=403)
 
+    active_pause = await get_active_pause(current_user.id)
+    if active_pause:
+        pause_reason = active_pause.get("reason") or "pause_active"
+        return JSONResponse(
+            content={
+                "error": "wellbeing_pause_active" if pause_reason == "pause_active" else "wellbeing_pause_required",
+                "message": active_pause.get("message") or "A break pause is required before continuing.",
+                "pause_until": active_pause.get("pause_until"),
+                "session_id": active_pause.get("session_id"),
+                "reason": pause_reason,
+            },
+            status_code=429,
+        )
+
     config = await elevenlabs_service.get_configuration(conversation_id, current_user.id, is_admin_user)
     if not config:
         return JSONResponse(content={'error': 'No ElevenLabs agent configured for this conversation'}, status_code=409)
@@ -11041,12 +10483,39 @@ async def start_elevenlabs_session(conversation_id: int, request: Request, curre
     if conversation.get("locked"):
         return JSONResponse(content={'error': 'This conversation is locked'}, status_code=403)
 
+    active_pause = await get_active_pause(current_user.id)
+    if active_pause:
+        pause_reason = active_pause.get("reason") or "pause_active"
+        return JSONResponse(
+            content={
+                "error": "wellbeing_pause_active" if pause_reason == "pause_active" else "wellbeing_pause_required",
+                "message": active_pause.get("message") or "A break pause is required before continuing.",
+                "pause_until": active_pause.get("pause_until"),
+                "session_id": active_pause.get("session_id"),
+                "reason": pause_reason,
+            },
+            status_code=429,
+        )
+
     existing_session = (conversation.get('elevenlabs_session_id') or '').strip()
     existing_status = (conversation.get('elevenlabs_status') or '').lower()
     if existing_session == session_id and existing_status == 'active':
         return JSONResponse(content={'status': 'active', 'session_id': session_id})
 
     await elevenlabs_service.mark_session_started(conversation_id, session_id)
+    try:
+        await record_wellbeing_activity(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            activity_type="voice_call_started",
+            metadata={"elevenlabs_session_id": session_id},
+        )
+    except Exception:
+        logger.warning(
+            "[wellbeing] Failed to record ElevenLabs session start for conversation_id=%s",
+            conversation_id,
+            exc_info=True,
+        )
 
     # Watchdog: consume pending hint via CAS if frontend sent the eval_id token
     watchdog_hint_eval_id = payload.get('watchdog_hint_eval_id')
@@ -11453,6 +10922,7 @@ class BranchConversationRequest(BaseModel):
 class NewConversationRequest(BaseModel):
     prompt_id: Optional[int] = None
     folder_id: Optional[int] = None
+    llm_id: Optional[int] = None
     incognito: bool = False
 @app.post("/api/conversations/new")
 async def start_new_conversation(
@@ -11483,6 +10953,7 @@ async def start_new_conversation(
                 cursor,
                 current_user,
                 prompt_id=request.prompt_id,
+                llm_id=request.llm_id,
                 folder_id=None if request.incognito else request.folder_id,
                 strict_prompt_access=True,
             )
@@ -14021,9 +13492,30 @@ async def stripe_webhook(request: Request):
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         metadata = session.get('metadata', {})
+        product_checkout_type = metadata.get('type')
+
+        if product_checkout_type in {"pack_purchase", "prompt_purchase"} and not marketplace_checkout_enabled():
+            record_status = await record_disabled_marketplace_checkout(
+                session,
+                metadata,
+                product_checkout_type,
+            )
+            logger.warning(
+                "Marketplace product checkout not fulfilled because checkout is disabled: session=%s type=%s record_status=%s",
+                session.get("id"),
+                product_checkout_type,
+                record_status,
+            )
+            return JSONResponse(
+                content={
+                    "status": "refund_required",
+                    "reason": "marketplace_checkout_disabled",
+                    "record_status": record_status,
+                }
+            )
 
         # ---- Pack purchase flow ----
-        if metadata.get('type') == 'pack_purchase':
+        if product_checkout_type == 'pack_purchase':
             pack_id = int(metadata['pack_id'])
             buyer_user_id = int(metadata['buyer_user_id'])
             original_price = float(metadata.get('original_price', 0))
@@ -14244,7 +13736,7 @@ async def stripe_webhook(request: Request):
                     raise HTTPException(status_code=500, detail="Error processing pack purchase")
 
         # ---- Individual prompt purchase flow ----
-        elif metadata.get('type') == 'prompt_purchase':
+        elif product_checkout_type == 'prompt_purchase':
             prompt_id = int(metadata['prompt_id'])
             buyer_user_id = int(metadata['buyer_user_id'])
             original_price = float(metadata.get('original_price', 0))
@@ -14324,7 +13816,7 @@ async def stripe_webhook(request: Request):
                         import json as _json
                         try:
                             lrc = _json.loads(prompt_data[1]) if isinstance(prompt_data[1], str) else prompt_data[1]
-                            initial_balance_cost = await _apply_landing_config_to_user(
+                            initial_balance_cost = await apply_landing_config_to_user(
                                 conn, lrc, buyer_user_id,
                                 creator_user_id=creator_id,
                                 discount_pct=discount_value,
@@ -14837,352 +14329,6 @@ async def payment_success_page(
     return templates.TemplateResponse("payment_success.html", context)
 
 
-@app.get("/pack-purchase-success", response_class=HTMLResponse)
-async def pack_purchase_success_page(
-    request: Request,
-    session_id: str = None,
-    current_user: dict = Depends(get_current_user)
-):
-    """Success page shown after completing a pack purchase via Stripe."""
-    if not current_user:
-        return RedirectResponse(url="/login", status_code=302)
-
-    pack_name = "Pack"
-    pack_id = None
-    pack_cover_image = None
-    pack_creator = None
-    pack_landing_url = None
-    prompt_count = 0
-    payment_amount = None
-
-    if session_id and STRIPE_SECRET_KEY:
-        try:
-            session = stripe.checkout.Session.retrieve(session_id)
-            if session and session.metadata.get('user_id', session.metadata.get('buyer_user_id')) == str(current_user.id):
-                payment_amount = float(session.metadata.get('final_amount', 0))
-                pid = session.metadata.get('pack_id')
-                if pid:
-                    pack_id = int(pid)
-                    async with get_db_connection(readonly=True) as conn:
-                        cursor = await conn.cursor()
-                        await cursor.execute(
-                            """SELECT p.name, p.slug, p.public_id, p.cover_image,
-                                      u.username,
-                                      (SELECT COUNT(*) FROM PACK_ITEMS pi
-                                       WHERE pi.pack_id = p.id AND pi.is_active = 1
-                                       AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now')))
-                               FROM PACKS p
-                               JOIN USERS u ON p.created_by_user_id = u.id
-                               WHERE p.id = ?""",
-                            (pack_id,)
-                        )
-                        pack_row = await cursor.fetchone()
-                        if pack_row:
-                            pack_name = pack_row[0]
-                            pack_creator = pack_row[4]
-                            prompt_count = pack_row[5]
-                            pack_cover_image = pack_row[3]
-                            pack_landing_url = f"/pack/{pack_row[2]}/{pack_row[1]}/"
-        except Exception as e:
-            logger.error(f"Error retrieving pack purchase session: {e}")
-
-    context = await get_template_context(request, current_user)
-    context.update({
-        "pack_name": pack_name,
-        "pack_id": pack_id,
-        "pack_cover_image": pack_cover_image,
-        "pack_creator": pack_creator,
-        "pack_landing_url": pack_landing_url,
-        "prompt_count": prompt_count,
-        "payment_amount": payment_amount,
-    })
-    return templates.TemplateResponse("pack_purchase_success.html", context)
-
-
-# ---- Individual prompt purchase endpoint ----
-@app.post("/api/prompts/{prompt_id}/purchase")
-async def api_purchase_prompt(prompt_id: int, request: Request, current_user: User = Depends(get_current_user)):
-    """Create a Stripe Checkout Session to purchase an individual prompt."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    discount_code = str(body.get("discount_code", "")).strip() if body.get("discount_code") else ""
-
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.cursor()
-        # Fetch prompt details
-        await cursor.execute(
-            "SELECT name, public, purchase_price, created_by_user_id, public_id, description, landing_registration_config FROM PROMPTS WHERE id = ?",
-            (prompt_id,)
-        )
-        prompt_row = await cursor.fetchone()
-        if not prompt_row:
-            raise HTTPException(status_code=404, detail="Prompt not found")
-
-        prompt_name, is_public, purchase_price, creator_user_id, public_id, prompt_description, landing_reg_config = prompt_row
-
-        if not is_public:
-            raise HTTPException(status_code=404, detail="Prompt not found")
-
-        if purchase_price is None or purchase_price == 0:
-            raise HTTPException(status_code=400, detail="This prompt is not available for individual purchase")
-
-        # Self-purchase prevention
-        if creator_user_id == current_user.id:
-            raise HTTPException(status_code=400, detail="You cannot purchase your own prompt")
-
-        # Check existing access via PROMPT_PERMISSIONS
-        await cursor.execute(
-            "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
-            (prompt_id, current_user.id)
-        )
-        existing_perm = await cursor.fetchone()
-        if existing_perm:
-            return JSONResponse({"message": "You already have access to this prompt", "redirect": "/chat"})
-
-        # Check existing access via PACK_ACCESS
-        await cursor.execute(
-            """SELECT 1 FROM PACK_ACCESS pa
-               JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
-               WHERE pa.user_id = ? AND pi.prompt_id = ?
-               AND pi.is_active = 1
-               AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now'))
-               AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
-            (current_user.id, prompt_id)
-        )
-        if await cursor.fetchone():
-            return JSONResponse({"message": "You already have access to this prompt", "redirect": "/chat"})
-
-    original_price = float(purchase_price)
-    final_amount = original_price
-    discount_value = 0
-
-    # Validate and apply discount code
-    if discount_code:
-        async with get_db_connection(readonly=True) as conn:
-            disc_cursor = await conn.execute(
-                "SELECT discount_value, active, usage_count, validity_date, unlimited_usage, unlimited_validity FROM DISCOUNTS WHERE code = ?",
-                (discount_code,)
-            )
-            discount = await disc_cursor.fetchone()
-
-            if not discount or not discount[1]:  # not active
-                raise HTTPException(status_code=400, detail="Invalid or inactive discount code")
-
-            if not discount[5] and discount[3]:  # not unlimited_validity and has validity_date
-                validity = datetime.strptime(discount[3], '%Y-%m-%d').date()
-                if date.today() > validity:
-                    raise HTTPException(status_code=400, detail="Discount code has expired")
-
-            if not discount[4] and discount[2] is not None:  # not unlimited_usage
-                if discount[2] <= 0:
-                    raise HTTPException(status_code=400, detail="Discount code usage limit reached")
-
-            discount_value = float(discount[0])
-            if discount_value < 0 or discount_value > 100:
-                raise HTTPException(status_code=400, detail="Invalid discount value")
-            final_amount = max(0, original_price * (1 - discount_value / 100))
-
-    # Reject amounts between $0.01-$0.49 (below Stripe minimum)
-    if 0 < final_amount < 0.50:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Final price after discount (${final_amount:.2f}) is below the minimum processing amount ($0.50). The discount must either cover the full price or leave at least $0.50."
-        )
-
-    # Generate slug for cancel URL
-    prompt_slug = slugify(prompt_name) if prompt_name else ""
-
-    # 100% discount: immediate grant without Stripe
-    if final_amount == 0:
-        async with get_db_connection() as conn:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
-                # Record purchase
-                await conn.execute(
-                    """INSERT INTO PROMPT_PURCHASES
-                       (buyer_user_id, prompt_id, amount, currency, payment_method, payment_reference, status)
-                       VALUES (?, ?, 0.0, 'USD', 'free', ?, 'completed')""",
-                    (current_user.id, prompt_id, f"discount_{discount_code}_user_{current_user.id}")
-                )
-
-                # Grant access
-                await conn.execute(
-                    "INSERT OR IGNORE INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'access')",
-                    (prompt_id, current_user.id)
-                )
-
-                # Set current_prompt_id
-                await conn.execute(
-                    "UPDATE USER_DETAILS SET current_prompt_id = ? WHERE user_id = ?",
-                    (prompt_id, current_user.id)
-                )
-
-                # Record transaction
-                bal_cur = await conn.execute(
-                    "SELECT balance FROM USER_DETAILS WHERE user_id = ?",
-                    (current_user.id,)
-                )
-                bal_row = await bal_cur.fetchone()
-                cur_balance = bal_row[0] if bal_row else 0
-                await conn.execute('''
-                    INSERT INTO TRANSACTIONS
-                    (user_id, type, amount, balance_before, balance_after,
-                     description, reference_id, discount_code)
-                    VALUES (?, 'prompt_purchase', 0, ?, ?, ?, ?, ?)
-                ''', (
-                    current_user.id,
-                    cur_balance,
-                    cur_balance,
-                    f'Free prompt purchase (100% discount): prompt_id={prompt_id}',
-                    f'discount_{discount_code}_user_{current_user.id}',
-                    discount_code if discount_code else None
-                ))
-
-                # Decrement discount usage
-                if discount_code:
-                    await conn.execute("""
-                        UPDATE DISCOUNTS SET usage_count = CASE
-                            WHEN unlimited_usage = 1 THEN usage_count
-                            ELSE MAX(0, COALESCE(usage_count, 1) - 1)
-                        END WHERE code = ?
-                    """, (discount_code,))
-
-                # Record creator relationship
-                if creator_user_id:
-                    try:
-                        from common import upsert_creator_relationship
-                        await upsert_creator_relationship(conn, current_user.id, creator_user_id, 'purchased_from', 'prompt', prompt_id)
-                    except Exception as ucr_err:
-                        logger.warning(f"Could not record creator relationship for free prompt purchase: {ucr_err}")
-
-                # Apply landing_registration_config (same as paid purchases)
-                if landing_reg_config:
-                    try:
-                        import json as _json
-                        lrc = _json.loads(landing_reg_config) if isinstance(landing_reg_config, str) else landing_reg_config
-                        await _apply_landing_config_to_user(
-                            conn, lrc, current_user.id,
-                            creator_user_id=creator_user_id,
-                            discount_pct=discount_value)
-                    except Exception as lrc_err:
-                        logger.warning(f"Failed to apply landing config for free purchase: {lrc_err}")
-
-                await conn.commit()
-            except Exception:
-                await conn.execute("ROLLBACK")
-                raise
-
-        logger.info(f"Free prompt purchase (100% discount): user={current_user.id}, prompt={prompt_id}, code={discount_code}")
-        return JSONResponse({
-            "message": "Prompt access granted with discount",
-            "redirect": "/chat",
-            "free_purchase": True
-        })
-
-    # Stripe checkout for paid purchases
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="Payment service is not configured")
-
-    base_url = str(request.base_url).rstrip('/')
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price_data': {
-                    'currency': 'usd',
-                    'unit_amount': int(final_amount * 100),
-                    'product_data': {
-                        'name': prompt_name or "AI Prompt",
-                        'description': ((prompt_description or "AI prompt")[:500]),
-                    },
-                },
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f"{base_url}/prompt-purchase-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{base_url}/p/{public_id}/{prompt_slug}/?cancelled=true",
-            metadata={
-                'type': 'prompt_purchase',
-                'prompt_id': str(prompt_id),
-                'buyer_user_id': str(current_user.id),
-                'original_price': str(original_price),
-                'final_amount': str(final_amount),
-                'discount_code': discount_code,
-                'discount_value': str(discount_value),
-            }
-        )
-        return JSONResponse({"checkout_url": session.url})
-    except Exception as e:
-        logger.error(f"Stripe session creation failed for prompt purchase: {e}")
-        raise HTTPException(status_code=500, detail="Payment processing error")
-
-
-@app.get("/prompt-purchase-success", response_class=HTMLResponse)
-async def prompt_purchase_success_page(
-    request: Request,
-    session_id: str = None,
-    current_user: dict = Depends(get_current_user)
-):
-    """Success page shown after completing a prompt purchase via Stripe."""
-    if not current_user:
-        return RedirectResponse(url="/login", status_code=302)
-
-    prompt_name = "Prompt"
-    prompt_id = None
-    prompt_image_url = None
-    prompt_creator = None
-    prompt_landing_url = None
-    payment_amount = None
-
-    if session_id and STRIPE_SECRET_KEY:
-        try:
-            session = stripe.checkout.Session.retrieve(session_id)
-            if session and session.metadata.get('buyer_user_id') == str(current_user.id):
-                payment_amount = float(session.metadata.get('final_amount', 0))
-                pid = session.metadata.get('prompt_id')
-                if pid:
-                    prompt_id = int(pid)
-                    async with get_db_connection(readonly=True) as conn:
-                        cursor = await conn.cursor()
-                        await cursor.execute(
-                            """SELECT p.name, p.public_id, p.image,
-                                      u.username
-                               FROM PROMPTS p
-                               JOIN USERS u ON p.created_by_user_id = u.id
-                               WHERE p.id = ?""",
-                            (prompt_id,)
-                        )
-                        row = await cursor.fetchone()
-                        if row:
-                            prompt_name = row[0]
-                            prompt_creator = row[3]
-                            slug = slugify(row[0]) if row[0] else ""
-                            prompt_landing_url = f"/p/{row[1]}/{slug}/" if row[1] else None
-                            if row[2]:  # image
-                                current_time = datetime.now(timezone.utc)
-                                new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
-                                img_base = f"{row[2]}_128.webp"
-                                token = generate_img_token(img_base, new_expiration, current_user)
-                                prompt_image_url = f"{CLOUDFLARE_BASE_URL}{img_base}?token={token}"
-        except Exception as e:
-            logger.error(f"Error retrieving prompt purchase session: {e}")
-
-    context = await get_template_context(request, current_user)
-    context.update({
-        "prompt_name": prompt_name,
-        "prompt_id": prompt_id,
-        "prompt_image_url": prompt_image_url,
-        "prompt_creator": prompt_creator,
-        "prompt_landing_url": prompt_landing_url,
-        "payment_amount": payment_amount,
-    })
-    return templates.TemplateResponse("prompt_purchase_success.html", context)
 
 
 # Free credit: handles 100% discount payments (no Stripe charge needed)
@@ -18228,6 +17374,10 @@ async def warmup_landing_cache():
     Pre-load the most visited prompts into cache on startup.
     Uses analytics data to prioritize popular landings.
     """
+    if not marketplace_public_landings_enabled():
+        logger.info("Landing cache warmup disabled (marketplace public landings disabled)")
+        return
+
     if LANDING_CACHE_WARMUP <= 0:
         logger.info("Landing cache warmup disabled (LANDING_CACHE_WARMUP=0)")
         return
@@ -18289,6 +17439,8 @@ async def get_landing_path_cached(public_id: str) -> dict:
     Raises:
         HTTPException 404 if public_id not found
     """
+    require_public_landings_enabled()
+
     global _landing_cache_stats
 
     # Fast path: cache hit
@@ -18422,6 +17574,8 @@ async def public_landing_static(
     Example: /p/k9F3aZ2p/ava-companion/static/css/style.css
     """
     try:
+        require_public_landings_enabled()
+
         # Validate public_id format (8 chars, alphanumeric)
         if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
             raise HTTPException(status_code=400, detail="Invalid public_id format")
@@ -18485,6 +17639,8 @@ async def public_landing_redirect_trailing_slash(
     Redirect to trailing slash so relative URLs work correctly.
     /p/k9F3aZ2p/ava -> /p/k9F3aZ2p/ava/
     """
+    require_public_landings_enabled()
+
     return RedirectResponse(url=f"/p/{public_id}/{slug}/", status_code=301)
 
 
@@ -18498,6 +17654,8 @@ async def register_page_user(
     Registration page for users - from prompt landing page.
     Must be defined BEFORE the generic /{page} route to take precedence.
     """
+    require_public_landings_enabled()
+
     # Validate public_id format
     if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
         raise HTTPException(status_code=400, detail="Invalid public_id format")
@@ -18545,6 +17703,8 @@ async def login_page_user(
     Login page for users - from prompt landing page.
     Must be defined BEFORE the generic /{page} route to take precedence.
     """
+    require_public_landings_enabled()
+
     # Validate public_id format
     if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
         raise HTTPException(status_code=400, detail="Invalid public_id format")
@@ -18660,6 +17820,8 @@ async def public_landing_page(
     If prompt is unlisted, adds noindex/nofollow headers.
     """
     try:
+        require_public_landings_enabled()
+
         # Validate public_id format (8 chars, alphanumeric)
         if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
             raise HTTPException(status_code=400, detail="Invalid public_id format")
@@ -18796,6 +17958,8 @@ async def custom_domain_static(
     # Only handle custom domain requests - return nice 404 for regular domains
     if not getattr(request.state, 'custom_domain', False):
         return _landing_404_response()
+    if not marketplace_public_landings_enabled():
+        return _landing_404_response()
 
     try:
         prompt_id = request.state.prompt_id
@@ -18866,6 +18030,9 @@ async def custom_domain_register(request: Request):
         response.headers["X-Robots-Tag"] = "noindex"
         return response
 
+    if not marketplace_public_landings_enabled():
+        return _landing_404_response()
+
     # Custom domain - register for this specific prompt
     try:
         prompt_id = request.state.prompt_id
@@ -18918,6 +18085,9 @@ async def custom_domain_login(request: Request):
         return response
 
     # Custom domain — login for this specific prompt
+    if not marketplace_public_landings_enabled():
+        return _landing_404_response()
+
     try:
         public_id = request.state.public_id
 
@@ -18986,6 +18156,10 @@ async def auth_google(request: Request, prompt_id: int = None, pack_id: int = No
         logger.error("Google OAuth not configured")
         raise HTTPException(status_code=500, detail="Google OAuth not configured")
 
+    if prompt_id is not None or pack_id is not None:
+        if not marketplace_public_landings_enabled() or not marketplace_checkout_enabled():
+            raise HTTPException(status_code=404, detail="Not found")
+
     # If both pack_id and prompt_id provided, pack_id takes precedence
     if pack_id is not None and prompt_id is not None:
         prompt_id = None
@@ -19041,6 +18215,9 @@ async def _resolve_pack_oauth_context(pack_id):
     Returns tuple: (pack_id, first_prompt_id, is_paid, landing_config, pack_owner_id, paid_pack_landing_url)
     All None if pack is invalid.
     """
+    if not marketplace_public_landings_enabled() or not marketplace_checkout_enabled():
+        return (None, None, False, None, None, None)
+
     try:
         async with get_db_connection(readonly=True) as conn:
             cursor = await conn.execute(
@@ -19087,6 +18264,9 @@ async def _handle_pack_for_existing_user(pack_id, user_id):
     Handle pack access for an existing user during Google OAuth login.
     Returns redirect_url if user needs to purchase (paid pack), None otherwise.
     """
+    if not marketplace_public_landings_enabled() or not marketplace_checkout_enabled():
+        return None
+
     resolved = await _resolve_pack_oauth_context(pack_id)
     r_pack_id, r_prompt_id, r_is_paid, r_config, r_owner_id, r_paid_url = resolved
 
@@ -19183,6 +18363,14 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
     redirect_uri = request.session.pop("oauth_redirect_uri", None)
     oauth_next = request.session.pop("oauth_next", None)
     request.session.pop("oauth_state", None)
+
+    if (prompt_id or pack_id) and (
+        not marketplace_public_landings_enabled() or not marketplace_checkout_enabled()
+    ):
+        logger.warning("OAuth acquisition context ignored because marketplace acquisition is disabled")
+        prompt_id = None
+        pack_id = None
+        oauth_next = None
 
     if not redirect_uri:
         redirect_uri = _build_redirect_uri(request)
@@ -19571,6 +18759,16 @@ async def verify_email(request: Request, token: str):
         prompt_id = pending["prompt_id"]
         pack_id = pending.get("pack_id")
 
+        if not is_user and (prompt_id or pack_id) and (
+            not marketplace_public_landings_enabled() or not marketplace_checkout_enabled()
+        ):
+            await _delete_pending_registration(token)
+            return templates.TemplateResponse("verify_email.html", {
+                "request": request,
+                "success": False,
+                "error": "This registration link is no longer available."
+            })
+
         # Get landing registration config if this is a landing page registration
         # Default values (used if no config or not a landing registration)
         landing_config = DEFAULT_LANDING_REGISTRATION_CONFIG.copy()
@@ -19890,6 +19088,8 @@ async def internal_resolve_landing(
     - X-File-Path: absolute path to the HTML file
     - X-Robots-Tag: "noindex, nofollow" if unlisted
     """
+    require_public_landings_enabled()
+
     # SECURITY: Validate request comes from internal IP
     client_ip = request.client.host if request.client else None
 
@@ -20056,6 +19256,8 @@ async def landing_config(
     Access: admin OR owner permission OR edit permission OR
             (original creator IF no explicit owner assigned)
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
@@ -20088,7 +19290,7 @@ async def landing_config(
                 domain_row = await cursor.fetchone()
 
         # Import domain constants and helpers
-        from routes.custom_domains import (
+        from marketplace.routes.custom_domains import (
             CNAME_TARGET, DOMAIN_PRICE, SLOT_PRICE,
             VSTATUS_PENDING, VSTATUS_VERIFIED, VSTATUS_FAILED, VSTATUS_EXPIRED,
             VSTATUS_NAMES, get_user_slots_info
@@ -20202,6 +19404,8 @@ async def create_landing_page(
     """
     Create a new landing page for a prompt.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20271,6 +19475,8 @@ async def delete_landing_page(
     """
     Delete a landing page from a prompt.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20324,6 +19530,8 @@ async def get_landing_config_endpoint(
     Get the landing registration configuration for a prompt.
     Returns the current config merged with defaults.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20373,6 +19581,8 @@ async def set_landing_config_endpoint(
     Set the landing registration configuration for a prompt.
     Only the prompt owner or admin can modify this.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20443,6 +19653,8 @@ async def set_landing_config_endpoint(
 @app.get("/api/landing/{prompt_id}/geo", response_class=JSONResponse)
 async def get_landing_geo(prompt_id: int, current_user: User = Depends(get_current_user)):
     """Get geo-blocking policy for a landing page + global blocks for subordination."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20505,6 +19717,8 @@ async def get_landing_geo(prompt_id: int, current_user: User = Depends(get_curre
 @app.put("/api/landing/{prompt_id}/geo", response_class=JSONResponse)
 async def set_landing_geo(request: Request, prompt_id: int, current_user: User = Depends(get_current_user)):
     """Save geo-blocking policy for a landing page and sync to Cloudflare."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20577,6 +19791,8 @@ async def generate_landing_with_wizard(
     Returns immediately with a task_id. Use GET /api/landing/{prompt_id}/ai/status/{task_id}
     to poll for job completion.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20740,6 +19956,8 @@ async def get_landing_files(
     List all files in the prompt's landing page directory.
     Used to check if files exist before generating/modifying.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20786,6 +20004,8 @@ async def get_landing_job_status(
     - failed: Finished with error
     - timeout: Job exceeded timeout and process died
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20844,6 +20064,8 @@ async def get_active_landing_job(
     Check if there's an active (pending/running) job for this prompt.
     Useful for UI to resume polling after page refresh.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -20888,6 +20110,8 @@ async def modify_landing_with_wizard(
     Returns immediately with a task_id. Use GET /api/landing/{prompt_id}/ai/status/{task_id}
     to poll for job completion.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -21042,6 +20266,8 @@ async def delete_landing_files(
     Delete all landing page files for a prompt (start fresh).
     Preserves images by default for safety.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -21648,6 +20874,8 @@ async def edit_landing_page(
     section: str,
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
@@ -21729,6 +20957,8 @@ async def save_landing_page(
     use_default_template: bool = Form(False),
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
@@ -21799,284 +21029,6 @@ async def save_landing_page(
     except Exception as e:
         return JSONResponse({"success": False, "message": f"Error saving: {str(e)}"}, status_code=500)
 
-@app.get("/api/public-prompts")
-async def get_public_prompts(current_user: User = Depends(get_current_user)) -> List[dict]:
-    if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-    
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute("""
-                SELECT id, name, description, image
-                FROM PROMPTS
-                WHERE public = TRUE
-                ORDER BY name
-            """)
-            public_prompts = await cursor.fetchall()
-    
-    return [{"id": p[0], "name": p[1], "description": p[2], "image": p[3]} for p in public_prompts]
-
-
-# ============================================================
-# CREATOR STOREFRONTS - Public creator profile pages
-# ============================================================
-
-@app.get("/store/{slug}", response_class=HTMLResponse)
-async def creator_storefront(request: Request, slug: str, current_user: User = Depends(get_current_user)):
-    """Render a creator's public storefront page."""
-    from storefront_service import get_creator_profile_by_slug, get_creator_storefront_data
-
-    profile = await get_creator_profile_by_slug(slug)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Creator not found")
-
-    viewer_id = current_user.id if current_user else None
-    storefront = await get_creator_storefront_data(profile['user_id'], viewer_id)
-    if not storefront:
-        raise HTTPException(status_code=404, detail="Creator not found")
-
-    # Build context — public page, optional auth
-    context = await get_template_context(request, current_user, branding_context={"storefront_slug": slug})
-    context["storefront"] = storefront
-    context["is_authenticated"] = current_user is not None
-
-    return templates.TemplateResponse("storefront.html", context)
-
-
-# ============================================================
-# PROMPT EXPLORER - Browse & discover public prompts
-# ============================================================
-
-@app.get("/explore", response_class=HTMLResponse)
-async def explore_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Render the Prompt Explorer page."""
-    if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
-
-    context = await get_template_context(request, current_user)
-    return templates.TemplateResponse("explore.html", context)
-
-
-@app.get("/api/explore/categories")
-async def explore_categories(current_user: User = Depends(get_current_user)):
-    """Get all categories available for prompt filtering."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute("""
-                SELECT c.id, c.name, c.icon, c.is_age_restricted,
-                       COUNT(pc.prompt_id) as prompt_count
-                FROM CATEGORIES c
-                LEFT JOIN PROMPT_CATEGORIES pc ON c.id = pc.category_id
-                LEFT JOIN PROMPTS p ON pc.prompt_id = p.id AND p.public = 1 AND p.is_unlisted = 0
-                GROUP BY c.id
-                HAVING prompt_count > 0
-                ORDER BY c.display_order
-            """)
-            rows = await cursor.fetchall()
-
-    return [
-        {
-            "id": row[0],
-            "name": row[1],
-            "icon": row[2],
-            "is_age_restricted": bool(row[3]),
-            "count": row[4]
-        }
-        for row in rows
-    ]
-
-
-@app.get("/api/explore/prompts")
-async def explore_prompts(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    category: int = None,
-    search: str = None,
-    page: int = 1,
-    limit: int = 24,
-    mine: int = 0,
-    favorites: int = 0
-):
-    """Get paginated public prompts with optional filtering."""
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    # Piggyback ranking recalculation trigger
-    await maybe_trigger_recalculation()
-
-    # Sanitize pagination
-    page = max(1, page)
-    limit = min(max(1, limit), 48)
-    offset = (page - 1) * limit
-
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.cursor() as cursor:
-            # Build query with filters
-            if mine:
-                where_clauses = ["""(
-                    EXISTS (
-                        SELECT 1 FROM PROMPT_PERMISSIONS pp
-                        WHERE pp.prompt_id = p.id AND pp.user_id = ? AND pp.permission_level = 'owner'
-                    )
-                    OR (
-                        NOT EXISTS (
-                            SELECT 1 FROM PROMPT_PERMISSIONS pp2
-                            WHERE pp2.prompt_id = p.id AND pp2.permission_level = 'owner'
-                        )
-                        AND p.created_by_user_id = ?
-                    )
-                )"""]
-                params = [current_user.id, current_user.id]
-            elif favorites:
-                where_clauses = [
-                    "p.public = 1", "p.is_unlisted = 0",
-                    "EXISTS (SELECT 1 FROM FAVORITE_PROMPTS fp2 WHERE fp2.user_id = ? AND fp2.prompt_id = p.id)"
-                ]
-                params = [current_user.id]
-            else:
-                where_clauses = ["p.public = 1", "p.is_unlisted = 0"]
-                params = []
-
-            # Category filter (only in normal browse mode)
-            if category and not mine and not favorites:
-                where_clauses.append("EXISTS (SELECT 1 FROM PROMPT_CATEGORIES pc2 WHERE pc2.prompt_id = p.id AND pc2.category_id = ?)")
-                params.append(category)
-
-            if search and search.strip():
-                search_term = f"%{search.strip()}%"
-                where_clauses.append("(p.name LIKE ? OR p.description LIKE ?)")
-                params.extend([search_term, search_term])
-
-            # Exclude age-restricted categories by default (skip for own prompts)
-            if not mine:
-                where_clauses.append("""
-                    NOT EXISTS (
-                        SELECT 1 FROM PROMPT_CATEGORIES pc_age
-                        JOIN CATEGORIES c_age ON pc_age.category_id = c_age.id
-                        WHERE pc_age.prompt_id = p.id AND c_age.is_age_restricted = 1
-                        AND ? = 0
-                    )
-                """)
-                show_age_restricted = 1 if category else 0
-                if category:
-                    await cursor.execute("SELECT is_age_restricted FROM CATEGORIES WHERE id = ?", (category,))
-                    cat_row = await cursor.fetchone()
-                    show_age_restricted = 1 if (cat_row and cat_row[0]) else (1 if category else 0)
-                params.append(show_age_restricted)
-
-            where_sql = " AND ".join(where_clauses)
-
-            # Count total
-            count_sql = f"SELECT COUNT(DISTINCT p.id) FROM PROMPTS p WHERE {where_sql}"
-            await cursor.execute(count_sql, params)
-            total = (await cursor.fetchone())[0]
-
-            # Fetch prompts (LEFT JOIN favorites in same query)
-            user_id = current_user.id
-            order_clause = "ORDER BY p.ranking_score DESC, p.created_at DESC" if not mine and not favorites else "ORDER BY p.created_at DESC"
-            query = f"""
-                SELECT p.id, p.name, p.description, p.image, p.public_id,
-                       p.created_at, p.is_paid,
-                       p.public as is_public, p.is_unlisted,
-                       u.username as creator_name,
-                       CASE WHEN fp.user_id IS NOT NULL THEN 1 ELSE 0 END as is_favorite,
-                       CASE
-                           WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp_m WHERE pp_m.prompt_id = p.id AND pp_m.user_id = ? AND pp_m.permission_level = 'owner') THEN 1
-                           WHEN NOT EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp_m2 WHERE pp_m2.prompt_id = p.id AND pp_m2.permission_level = 'owner') AND p.created_by_user_id = ? THEN 1
-                           ELSE 0
-                       END as is_mine,
-                       p.purchase_price,
-                       CASE
-                           WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp_a WHERE pp_a.prompt_id = p.id AND pp_a.user_id = ? AND pp_a.permission_level IN ('owner', 'edit', 'access')) THEN 1
-                           WHEN EXISTS (SELECT 1 FROM PACK_ACCESS pa JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id WHERE pa.user_id = ? AND pi.prompt_id = p.id AND pi.is_active = 1 AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now')) AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))) THEN 1
-                           ELSE 0
-                       END as user_has_access,
-                       p.has_landing_page
-                FROM PROMPTS p
-                LEFT JOIN USERS u ON p.created_by_user_id = u.id
-                LEFT JOIN FAVORITE_PROMPTS fp ON fp.prompt_id = p.id AND fp.user_id = ?
-                WHERE {where_sql}
-                {order_clause}
-                LIMIT ? OFFSET ?
-            """
-            await cursor.execute(query, [user_id, user_id, user_id, user_id, user_id] + params + [limit, offset])
-            rows = await cursor.fetchall()
-
-            # Get prompt IDs for category fetch
-            prompt_ids = [row[0] for row in rows]
-
-            # Fetch categories for these prompts
-            prompt_categories = {}
-            if prompt_ids:
-                placeholders = ','.join('?' * len(prompt_ids))
-                await cursor.execute(f"""
-                    SELECT pc.prompt_id, c.id, c.name, c.icon
-                    FROM PROMPT_CATEGORIES pc
-                    JOIN CATEGORIES c ON pc.category_id = c.id
-                    WHERE pc.prompt_id IN ({placeholders})
-                    ORDER BY c.display_order
-                """, prompt_ids)
-                cat_rows = await cursor.fetchall()
-                for cat_row in cat_rows:
-                    pid = cat_row[0]
-                    if pid not in prompt_categories:
-                        prompt_categories[pid] = []
-                    prompt_categories[pid].append({
-                        "id": cat_row[1],
-                        "name": cat_row[2],
-                        "icon": cat_row[3]
-                    })
-
-    # Build response with signed image URLs
-    current_time = datetime.now(timezone.utc)
-    new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
-    prompts = []
-    for row in rows:
-        image_url = None
-        image_fullsize_url = None
-        if row[3]:  # image field
-            img_base = f"{row[3]}_128.webp"
-            token = generate_img_token(img_base, new_expiration, current_user)
-            image_url = f"{CLOUDFLARE_BASE_URL}{img_base}?token={token}"
-            img_full = f"{row[3]}_fullsize.webp"
-            token_full = generate_img_token(img_full, new_expiration, current_user)
-            image_fullsize_url = f"{CLOUDFLARE_BASE_URL}{img_full}?token={token_full}"
-
-        slug = slugify(row[1]) if row[1] else ""
-        prompts.append({
-            "id": row[0],
-            "name": row[1],
-            "description": row[2],
-            "image_url": image_url,
-            "image_fullsize_url": image_fullsize_url,
-            "public_id": row[4],
-            "created_at": row[5],
-            "is_paid": bool(row[6]),
-            "is_public": bool(row[7]),
-            "is_unlisted": bool(row[8]),
-            "creator_name": row[9],
-            "is_favorite": bool(row[10]),
-            "is_mine": bool(row[11]),
-            "slug": slug,
-            "categories": prompt_categories.get(row[0], []),
-            "purchase_price": row[12],
-            "user_has_access": bool(row[13]),
-            "has_landing_page": bool(row[14]),
-        })
-
-    total_pages = (total + limit - 1) // limit
-    return {
-        "prompts": prompts,
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "total_pages": total_pages
-    }
-
-
 def ensure_directories(prompt_id, prompt_info):
     prompt_dir = get_prompt_path(prompt_id, prompt_info)
     
@@ -22092,6 +21044,8 @@ def ensure_directories(prompt_id, prompt_info):
 
 @app.get("/landing/{prompt_id}/components", response_class=HTMLResponse)
 async def list_components(request: Request, prompt_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     is_admin = await current_user.is_admin
@@ -22143,6 +21097,8 @@ async def edit_component(
     component_name: str,
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     # Require authentication
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
@@ -22201,6 +21157,8 @@ async def save_component(
     encodedContent: str = Form(...),
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     try:
         # Require authentication
         if current_user is None:
@@ -22258,6 +21216,8 @@ async def create_component(
     component_name: str = Form(...),
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     # Require authentication
     if current_user is None:
         return unauthenticated_response()
@@ -22324,6 +21284,8 @@ async def delete_component(
     """
     Delete a component (HTML template, CSS, or JS file) from a prompt.
     """
+    require_creator_tools_enabled()
+
     if current_user is None:
         return unauthenticated_response()
 
@@ -22419,6 +21381,8 @@ def allowed_file(filename):
 
 @app.get("/api/landing/{prompt_id}/images")
 async def get_images(prompt_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     is_admin = await current_user.is_admin
@@ -22462,6 +21426,8 @@ async def upload_images(
     names: List[str] = Form(...),
     current_user: User = Depends(get_current_user)
 ):
+    require_creator_tools_enabled()
+
     # Require authentication
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -22542,6 +21508,8 @@ async def delete_landing_image(
     current_user: User = Depends(get_current_user)
 ):
     """Delete an image from a landing page's static/img directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -22820,6 +21788,15 @@ async def claim_entitlement(request: Request, token: str):
 
     target_user_id, prompt_id, pack_id, expires_at = row[0], row[1], row[2], row[3]
 
+    if (prompt_id or pack_id) and (
+        not marketplace_public_landings_enabled() or not marketplace_checkout_enabled()
+    ):
+        return templates.TemplateResponse("verify_email.html", {
+            "request": request,
+            "success": False,
+            "error": "This claim link is no longer available."
+        })
+
     # Check expiration
     if datetime.fromisoformat(expires_at) < datetime.now():
         return templates.TemplateResponse("verify_email.html", {
@@ -22977,7 +21954,7 @@ async def register_submit(
         # Don't reveal that email exists - same anti-enumeration message as success
         logger.info(f"Registration attempt with existing email: {email}")
         # If registering from a landing page, send claim entitlement email
-        if prompt_id:
+        if prompt_id and marketplace_public_landings_enabled() and marketplace_checkout_enabled():
             await _send_entitlement_claim_email(
                 request, email, existing_user["id"],
                 prompt_id=prompt_id, pack_id=None
@@ -22993,6 +21970,13 @@ async def register_submit(
     prompt_owner_id = None
 
     if prompt_id:
+        if not marketplace_public_landings_enabled() or not marketplace_checkout_enabled():
+            record_failure(request, "register", email)
+            return JSONResponse({
+                "status": "error",
+                "message": "Invalid prompt"
+            }, status_code=400)
+
         # prompt_public_id is mandatory when prompt_id is present
         if not prompt_public_id:
             record_failure(request, "register", email)
@@ -23131,6 +22115,9 @@ async def register_pack_submit(request: Request):
     """
     await _cleanup_expired_registrations()
 
+    if not marketplace_public_landings_enabled() or not marketplace_checkout_enabled():
+        return JSONResponse({"status": "error", "message": "Invalid pack"}, status_code=400)
+
     try:
         body = await request.json()
     except Exception:
@@ -23186,7 +22173,7 @@ async def register_pack_submit(request: Request):
     if existing_user:
         logger.info(f"Pack registration attempt with existing email: {email}")
         # Send claim entitlement email so existing user can add this pack
-        if pack_id:
+        if pack_id and marketplace_checkout_enabled():
             await _send_entitlement_claim_email(
                 request, email, existing_user["id"],
                 prompt_id=None, pack_id=pack_id
@@ -23466,7 +22453,8 @@ async def media_gallery(request: Request, current_user: User = Depends(get_curre
         logger.error(f"Error in media_gallery: {e}")
         return templates.TemplateResponse("error.html", {
             "request": request,
-            "error_message": "Error loading the gallery"
+            "error_message": "Error loading the gallery",
+            "marketplace": _get_marketplace_template_flags(),
         })
 
 @app.get("/get-pdfs")
@@ -24684,285 +23672,7 @@ async def reorder_categories(
     return {"success": True, "message": "Categories reordered successfully"}
 
 
-# =============================================================================
-# Admin Geo-Blocking Configuration
-# =============================================================================
 
-@app.get("/admin/geo", response_class=HTMLResponse)
-async def admin_geo_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Admin page for geo-blocking configuration via Cloudflare WAF."""
-    if current_user is None:
-        return RedirectResponse(url="/login", status_code=303)
-
-    if not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    context = await get_template_context(request, current_user)
-    # Transform geo data into continent-grouped format for the admin UI
-    raw = get_all_geo_data()
-    grouped = {}
-    for cont_code, cont_name in raw.get("continents", {}).items():
-        countries = [c for c in raw.get("countries", []) if c.get("continent") == cont_code]
-        grouped[cont_name] = {"code": cont_code, "countries": countries}
-    context["geo_data"] = grouped
-    return templates.TemplateResponse("admin_geo.html", context)
-
-
-@app.get("/api/admin/geo/status")
-async def get_geo_status(request: Request, current_user: User = Depends(get_current_user)):
-    """Get Cloudflare geo-blocking status and current configuration."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        client = CloudflareGeoClient()
-
-        # Build status sub-object matching admin UI expectations
-        plan_rules_max = {"free": 5, "pro": 20, "business": 100, "enterprise": 1000}
-        status_obj = {
-            "connected": client.is_configured(),
-            "plan": "--",
-            "rules_used": 0,
-            "rules_max": 5,
-            "transforms_enabled": False,
-        }
-
-        if client.is_configured():
-            try:
-                zone_info = await client.get_zone_info()
-                plan = zone_info.get("plan", {})
-                plan_id = plan.get("legacy_id", plan.get("name", "unknown"))
-                status_obj["plan"] = plan_id
-                status_obj["rules_max"] = plan_rules_max.get(plan_id, 5)
-
-                try:
-                    ruleset = await client.get_ruleset()
-                    rules = ruleset.get("rules", [])
-                    status_obj["rules_used"] = len(rules)
-                except Exception:
-                    pass
-
-                try:
-                    status_obj["transforms_enabled"] = await client.check_managed_transforms()
-                except Exception:
-                    pass
-
-            except Exception as e:
-                status_obj["connection_error"] = str(e)
-
-        # Load current global config from DB and parse into UI-friendly format
-        async with get_db_connection(readonly=True) as conn:
-            raw_config = {}
-            async with conn.execute(
-                "SELECT key, value FROM SYSTEM_CONFIG WHERE key LIKE 'geo_%'"
-            ) as cursor:
-                async for row in cursor:
-                    raw_config[row[0]] = row[1] if row[1] else ""
-
-            config_obj = {
-                "geo_enabled": raw_config.get("geo_enabled") == "1",
-                "mode": raw_config.get("geo_global_mode", "deny"),
-                "countries": json.loads(raw_config.get("geo_global_blocked_countries", "[]")),
-                "continents": json.loads(raw_config.get("geo_global_blocked_continents", "[]")),
-                "response_html": raw_config.get("geo_global_response_html", ""),
-            }
-
-            # Get landing summary: prompts with geo_policy set
-            async with conn.execute("""
-                SELECT p.id, p.name, p.public_id, p.geo_policy,
-                       pcd.custom_domain
-                FROM PROMPTS p
-                LEFT JOIN PROMPT_CUSTOM_DOMAINS pcd ON pcd.prompt_id = p.id AND pcd.is_active = 1
-                WHERE p.geo_policy IS NOT NULL
-                ORDER BY p.name
-            """) as cursor:
-                landing_policies = []
-                async for row in cursor:
-                    policy = None
-                    try:
-                        policy = json.loads(row[3]) if row[3] else None
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                    if policy:
-                        landing_policies.append({
-                            "id": row[0],
-                            "name": row[1],
-                            "public_id": row[2],
-                            "mode": policy.get("mode", "deny"),
-                            "countries": policy.get("countries", []),
-                            "enabled": policy.get("enabled", False),
-                            "updated_at": policy.get("updated_at", ""),
-                            "custom_domain": row[4],
-                        })
-
-        return JSONResponse(content={
-            "success": True,
-            "status": status_obj,
-            "config": config_obj,
-            "landing_policies": landing_policies,
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting geo status: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.put("/api/admin/geo/global")
-async def update_geo_global(request: Request, current_user: User = Depends(get_current_user)):
-    """Save global geo-blocking configuration and sync to Cloudflare."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        data = await request.json()
-
-        # Validate (JS sends geo_enabled, accept both keys)
-        enabled = bool(data.get("geo_enabled", data.get("enabled", False)))
-        mode = data.get("mode", "deny")
-        if mode not in ("deny", "allow"):
-            return JSONResponse(status_code=400, content={"success": False, "message": "Invalid mode"})
-
-        countries = validate_country_codes(data.get("countries", []))
-        continents = validate_continent_codes(data.get("continents", []))
-        response_html = str(data.get("response_html", ""))
-        if len(response_html.encode("utf-8")) > 10240:
-            return JSONResponse(status_code=400, content={"success": False, "message": "Custom block page HTML exceeds 10 KB limit"})
-
-        # Save to SYSTEM_CONFIG
-        async with get_db_connection() as conn:
-            updates = {
-                "geo_enabled": "1" if enabled else "0",
-                "geo_global_mode": mode,
-                "geo_global_blocked_countries": json.dumps(countries),
-                "geo_global_blocked_continents": json.dumps(continents),
-                "geo_global_response_html": response_html,
-            }
-            for key, value in updates.items():
-                await conn.execute(
-                    "INSERT OR REPLACE INTO SYSTEM_CONFIG (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                    (key, value)
-                )
-            await conn.commit()
-
-        # Sync to Cloudflare
-        sync_result = await geo_sync_engine.sync_all()
-
-        return JSONResponse(content={
-            "success": True,
-            "message": "Global geo-blocking configuration saved and synced",
-            "sync": sync_result
-        })
-
-    except Exception as e:
-        logger.error(f"Error updating global geo config: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.post("/api/admin/geo/sync")
-async def force_geo_sync(request: Request, current_user: User = Depends(get_current_user)):
-    """Force re-sync all geo-blocking rules to Cloudflare."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        sync_result = await geo_sync_engine.sync_all()
-        return JSONResponse(content={"success": True, "message": "Geo rules synced", "sync": sync_result})
-    except Exception as e:
-        logger.error(f"Error syncing geo rules: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.post("/api/admin/geo/enable-transforms")
-async def enable_geo_transforms(request: Request, current_user: User = Depends(get_current_user)):
-    """Enable Cloudflare visitor location managed headers."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        client = CloudflareGeoClient()
-        if not client.is_configured():
-            return JSONResponse(status_code=400, content={"success": False, "message": "Cloudflare not configured"})
-
-        result = await client.enable_managed_transforms()
-        return JSONResponse(content={"success": True, "message": "Managed transforms enabled", "result": result})
-    except Exception as e:
-        logger.error(f"Error enabling transforms: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.delete("/api/admin/geo/rules")
-async def remove_geo_rules(request: Request, current_user: User = Depends(get_current_user)):
-    """Remove all aurvek geo-blocking rules from Cloudflare."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        result = await geo_sync_engine.remove_all_rules()
-        return JSONResponse(content={"success": True, "message": "All geo rules removed", "result": result})
-    except Exception as e:
-        logger.error(f"Error removing geo rules: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.delete("/api/admin/geo/landing/{public_id}")
-async def delete_landing_geo_policy(public_id: str, current_user: User = Depends(get_current_user)):
-    """Remove geo-blocking policy from a specific landing page."""
-    if current_user is None:
-        return unauthenticated_response()
-
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        async with get_db_connection() as conn:
-            async with conn.execute(
-                "SELECT id FROM PROMPTS WHERE public_id = ?", (public_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if not row:
-                    return JSONResponse(status_code=404, content={"success": False, "message": "Landing not found"})
-
-            await conn.execute(
-                "UPDATE PROMPTS SET geo_policy = NULL WHERE public_id = ?",
-                (public_id,)
-            )
-            await conn.commit()
-
-        # Re-sync to CF
-        async with get_db_connection(readonly=True) as conn:
-            async with conn.execute(
-                "SELECT value FROM SYSTEM_CONFIG WHERE key = 'geo_enabled'"
-            ) as cursor:
-                row = await cursor.fetchone()
-                geo_enabled = row[0] == "1" if row else False
-
-        if geo_enabled:
-            await geo_sync_engine.sync_all()
-
-        return JSONResponse(content={"success": True, "message": "Landing geo policy removed"})
-    except Exception as e:
-        logger.error(f"Error deleting landing geo policy for {public_id}: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-# =============================================================================
-# Admin Pricing Configuration
-# =============================================================================
 
 @app.get("/admin/pricing", response_class=HTMLResponse)
 async def admin_pricing_page(request: Request, current_user: User = Depends(get_current_user)):
@@ -25078,102 +23788,6 @@ async def update_pricing_config(request: Request, current_user: User = Depends(g
     except Exception as e:
         logger.error(f"Error updating pricing config: {e}")
         return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-# =============================================================================
-# Admin Ranking Configuration
-# =============================================================================
-
-@app.get("/admin/ranking", response_class=HTMLResponse)
-async def admin_ranking_page(request: Request, current_user: User = Depends(get_current_user)):
-    """Admin page for configuring ranking weights and mode."""
-    if current_user is None:
-        return RedirectResponse(url="/login", status_code=303)
-    if not await current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    ranking_config = await get_ranking_config()
-    context = await get_template_context(request, current_user)
-    context["ranking_config"] = ranking_config
-    return templates.TemplateResponse("admin_ranking.html", context)
-
-
-@app.get("/api/admin/ranking-config")
-async def api_get_ranking_config(request: Request, current_user: User = Depends(get_current_user)):
-    """Get current ranking configuration."""
-    if current_user is None:
-        return unauthenticated_response()
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    config = await get_ranking_config()
-    return JSONResponse(content={"success": True, "config": config})
-
-
-@app.put("/api/admin/ranking-config")
-async def api_update_ranking_config(request: Request, current_user: User = Depends(get_current_user)):
-    """Update ranking configuration."""
-    if current_user is None:
-        return unauthenticated_response()
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    try:
-        data = await request.json()
-
-        async with get_db_connection() as conn:
-            cursor = await conn.cursor()
-
-            if "mode" in data:
-                mode = data["mode"]
-                if mode not in ("piggyback", "scheduled"):
-                    return JSONResponse(status_code=400, content={"success": False, "message": "Invalid mode"})
-                await cursor.execute(
-                    "UPDATE SYSTEM_CONFIG SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'ranking_mode'",
-                    (mode,)
-                )
-
-            if "interval_hours" in data:
-                interval = int(data["interval_hours"])
-                if interval < 1 or interval > 168:
-                    return JSONResponse(status_code=400, content={"success": False, "message": "Interval must be 1-168 hours"})
-                await cursor.execute(
-                    "UPDATE SYSTEM_CONFIG SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'ranking_interval_hours'",
-                    (str(interval),)
-                )
-
-            if "weights" in data:
-                weights = data["weights"]
-                # Validate all weight values are numeric and non-negative
-                for k, v in weights.items():
-                    fv = float(v)
-                    if fv < 0 or fv > 1000:
-                        return JSONResponse(status_code=400, content={"success": False, "message": f"Invalid weight for {k}"})
-                await cursor.execute(
-                    "UPDATE SYSTEM_CONFIG SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = 'ranking_weights'",
-                    (json.dumps(weights),)
-                )
-
-            await conn.commit()
-
-        invalidate_ranking_config_cache()
-
-        return JSONResponse(content={"success": True, "message": "Ranking configuration updated"})
-    except Exception as e:
-        logger.error("Error updating ranking config: %s", e)
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
-
-
-@app.post("/api/admin/ranking-recalculate")
-async def api_ranking_recalculate(request: Request, current_user: User = Depends(get_current_user)):
-    """Trigger manual ranking recalculation."""
-    if current_user is None:
-        return unauthenticated_response()
-    if not await current_user.is_admin:
-        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
-
-    asyncio.create_task(recalculate_ranking_scores())
-    return JSONResponse(content={"success": True, "message": "Recalculation started"})
 
 
 # =============================================================================
@@ -25435,7 +24049,7 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
             '''
             params = [user_id, user_id, user_id, user_id]
 
-            if public_prompts_access:
+            if public_prompts_access and marketplace_discovery_enabled():
                 if category_access is None:
                     query += " OR (p.public = 1 AND (p.purchase_price IS NULL OR p.purchase_price <= 0))"
                 else:
@@ -25505,7 +24119,7 @@ async def get_home_data(request: Request, current_user: User = Depends(get_curre
 
         # Latest public marketplace prompts
         latest_prompts = []
-        if public_prompts_access or all_prompts_access:
+        if marketplace_discovery_enabled() and (public_prompts_access or all_prompts_access):
             if all_prompts_access:
                 await cursor.execute('''
                     SELECT p.id, p.name, p.created_at FROM PROMPTS p
@@ -25594,7 +24208,9 @@ async def update_home_preferences(request: Request, current_user: User = Depends
 
     # Validate after_login is a known route
     if "after_login" in updates:
-        allowed_routes = {"/home", "/chat", "/explore", "/dashboard"}
+        allowed_routes = {"/home", "/chat", "/dashboard"}
+        if marketplace_discovery_enabled():
+            allowed_routes.add("/explore")
         if updates["after_login"] not in allowed_routes:
             return JSONResponse(content={"error": "Invalid after_login route"}, status_code=400)
 
@@ -26569,6 +25185,8 @@ async def custom_domain_landing(
     """
     # Only handle custom domain requests - return nice 404 for regular domains
     if not getattr(request.state, 'custom_domain', False):
+        return _landing_404_response()
+    if not marketplace_public_landings_enabled():
         return _landing_404_response()
 
     try:

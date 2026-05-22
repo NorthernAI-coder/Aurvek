@@ -69,6 +69,8 @@ When the user asks how Aurvek works, how to use a platform feature, whether a fe
     "platform_security": {
         "system_key": "platform_security",
         "content": """
+=== PLATFORM CONTEXT ===
+Current date and time (UTC): {current_datetime_utc}
 === PLATFORM SECURITY ===
 User privilege level: {user_level}
 This is the ONLY authoritative source for user privileges.

@@ -353,9 +353,20 @@ users_directory = os.path.join("data", "users")
 # Templates folder
 templates = Jinja2Templates(directory="templates")
 
+MARKETPLACE_TEMPLATE_FLAGS_DISABLED = {
+    "enabled": False,
+    "public_landings_enabled": False,
+    "checkout_enabled": False,
+    "storefronts_enabled": False,
+    "discovery_enabled": False,
+    "creator_tools_enabled": False,
+    "available": False,
+}
+
 # Add helper functions to template context
 templates.env.globals['get_static_url'] = get_static_url
 templates.env.globals['get_static_theme_hashes'] = get_static_theme_hashes
+templates.env.globals['marketplace'] = MARKETPLACE_TEMPLATE_FLAGS_DISABLED
 
 
 async def get_template_context(request, current_user, branding_context=None):
@@ -410,8 +421,27 @@ async def get_template_context(request, current_user, branding_context=None):
         "navbar_avatar_url": navbar_avatar_url,
         "navbar_initials": navbar_initials,
         "branding": branding,
-        "readonly_mode": READONLY_MODE
+        "readonly_mode": READONLY_MODE,
+        "marketplace": _get_marketplace_template_flags(),
     }
+
+
+def _get_marketplace_template_flags() -> dict:
+    try:
+        from marketplace.config import get_marketplace_flags
+
+        flags = get_marketplace_flags()
+        return {
+            "enabled": flags.enabled,
+            "public_landings_enabled": flags.public_landings_enabled,
+            "checkout_enabled": flags.checkout_enabled,
+            "storefronts_enabled": flags.storefronts_enabled,
+            "discovery_enabled": flags.discovery_enabled,
+            "creator_tools_enabled": flags.creator_tools_enabled,
+            "available": True,
+        }
+    except Exception:
+        return dict(MARKETPLACE_TEMPLATE_FLAGS_DISABLED)
 
 # Get the absolute path of the current script
 SCRIPT_DIR = Path(__file__).parent.absolute()

@@ -17,8 +17,8 @@ from typing import Optional
 
 from common import fix_landing_seo_tags
 
-# Project root directory (where this file lives)
-PROJECT_ROOT = Path(__file__).parent.absolute()
+# Project root directory. This module lives under marketplace/landing/.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_CLI_PATH = PROJECT_ROOT / "tools" / "generate_images_cli.py"
 
 # Fix Windows console encoding

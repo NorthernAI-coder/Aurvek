@@ -7,12 +7,16 @@
     const TAB_MAP = {
         '#profile': 'profile-tab',
         '#usage': 'usage-tab',
+        '#wellbeing': 'wellbeing-tab',
+        '#memory': 'memory-tab',
         '#api-keys': 'api-keys-tab'
     };
 
     const initialized = {
         profile: false,
         usage: false,
+        wellbeing: false,
+        memory: false,
         'api-keys': false
     };
 
@@ -54,6 +58,11 @@
                 break;
             case 'usage':
                 loadUsageTab();
+                break;
+            case 'wellbeing':
+                loadWellbeingTab();
+                break;
+            case 'memory':
                 break;
             case 'api-keys':
                 // api-credentials.js initializes on DOMContentLoaded, already fired
@@ -225,6 +234,136 @@
                 </div>
             </div>
         `).join('');
+    }
+
+    // --- Break Reminders Tab ---
+    async function loadWellbeingTab() {
+        setupWellbeingHandlers();
+        await loadWellbeingPreferences();
+    }
+
+    function setupWellbeingHandlers() {
+        const form = document.getElementById('wellbeingPreferencesForm');
+        const resetBtn = document.getElementById('wellbeingResetSessionBtn');
+        if (form && !form.dataset.bound) {
+            form.dataset.bound = '1';
+            form.addEventListener('submit', saveWellbeingPreferences);
+        }
+        if (resetBtn && !resetBtn.dataset.bound) {
+            resetBtn.dataset.bound = '1';
+            resetBtn.addEventListener('click', resetWellbeingSession);
+        }
+    }
+
+    async function wellbeingFetch(url, options = {}) {
+        const fetcher = typeof secureFetch === 'function' ? secureFetch : fetch;
+        return fetcher(url, {
+            credentials: 'include',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...(options.headers || {})
+            }
+        });
+    }
+
+    async function loadWellbeingPreferences() {
+        try {
+            const response = await wellbeingFetch('/api/wellbeing/preferences');
+            if (!response.ok) throw new Error('Failed to load break reminder settings');
+            const data = await response.json();
+            renderWellbeingPreferences(data.preferences || {});
+            renderWellbeingStatus(data.status || {});
+        } catch (error) {
+            console.error('Error loading break reminder settings:', error);
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.error('Error', 'Failed to load break reminder settings');
+            }
+        }
+    }
+
+    function renderWellbeingPreferences(preferences) {
+        const remindersEnabled = document.getElementById('wellbeingRemindersEnabled');
+        const intenseEnabled = document.getElementById('wellbeingIntenseEnabled');
+        const preferredMinutes = document.getElementById('wellbeingPreferredSoftMinutes');
+        if (remindersEnabled) remindersEnabled.checked = preferences.reminders_enabled !== false;
+        if (intenseEnabled) intenseEnabled.checked = preferences.intense_reminders_enabled !== false;
+        if (preferredMinutes) preferredMinutes.value = preferences.preferred_soft_minutes || '';
+    }
+
+    function renderWellbeingStatus(status) {
+        const session = status.session || {};
+        const setEl = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        setEl('wellbeingActiveMinutes', session.active_minutes !== undefined ? formatNumber(session.active_minutes) : '-');
+        setEl('wellbeingUserMessages', session.user_messages_count !== undefined ? formatNumber(session.user_messages_count) : '-');
+        setEl('wellbeingRemindersShown', session.reminders_shown !== undefined ? formatNumber(session.reminders_shown) : '-');
+        setEl('wellbeingSeverity', session.current_severity || 'normal');
+
+        const statusText = document.getElementById('wellbeingStatusText');
+        if (statusText) {
+            if (!session.id) {
+                statusText.textContent = 'No active continuous session.';
+            } else if (status.active_pause && status.pause_until) {
+                statusText.textContent = 'Pause active until ' + new Date(status.pause_until).toLocaleTimeString();
+            } else {
+                statusText.textContent = 'Current session started ' + formatDateTime(session.started_at) + '.';
+            }
+        }
+    }
+
+    async function saveWellbeingPreferences(event) {
+        event.preventDefault();
+        const preferredMinutes = document.getElementById('wellbeingPreferredSoftMinutes');
+        const payload = {
+            reminders_enabled: document.getElementById('wellbeingRemindersEnabled')?.checked,
+            intense_reminders_enabled: document.getElementById('wellbeingIntenseEnabled')?.checked,
+            preferred_soft_minutes: preferredMinutes && preferredMinutes.value ? Number(preferredMinutes.value) : null
+        };
+        try {
+            const response = await wellbeingFetch('/api/wellbeing/preferences', {
+                method: 'PUT',
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) throw new Error('Failed to save break reminder settings');
+            const data = await response.json();
+            renderWellbeingPreferences(data.preferences || {});
+            renderWellbeingStatus(data.status || {});
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.success('Saved', 'Break reminder settings updated');
+            }
+        } catch (error) {
+            console.error('Error saving break reminder settings:', error);
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.error('Error', 'Failed to save break reminder settings');
+            }
+        }
+    }
+
+    async function resetWellbeingSession() {
+        try {
+            const response = await wellbeingFetch('/api/wellbeing/reset-session', {
+                method: 'POST',
+                body: JSON.stringify({})
+            });
+            if (!response.ok) throw new Error('Failed to reset current counter');
+            const status = await response.json();
+            renderWellbeingStatus(status || {});
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.success('Reset', 'Current break reminder counter reset');
+            }
+        } catch (error) {
+            console.error('Error resetting break reminder counter:', error);
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.error('Error', 'Failed to reset current counter');
+            }
+        }
+    }
+
+    function formatDateTime(value) {
+        if (!value) return '-';
+        const normalized = String(value).replace(' ', 'T') + (String(value).includes('Z') ? '' : 'Z');
+        const date = new Date(normalized);
+        return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
     }
 
     function formatNumber(num) {

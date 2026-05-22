@@ -15,6 +15,25 @@
         font-size: 0.82rem;
         margin-top: 4px;
     }
+    .secret-field-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 0.5rem;
+        flex-wrap: wrap;
+    }
+    .secret-field-header .form-label {
+        margin-bottom: 0;
+    }
+    .credential-autofill-sink {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+    }
     .connection-status {
         display: none;
         margin-top: 12px;
@@ -112,6 +131,25 @@
     .memory-breakdown {
         border: 1px solid var(--border-color);
         border-radius: 8px;
+        overflow: hidden;
+    }
+    .memory-review-list {
+        max-height: 340px;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+    }
+    .memory-review-list .memory-row {
+        grid-template-columns: minmax(0, 1fr) minmax(92px, auto);
+    }
+    .memory-review-list .memory-row-value {
+        max-width: 180px;
+        text-align: right;
+        overflow-wrap: anywhere;
+    }
+    .memory-review-list .memory-metric-note {
+        display: -webkit-box;
+        -webkit-line-clamp: 4;
+        -webkit-box-orient: vertical;
         overflow: hidden;
     }
     .memory-breakdown-title {
@@ -340,25 +378,46 @@
         <p class="field-note">Used when transport is local or auto without an HTTP URL.</p>
     </div>
 
+    <div class="credential-autofill-sink" aria-hidden="true">
+        <input type="text" name="username" autocomplete="username" tabindex="-1">
+        <input type="password" name="password" autocomplete="current-password" tabindex="-1">
+    </div>
+
     <div class="mb-3">
         <label class="form-label" for="atagia_base_url">HTTP Base URL</label>
-        <input class="form-control" type="url" id="atagia_base_url"
-               value="{{ config.base_url or '' }}" placeholder="http://127.0.0.1:8100">
+        <input class="form-control" type="url" id="atagia_base_url" name="atagia_base_url_config"
+               value="{{ config.base_url or '' }}" placeholder="http://127.0.0.1:8100"
+               autocomplete="off" autocapitalize="none" spellcheck="false"
+               data-config-value="{{ config.base_url or '' }}">
         <p class="field-note">HTTP mode accepts IP literal hosts only for SSRF protection.</p>
     </div>
 
     <div class="mb-3">
-        <label class="form-label" for="atagia_service_api_key">Service API Key</label>
-        <input class="form-control" type="password" id="atagia_service_api_key"
+        <div class="secret-field-header">
+            <label class="form-label" for="atagia_service_api_key">Service API Key</label>
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearServiceApiKeyBtn" onclick="markSecretForClear('service')">
+                <i class="fas fa-eraser me-1"></i> Clear saved key
+            </button>
+        </div>
+        <input class="form-control" type="password" id="atagia_service_api_key" name="atagia_service_api_key_config"
+               autocomplete="new-password" autocapitalize="none" spellcheck="false"
+               data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                placeholder="{% if config.has_service_api_key %}Current key: {{ config.service_api_key_masked }}{% else %}Required for HTTP transport{% endif %}">
-        <p class="field-note">Leave blank to keep the current saved key.</p>
+        <p class="field-note" id="serviceApiKeyNote">Leave blank to keep the current saved key.</p>
     </div>
 
     <div class="mb-3">
-        <label class="form-label" for="atagia_admin_api_key">Admin API Key</label>
-        <input class="form-control" type="password" id="atagia_admin_api_key"
+        <div class="secret-field-header">
+            <label class="form-label" for="atagia_admin_api_key">Admin API Key</label>
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearAdminApiKeyBtn" onclick="markSecretForClear('admin')">
+                <i class="fas fa-eraser me-1"></i> Clear saved key
+            </button>
+        </div>
+        <input class="form-control" type="password" id="atagia_admin_api_key" name="atagia_admin_api_key_config"
+               autocomplete="new-password" autocapitalize="none" spellcheck="false"
+               data-lpignore="true" data-1p-ignore="true" data-form-type="other"
                placeholder="{% if config.has_admin_api_key %}Current key: {{ config.admin_api_key_masked }}{% else %}Required for HTTP processing controls{% endif %}">
-        <p class="field-note">Used only for Atagia admin operations like pausing, draining, and resuming background processing. Leave blank to keep the current saved key.</p>
+        <p class="field-note" id="adminApiKeyNote">Used only for Atagia admin operations like pausing, draining, and resuming background processing. Leave blank to keep the current saved key.</p>
     </div>
 
     <div class="d-flex gap-2">
@@ -369,6 +428,10 @@
         <button type="button" class="btn btn-primary" id="saveConfigBtn" onclick="saveConfig()">
             <span id="saveSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
             <i class="fas fa-save me-1" id="saveIcon"></i> Save
+        </button>
+        <button type="button" class="btn btn-outline-warning" id="restoreDefaultsBtn" onclick="restoreDefaults()">
+            <span id="restoreSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
+            <i class="fas fa-rotate-left me-1" id="restoreIcon"></i> Restore Defaults
         </button>
     </div>
 
@@ -461,6 +524,42 @@
                     </tr>
                 </tbody>
             </table>
+        </div>
+    </div>
+</div>
+
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-clipboard-check"></i> Memory Review
+    </div>
+    <p class="field-note">
+        Read-only Atagia review queue. These rows are memory candidates or user confirmations after ingestion, not failed history-sync messages. Approval/rejection needs Atagia's review API before Aurvek can safely mutate them.
+    </p>
+
+    <div class="memory-toolbar">
+        <div class="memory-toolbar-meta">
+            <span class="memory-status-pill" id="memoryReviewRequiredPill">
+                <i class="fas fa-circle-notch fa-spin"></i> Loading
+            </span>
+            <span class="memory-status-pill" id="memoryUserConfirmPill">
+                <i class="fas fa-user-check"></i> -
+            </span>
+        </div>
+        <button type="button" class="btn btn-outline-secondary" onclick="loadDiagnostics()">
+            <i class="fas fa-arrows-rotate me-1"></i> Refresh
+        </button>
+    </div>
+
+    <div class="memory-error-box" id="memoryReviewUnavailable" style="display: none;"></div>
+
+    <div class="memory-panel-grid" id="memoryReviewPanels">
+        <div class="memory-breakdown">
+            <div class="memory-breakdown-title">Admin Review Required</div>
+            <div id="memoryReviewItems" class="memory-review-list"></div>
+        </div>
+        <div class="memory-breakdown">
+            <div class="memory-breakdown-title">User Confirmation Pending</div>
+            <div id="memoryConfirmationItems" class="memory-review-list"></div>
         </div>
     </div>
 </div>
@@ -586,11 +685,11 @@
         </button>
         <button type="button" class="btn btn-warning" id="syncHistoryBtn" onclick="startHistorySync()">
             <span id="syncSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
-            <i class="fas fa-database me-1" id="syncIcon"></i> Sync all history
+            <i class="fas fa-database me-1" id="syncIcon"></i> Sync / Retry Pending
         </button>
     </div>
     <p class="field-note mt-2">
-        Manual backfill only. Enabling Atagia does not start a sync automatically.
+        Manual backfill only. Enabling Atagia does not start a sync automatically. <strong>Failed or pending messages are retried by running sync again.</strong>
     </p>
     <div class="connection-status" id="syncErrors">
         <i class="fas fa-triangle-exclamation me-2" style="color: var(--warning);"></i>
@@ -601,6 +700,25 @@
 
 {% block scripts %}
 <script>
+    var atagiaSecretState = {
+        service: {
+            clear: false,
+            hasKey: {{ 'true' if config.has_service_api_key else 'false' }},
+            masked: {{ (config.service_api_key_masked or '')|tojson }}
+        },
+        admin: {
+            clear: false,
+            hasKey: {{ 'true' if config.has_admin_api_key else 'false' }},
+            masked: {{ (config.admin_api_key_masked or '')|tojson }}
+        }
+    };
+    var atagiaAutofillTouched = {
+        baseUrl: false,
+        serviceKey: false,
+        adminKey: false
+    };
+    var workerControlAvailable = false;
+
     function payload() {
         return {
             enabled: document.getElementById('atagia_enabled').checked,
@@ -609,6 +727,8 @@
             base_url: document.getElementById('atagia_base_url').value.trim(),
             service_api_key: document.getElementById('atagia_service_api_key').value.trim(),
             admin_api_key: document.getElementById('atagia_admin_api_key').value.trim(),
+            clear_service_api_key: atagiaSecretState.service.clear,
+            clear_admin_api_key: atagiaSecretState.admin.clear,
             mode: document.getElementById('atagia_mode').value.trim(),
             platform_id: document.getElementById('atagia_platform_id').value.trim(),
             character_id: document.getElementById('atagia_character_id').value.trim(),
@@ -616,6 +736,127 @@
             operational_profile: document.getElementById('atagia_operational_profile').value.trim(),
             timeout_seconds: document.getElementById('atagia_timeout_seconds').value.trim()
         };
+    }
+
+    function suppressCredentialAutofill() {
+        var baseUrl = document.getElementById('atagia_base_url');
+        var serviceKey = document.getElementById('atagia_service_api_key');
+        var adminKey = document.getElementById('atagia_admin_api_key');
+
+        if (baseUrl && !atagiaAutofillTouched.baseUrl && document.activeElement !== baseUrl) {
+            baseUrl.value = baseUrl.getAttribute('data-config-value') || '';
+        }
+        if (serviceKey && !atagiaAutofillTouched.serviceKey && document.activeElement !== serviceKey) {
+            serviceKey.value = '';
+        }
+        if (adminKey && !atagiaAutofillTouched.adminKey && document.activeElement !== adminKey) {
+            adminKey.value = '';
+        }
+    }
+
+    function secretElements(kind) {
+        if (kind === 'service') {
+            return {
+                input: document.getElementById('atagia_service_api_key'),
+                note: document.getElementById('serviceApiKeyNote'),
+                button: document.getElementById('clearServiceApiKeyBtn')
+            };
+        }
+        return {
+            input: document.getElementById('atagia_admin_api_key'),
+            note: document.getElementById('adminApiKeyNote'),
+            button: document.getElementById('clearAdminApiKeyBtn')
+        };
+    }
+
+    function markSecretForClear(kind) {
+        var state = atagiaSecretState[kind];
+        if (!state || !state.hasKey) return;
+        state.clear = !state.clear;
+        secretElements(kind).input.value = '';
+        updateSecretUi(kind);
+    }
+
+    function handleSecretInput(kind) {
+        var state = atagiaSecretState[kind];
+        var input = secretElements(kind).input;
+        if (state && input.value.trim()) {
+            state.clear = false;
+            updateSecretUi(kind);
+        }
+    }
+
+    function updateSecretUi(kind) {
+        var state = atagiaSecretState[kind];
+        var els = secretElements(kind);
+        var isService = kind === 'service';
+        if (state.clear) {
+            els.input.placeholder = 'Will be cleared on save';
+            els.note.textContent = 'This saved key will be cleared when you save.';
+            els.button.disabled = false;
+            els.button.innerHTML = '<i class="fas fa-undo me-1"></i> Undo clear';
+            return;
+        }
+
+        els.button.disabled = !state.hasKey;
+        els.button.innerHTML = '<i class="fas fa-eraser me-1"></i> Clear saved key';
+        if (state.hasKey) {
+            els.input.placeholder = 'Current key: ' + (state.masked || '****');
+            els.note.textContent = isService
+                ? 'Leave blank to keep the current saved key.'
+                : 'Used only for Atagia admin operations like pausing, draining, and resuming background processing. Leave blank to keep the current saved key.';
+        } else {
+            els.input.placeholder = isService
+                ? 'Required for HTTP transport'
+                : 'Required for HTTP processing controls';
+            els.note.textContent = isService
+                ? 'No saved service key. Enter a key only when using HTTP transport.'
+                : 'No saved admin key. Enter a key only when using HTTP processing controls.';
+        }
+    }
+
+    function applyConfig(config) {
+        if (!config) return;
+        document.getElementById('atagia_enabled').checked = Boolean(config.enabled);
+        document.getElementById('atagia_transport').value = config.transport || 'auto';
+        document.getElementById('atagia_mode').value = config.mode || 'personal_assistant';
+        document.getElementById('atagia_timeout_seconds').value = config.timeout_seconds || '30.0';
+        document.getElementById('atagia_platform_id').value = config.platform_id || 'aurvek';
+        document.getElementById('atagia_character_id').value = config.character_id || '';
+        document.getElementById('atagia_user_persona_id').value = config.user_persona_id || '';
+        document.getElementById('atagia_operational_profile').value = config.operational_profile || '';
+        document.getElementById('atagia_db_path').value = config.db_path || 'db/atagia.db';
+        document.getElementById('atagia_base_url').value = config.base_url || '';
+        document.getElementById('atagia_base_url').setAttribute('data-config-value', config.base_url || '');
+
+        document.getElementById('atagia_service_api_key').value = '';
+        document.getElementById('atagia_admin_api_key').value = '';
+        atagiaAutofillTouched.baseUrl = false;
+        atagiaAutofillTouched.serviceKey = false;
+        atagiaAutofillTouched.adminKey = false;
+        atagiaSecretState.service = {
+            clear: false,
+            hasKey: Boolean(config.has_service_api_key),
+            masked: config.service_api_key_masked || ''
+        };
+        atagiaSecretState.admin = {
+            clear: false,
+            hasKey: Boolean(config.has_admin_api_key),
+            masked: config.admin_api_key_masked || ''
+        };
+        updateSecretUi('service');
+        updateSecretUi('admin');
+    }
+
+    async function readJsonResponse(response) {
+        var text = await response.text();
+        if (!text) return {};
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            var snippet = text.replace(/\s+/g, ' ').trim().slice(0, 180);
+            throw new Error('Server returned a non-JSON response (' + response.status + '). ' + (snippet || response.statusText));
+        }
     }
 
     async function testConnection() {
@@ -635,7 +876,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload())
             });
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Connection failed');
             }
@@ -665,12 +906,11 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload())
             });
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Save failed');
             }
-            document.getElementById('atagia_service_api_key').value = '';
-            document.getElementById('atagia_admin_api_key').value = '';
+            applyConfig(data.config);
             btn.innerHTML = '<i class="fas fa-check me-1"></i> Saved!';
             showAlert('success', data.message || 'Configuration saved.');
             await loadDiagnostics();
@@ -683,6 +923,45 @@
             btn.innerHTML = originalHtml;
             btn.disabled = false;
         } finally {
+            spinner.style.display = 'none';
+            icon.style.display = 'inline-block';
+        }
+    }
+
+    async function restoreDefaults() {
+        if (!confirm('Restore Atagia settings to environment/default values? Saved Atagia overrides will be removed.')) {
+            return;
+        }
+
+        var btn = document.getElementById('restoreDefaultsBtn');
+        var spinner = document.getElementById('restoreSpinner');
+        var icon = document.getElementById('restoreIcon');
+
+        btn.disabled = true;
+        document.getElementById('testConnectionBtn').disabled = true;
+        document.getElementById('saveConfigBtn').disabled = true;
+        spinner.style.display = 'inline-block';
+        icon.style.display = 'none';
+
+        try {
+            var response = await fetch('/admin/atagia/defaults', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}'
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) {
+                throw new Error(data.message || 'Restore defaults failed');
+            }
+            applyConfig(data.config);
+            showAlert('success', data.message || 'Atagia defaults restored.');
+            await loadDiagnostics();
+        } catch (err) {
+            showAlert('danger', 'Failed to restore defaults: ' + err.message);
+        } finally {
+            btn.disabled = false;
+            document.getElementById('testConnectionBtn').disabled = false;
+            document.getElementById('saveConfigBtn').disabled = false;
             spinner.style.display = 'none';
             icon.style.display = 'inline-block';
         }
@@ -711,7 +990,7 @@
     async function loadDiagnostics() {
         try {
             var response = await fetch('/admin/atagia/diagnostics');
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Could not load Atagia diagnostics');
             }
@@ -724,6 +1003,7 @@
                 available: false,
                 reason: err.message
             });
+            renderMemoryReview(null, err.message);
             renderWorkerControl(null, { message: err.message });
         }
     }
@@ -743,7 +1023,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ batch_size: 100 })
             });
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Sync could not start');
             }
@@ -761,7 +1041,7 @@
     async function loadWorkerControl() {
         try {
             var response = await fetch('/admin/atagia/worker-control');
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Could not load processing control');
             }
@@ -790,7 +1070,7 @@
                     timeout_seconds: timeout
                 })
             });
-            var data = await response.json();
+            var data = await readJsonResponse(response);
             if (!response.ok || !data.success) {
                 throw new Error(data.message || 'Processing control update failed');
             }
@@ -807,12 +1087,13 @@
 
     function setWorkerButtonsDisabled(disabled) {
         document.querySelectorAll('[data-worker-action]').forEach(function(button) {
-            button.disabled = disabled;
+            button.disabled = disabled || !workerControlAvailable;
         });
         document.getElementById('refreshWorkerControlBtn').disabled = disabled;
     }
 
     function renderWorkerControl(state, error) {
+        workerControlAvailable = Boolean(state);
         var mode = state && state.mode ? state.mode : 'unavailable';
         var jobsAllowed = Boolean(state && state.new_source_jobs_allowed);
         var workersAllowed = Boolean(state && state.worker_claims_allowed);
@@ -865,6 +1146,7 @@
         document.querySelectorAll('.worker-control-action').forEach(function(card) {
             card.classList.toggle('active', card.getAttribute('data-worker-mode') === mode);
         });
+        setWorkerButtonsDisabled(false);
     }
 
     function workerModeLabel(mode) {
@@ -892,6 +1174,7 @@
         var memoryCounts = diagnostics.memory_status_counts || [];
         var jobTypeCounts = diagnostics.job_type_counts || [];
         var activeJobs = diagnostics.active_jobs || [];
+        var review = diagnostics.review || {};
         var status = available ? (processing.status || 'idle') : 'unavailable';
         var queueState = available ? (processing.queue_state || 'idle') : '-';
 
@@ -920,6 +1203,7 @@
             renderBreakdown('memoryStatusBreakdown', []);
             renderJobTypes([]);
             renderActiveJobs([]);
+            renderMemoryReview(null, diagnostics.reason || 'Atagia diagnostics are not available.');
             return;
         }
 
@@ -929,6 +1213,100 @@
         renderBreakdown('memoryStatusBreakdown', memoryCounts);
         renderJobTypes(jobTypeCounts);
         renderActiveJobs(activeJobs);
+        renderMemoryReview(review, null);
+    }
+
+    function renderMemoryReview(review, unavailableReason) {
+        var items = review && review.memory_items ? review.memory_items : [];
+        var confirmations = review && review.pending_confirmations ? review.pending_confirmations : [];
+        var unavailable = document.getElementById('memoryReviewUnavailable');
+        var panels = document.getElementById('memoryReviewPanels');
+
+        setStatusPill(
+            'memoryReviewRequiredPill',
+            items.length ? 'queued' : (unavailableReason ? 'unavailable' : 'idle'),
+            'Admin review: ' + formatNumber(items.length),
+            items.length ? 'fa-clipboard-check' : (unavailableReason ? 'fa-circle-xmark' : 'fa-circle-check')
+        );
+        setStatusPill(
+            'memoryUserConfirmPill',
+            confirmations.length ? 'queued' : (unavailableReason ? 'unavailable' : 'idle'),
+            'User confirmations: ' + formatNumber(confirmations.length),
+            confirmations.length ? 'fa-user-check' : (unavailableReason ? 'fa-circle-xmark' : 'fa-circle-check')
+        );
+
+        if (unavailableReason) {
+            unavailable.textContent = unavailableReason;
+            unavailable.style.display = 'block';
+            panels.style.display = 'none';
+            renderReviewRows('memoryReviewItems', [], 'No admin review rows.');
+            renderReviewRows('memoryConfirmationItems', [], 'No user confirmation rows.');
+            return;
+        }
+
+        unavailable.style.display = 'none';
+        panels.style.display = 'grid';
+        renderReviewRows('memoryReviewItems', items, 'No admin review rows.');
+        renderReviewRows('memoryConfirmationItems', confirmations, 'No user confirmation rows.');
+    }
+
+    function renderReviewRows(targetId, rows, emptyText) {
+        var target = document.getElementById(targetId);
+        if (!rows || !rows.length) {
+            target.innerHTML = '<div class="memory-empty">' + escapeHtml(emptyText) + '</div>';
+            return;
+        }
+        target.innerHTML = rows.map(function(row) {
+            var title = reviewTitle(row);
+            var status = row.status || row.state || '-';
+            var detail = reviewDetail(row);
+            return '<div class="memory-row">' +
+                '<span class="memory-row-label"><strong>' + escapeHtml(title) + '</strong>' +
+                (detail ? '<div class="memory-metric-note">' + escapeHtml(detail) + '</div>' : '') +
+                '</span>' +
+                '<span class="memory-row-value">' + escapeHtml(statusLabel(status)) + '</span>' +
+                '</div>';
+        }).join('');
+    }
+
+    function reviewTitle(row) {
+        return row.id || row.memory_id || row.job_id || row.confirmation_id || 'Review item';
+    }
+
+    function reviewDetail(row) {
+        var parts = [];
+        ['user_id', 'conversation_id', 'character_id', 'memory_type', 'created_at', 'updated_at', 'expires_at'].forEach(function(key) {
+            if (row[key]) parts.push(key.replace(/_/g, ' ') + ': ' + stringifyReviewValue(row[key]));
+        });
+        var sourceMessages = row.source_messages || row.source_message_ids || [];
+        if (sourceMessages.length) {
+            parts.push('source messages: ' + sourceMessages.join(', '));
+        }
+        var content = firstReviewContent(row);
+        if (content) parts.push(content);
+        return parts.join(' | ');
+    }
+
+    function firstReviewContent(row) {
+        var keys = ['content', 'text', 'summary', 'value', 'metadata_json'];
+        for (var i = 0; i < keys.length; i++) {
+            if (row[keys[i]]) {
+                return stringifyReviewValue(row[keys[i]]);
+            }
+        }
+        return '';
+    }
+
+    function stringifyReviewValue(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'object') {
+            try {
+                return JSON.stringify(value);
+            } catch (err) {
+                return String(value);
+            }
+        }
+        return String(value);
     }
 
     function setMetric(id, value) {
@@ -1059,6 +1437,28 @@
             .replace(/'/g, '&#039;');
     }
 
-    document.addEventListener('DOMContentLoaded', loadDiagnostics);
+    document.addEventListener('DOMContentLoaded', function() {
+        updateSecretUi('service');
+        updateSecretUi('admin');
+        suppressCredentialAutofill();
+        window.setTimeout(suppressCredentialAutofill, 250);
+        window.setTimeout(suppressCredentialAutofill, 1000);
+        document.getElementById('atagia_base_url').addEventListener('focus', function() {
+            atagiaAutofillTouched.baseUrl = true;
+        });
+        document.getElementById('atagia_service_api_key').addEventListener('focus', function() {
+            atagiaAutofillTouched.serviceKey = true;
+        });
+        document.getElementById('atagia_service_api_key').addEventListener('input', function() {
+            handleSecretInput('service');
+        });
+        document.getElementById('atagia_admin_api_key').addEventListener('focus', function() {
+            atagiaAutofillTouched.adminKey = true;
+        });
+        document.getElementById('atagia_admin_api_key').addEventListener('input', function() {
+            handleSecretInput('admin');
+        });
+        loadDiagnostics();
+    });
 </script>
 {% endblock %}

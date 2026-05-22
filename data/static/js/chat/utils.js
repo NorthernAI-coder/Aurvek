@@ -8,6 +8,7 @@ const Config = {
     attachedFiles: [],
     have_vision: true,
     can_send_files: false,
+    attachment_upload_chunk_size_bytes: 4 * 1024 * 1024,
     mediaRecorder: null,
     audioChunks: []
 };

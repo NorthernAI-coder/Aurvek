@@ -1279,6 +1279,13 @@ function setupNewChatIntegration() {
         if (!incognito && !isFirstCall && isCurrentConversationEmpty) {
             return Promise.resolve();
         }
+
+        if (promptId === null) {
+            const promptDropdown = document.getElementById('promptDropdown');
+            if (promptDropdown) {
+                promptId = promptDropdown.value;
+            }
+        }
         
         let body = {};
         if (promptId !== null) {
@@ -1286,6 +1293,12 @@ function setupNewChatIntegration() {
         }
         if (incognito) {
             body.incognito = true;
+        }
+        const llmId = typeof window.getSelectedNewChatLlmId === 'function'
+            ? window.getSelectedNewChatLlmId(options)
+            : parseInt(document.getElementById('llmDropdown')?.value, 10);
+        if (!isNaN(llmId) && llmId > 0) {
+            body.llm_id = llmId;
         }
         
         // Add folder_id if a folder is selected
@@ -1358,7 +1371,7 @@ function setupNewChatIntegration() {
             console.error('Error creating conversation:', error);
             // Fall back to original function if available
             if (typeof window.originalStartNewConversation === 'function') {
-                return window.originalStartNewConversation(promptId);
+                return window.originalStartNewConversation(promptId, options);
             }
         });
     };

@@ -38,6 +38,7 @@ from common import (
     MAX_FREE_INITIAL_BALANCE,
 )
 from security_config import is_forbidden_prompt_name
+from marketplace.config import marketplace_creator_tools_enabled, marketplace_discovery_enabled
 
 router = APIRouter()
 
@@ -45,7 +46,8 @@ router = APIRouter()
 async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
     """
     Single-prompt access check. Returns True if the user is allowed to use prompt_id.
-    Respects admin, owner/edit permissions, and public_prompts_access + category_access.
+    Respects admin, owner/edit permissions, pack access, and public prompt access
+    only when marketplace discovery is enabled.
     """
     if await user.is_admin:
         return True
@@ -82,6 +84,9 @@ async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
     is_public = prompt_row[0]
     purchase_price = prompt_row[1]
     if not is_public:
+        return False
+
+    if not marketplace_discovery_enabled():
         return False
 
     await cursor.execute(
@@ -121,7 +126,7 @@ async def list_prompts(request: Request, current_user: User = Depends(get_curren
         
     if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     async with get_db_connection(readonly=True) as conn:
         query = """
             SELECT p.id, p.name, p.description, p.image, p.created_at, p.public,
@@ -359,6 +364,9 @@ async def create_prompt_post(
     if not await current_user.is_admin and not await current_user.is_user:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    if (public or bool(is_paid)) and not marketplace_creator_tools_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
     # Mutual exclusion: disable_web_search takes priority over force_web_search
     if disable_web_search and force_web_search:
         force_web_search = False
@@ -537,7 +545,7 @@ async def create_prompt_post(
 
         # Auto-create creator profile if needed (non-blocking)
         try:
-            from storefront_service import ensure_creator_profile
+            from marketplace.services.storefronts import ensure_creator_profile
             await ensure_creator_profile(current_user.id, current_user.username)
         except Exception as e:
             logger.warning("Could not auto-create creator profile: %s", e)
@@ -725,6 +733,14 @@ async def update_prompt(
 ):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
+
+    if (
+        public
+        or bool(is_paid)
+        or allow_in_packs
+        or (purchase_price is not None and purchase_price.strip() != "")
+    ) and not marketplace_creator_tools_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
 
     # Mutual exclusion: disable_web_search takes priority over force_web_search
     if disable_web_search and force_web_search:

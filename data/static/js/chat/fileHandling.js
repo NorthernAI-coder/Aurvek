@@ -1,6 +1,7 @@
 const MAX_PDF_SIZE_MB = 25;
 const MAX_IMAGE_SIZE_MB = 20;
 const MAX_TEXT_SIZE_MB = 2;
+const DEFAULT_ATTACHMENT_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
 
 const TEXT_FILE_EXTENSIONS = new Set([
     '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm',
@@ -354,6 +355,359 @@ function processFiles(files, formData, imagePreviews, targetConversationId = nul
     }
     return renderedAttachmentElements;
 }
+
+function getUploadContentType(file) {
+    if (file.type) return file.type;
+    const lowerName = (file.name || '').toLowerCase();
+    if (lowerName.endsWith('.pdf')) return 'application/pdf';
+    if (isTextFile(file)) return 'text/plain';
+    return 'application/octet-stream';
+}
+
+function getAttachmentUploadChunkSize() {
+    const configured = Number(Config.attachment_upload_chunk_size_bytes);
+    if (Number.isFinite(configured) && configured > 0) {
+        return Math.floor(configured);
+    }
+    return DEFAULT_ATTACHMENT_UPLOAD_CHUNK_SIZE;
+}
+
+function createAttachmentUploadId() {
+    const bytes = new Uint8Array(16);
+    if (window.crypto && window.crypto.getRandomValues) {
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    }
+    return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function updateAttachmentUploadStatus(rendered, progress, text) {
+    if (!rendered) return;
+    const clamped = Math.max(0, Math.min(100, Math.round(progress)));
+    if (rendered.progressFill) {
+        rendered.progressFill.style.width = `${clamped}%`;
+    }
+    if (rendered.status) {
+        rendered.status.textContent = text || `${clamped}%`;
+    }
+}
+
+function markAttachmentUploadComplete(rendered) {
+    if (!rendered) return;
+    if (rendered.progressWrap) {
+        rendered.progressWrap.remove();
+        rendered.progressWrap = null;
+    }
+    if (rendered.status) {
+        const inlineAttachment = rendered.status.closest('.chat-pdf-attachment, .chat-text-attachment');
+        if (!inlineAttachment && rendered.status.parentElement) {
+            rendered.status.parentElement.style.textAlign = 'center';
+        }
+        rendered.status.textContent = '';
+        rendered.status.innerHTML = '<i class="fas fa-check-circle" aria-hidden="true"></i>';
+        rendered.status.title = 'Uploaded';
+        rendered.status.setAttribute('aria-label', 'Uploaded');
+        rendered.status.setAttribute('role', 'img');
+        Object.assign(rendered.status.style, {
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            marginTop: inlineAttachment ? '0' : '6px',
+            marginLeft: '0',
+            fontSize: '0.95rem',
+            lineHeight: '1',
+            opacity: '1',
+            color: '#22c55e',
+            verticalAlign: 'middle'
+        });
+    }
+}
+
+function markAttachmentUploadFailed(rendered, message) {
+    if (!rendered) return;
+    if (rendered.progressFill) {
+        rendered.progressFill.style.background = '#dc3545';
+    }
+    if (rendered.status) {
+        rendered.status.textContent = message || 'Failed';
+    }
+}
+
+function createAttachmentUploadEcho(file, targetConversationId = null, displayOptions = {}) {
+    const chatMessagesContainer = document.getElementById('chat-messages-container');
+    const chatWindow = document.getElementById('chat-window');
+    const imagePreviews = document.getElementById('image-previews');
+    const userMessageElement = document.createElement('div');
+    userMessageElement.classList.add('message', 'user');
+    if (targetConversationId !== null) {
+        userMessageElement.dataset.conversationId = targetConversationId;
+    }
+
+    const progressWrap = document.createElement('div');
+    progressWrap.className = 'attachment-upload-progress';
+    Object.assign(progressWrap.style, {
+        width: '100%',
+        height: '4px',
+        marginTop: '8px',
+        borderRadius: '4px',
+        overflow: 'hidden',
+        background: 'rgba(255,255,255,0.18)'
+    });
+    const progressFill = document.createElement('div');
+    Object.assign(progressFill.style, {
+        width: '0%',
+        height: '100%',
+        borderRadius: '4px',
+        background: '#20c997',
+        transition: 'width 0.16s ease'
+    });
+    progressWrap.appendChild(progressFill);
+
+    const status = document.createElement('span');
+    status.className = 'attachment-upload-status';
+    status.textContent = '0%';
+    Object.assign(status.style, {
+        display: 'block',
+        marginTop: '5px',
+        fontSize: '0.78rem',
+        opacity: '0.8'
+    });
+
+    if (file.type === 'application/pdf') {
+        const pdfAttachment = document.createElement('div');
+        pdfAttachment.className = 'chat-pdf-attachment';
+        const badge = document.createElement('span');
+        badge.className = 'pdf-badge';
+        badge.textContent = 'PDF';
+        const label = document.createElement('span');
+        label.textContent = ' ' + getRangedPdfDisplayName(file.name, displayOptions);
+        pdfAttachment.appendChild(badge);
+        pdfAttachment.appendChild(label);
+        pdfAttachment.appendChild(progressWrap);
+        pdfAttachment.appendChild(status);
+        userMessageElement.appendChild(pdfAttachment);
+    } else if (isTextFile(file)) {
+        const textAttachment = document.createElement('div');
+        textAttachment.className = 'chat-text-attachment';
+        const badge = document.createElement('span');
+        badge.className = 'text-badge';
+        badge.textContent = 'TXT';
+        const label = document.createElement('span');
+        label.textContent = file.name;
+        textAttachment.appendChild(badge);
+        textAttachment.appendChild(label);
+        textAttachment.appendChild(progressWrap);
+        textAttachment.appendChild(status);
+        userMessageElement.appendChild(textAttachment);
+    } else {
+        const imageWrap = document.createElement('div');
+        const userMessageImage = document.createElement('img');
+        const objectUrl = URL.createObjectURL(file);
+        userMessageImage.src = objectUrl;
+        userMessageImage.onload = () => URL.revokeObjectURL(objectUrl);
+        userMessageImage.style.maxWidth = '100%';
+        userMessageImage.style.height = 'auto';
+        userMessageImage.style.display = 'block';
+        userMessageImage.style.margin = '0 auto';
+        imageWrap.appendChild(userMessageImage);
+        imageWrap.appendChild(progressWrap);
+        imageWrap.appendChild(status);
+        userMessageElement.appendChild(imageWrap);
+    }
+
+    chatMessagesContainer.appendChild(userMessageElement);
+    if (chatWindow) chatWindow.scrollTop = chatWindow.scrollHeight;
+    if (imagePreviews) {
+        imagePreviews.innerHTML = '';
+        imagePreviews.classList.add('hidden');
+    }
+    const fileInput = document.getElementById('chat-files');
+    if (fileInput) fileInput.value = '';
+
+    return { element: userMessageElement, progressWrap, progressFill, status };
+}
+
+function postAttachmentForm(url, formData, { signal, onProgress } = {}) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let abortedBySignal = false;
+
+        xhr.open('POST', url, true);
+        xhr.withCredentials = true;
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+        const abortHandler = () => {
+            abortedBySignal = true;
+            xhr.abort();
+        };
+        if (signal) {
+            if (signal.aborted) {
+                const error = new Error('Upload cancelled');
+                error.name = 'AbortError';
+                reject(error);
+                return;
+            }
+            signal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable && typeof onProgress === 'function') {
+                onProgress(event.loaded, event.total);
+            }
+        };
+        xhr.onload = () => {
+            if (signal) signal.removeEventListener('abort', abortHandler);
+            let body = null;
+            try {
+                body = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+            } catch (err) {
+                body = null;
+            }
+            if (xhr.status >= 200 && xhr.status < 300) {
+                resolve(body || {});
+                return;
+            }
+            const error = new Error(body?.message || body?.error || `Upload failed (${xhr.status})`);
+            error.uploadFailed = true;
+            error.status = xhr.status;
+            reject(error);
+        };
+        xhr.onerror = () => {
+            if (signal) signal.removeEventListener('abort', abortHandler);
+            const error = new Error('Network error while uploading attachment');
+            error.uploadFailed = true;
+            reject(error);
+        };
+        xhr.onabort = () => {
+            if (signal) signal.removeEventListener('abort', abortHandler);
+            const error = new Error(abortedBySignal ? 'Upload cancelled' : 'Attachment upload aborted');
+            error.name = 'AbortError';
+            reject(error);
+        };
+        xhr.send(formData);
+    });
+}
+
+function getAttachmentRefsFromUploadElements(renderedAttachmentElements) {
+    return (renderedAttachmentElements?.attachmentRefs || [])
+        .map((attachment) => attachment?.attachment_ref)
+        .filter(Boolean);
+}
+
+async function discardUploadedAttachmentRefs(conversationId, attachmentRefs) {
+    const refs = Array.from(new Set((attachmentRefs || []).filter(Boolean)));
+    if (!conversationId || refs.length === 0) return;
+    const formData = new FormData();
+    formData.append('attachment_refs', JSON.stringify(refs));
+    try {
+        await postAttachmentForm(`/api/conversations/${conversationId}/attachments/discard`, formData);
+    } catch (error) {
+        console.warn('Could not discard uploaded attachments:', error);
+    }
+}
+
+async function uploadSingleAttachment(file, conversationId, rendered, options = {}) {
+    const uploadId = createAttachmentUploadId();
+    const chunkSize = getAttachmentUploadChunkSize();
+    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+    const contentType = getUploadContentType(file);
+
+    for (let index = 0; index < totalChunks; index++) {
+        if (conversationId !== null && typeof currentConversationId !== 'undefined' && currentConversationId !== conversationId) {
+            const error = new Error('Conversation changed while uploading attachment');
+            error.uploadFailed = true;
+            throw error;
+        }
+        const start = index * chunkSize;
+        const end = Math.min(file.size, start + chunkSize);
+        const chunkBlob = file.slice(start, end);
+        const formData = new FormData();
+        formData.append('upload_id', uploadId);
+        formData.append('chunk_index', String(index));
+        formData.append('total_chunks', String(totalChunks));
+        formData.append('filename', file.name || 'attachment');
+        formData.append('content_type', contentType);
+        formData.append('total_size', String(file.size));
+        formData.append('chunk', chunkBlob, `${file.name || 'attachment'}.part${index}`);
+
+        await postAttachmentForm(`/api/conversations/${conversationId}/attachments/chunk`, formData, {
+            signal: options.signal,
+            onProgress: (loaded, total) => {
+                const chunkFraction = total > 0 ? loaded / total : 0;
+                const overall = ((index + chunkFraction) / totalChunks) * 96;
+                updateAttachmentUploadStatus(rendered, overall, `${Math.max(1, Math.round(overall))}%`);
+            }
+        });
+    }
+
+    updateAttachmentUploadStatus(rendered, 98, 'Processing');
+
+    const completeForm = new FormData();
+    completeForm.append('upload_id', uploadId);
+    completeForm.append('total_chunks', String(totalChunks));
+    completeForm.append('filename', file.name || 'attachment');
+    completeForm.append('content_type', contentType);
+    completeForm.append('total_size', String(file.size));
+    const completed = await postAttachmentForm(`/api/conversations/${conversationId}/attachments/complete`, completeForm, {
+        signal: options.signal
+    });
+
+    markAttachmentUploadComplete(rendered);
+    return completed;
+}
+
+async function uploadAttachmentsForMessage(files, conversationId, displayOptions = {}) {
+    const renderedAttachmentElements = [];
+    renderedAttachmentElements.cancelled = false;
+    renderedAttachmentElements.attachmentRefs = [];
+
+    if (!files || files.length === 0) {
+        return renderedAttachmentElements;
+    }
+
+    if (window.SessionManager && typeof window.SessionManager.validateSession === 'function') {
+        const isValid = await window.SessionManager.validateSession(true);
+        if (!isValid) {
+            const error = new Error('Session expired');
+            error.uploadFailed = true;
+            throw error;
+        }
+    }
+
+    for (const file of files) {
+        if (!isAcceptedFileType(file) || !validateFileSize(file)) {
+            if (!isAcceptedFileType(file)) {
+                NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
+            }
+            const error = new Error('Attachment is not valid');
+            error.uploadFailed = true;
+            throw error;
+        }
+
+        const rendered = createAttachmentUploadEcho(file, conversationId, displayOptions);
+        renderedAttachmentElements.push(rendered.element);
+        try {
+            const uploaded = await uploadSingleAttachment(file, conversationId, rendered, displayOptions);
+            if (!uploaded || !uploaded.attachment_ref) {
+                const error = new Error('Upload did not return an attachment reference');
+                error.uploadFailed = true;
+                throw error;
+            }
+            renderedAttachmentElements.attachmentRefs.push(uploaded);
+        } catch (error) {
+            markAttachmentUploadFailed(rendered, error.message || 'Failed');
+            error.uploadFailed = true;
+            error.renderedAttachmentElements = renderedAttachmentElements;
+            throw error;
+        }
+    }
+
+    return renderedAttachmentElements;
+}
+
+window.uploadAttachmentsForMessage = uploadAttachmentsForMessage;
+window.discardUploadedAttachmentRefs = discardUploadedAttachmentRefs;
+window.getAttachmentRefsFromUploadElements = getAttachmentRefsFromUploadElements;
 
 
 function initFileHandling() {

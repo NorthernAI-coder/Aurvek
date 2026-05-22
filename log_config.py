@@ -42,7 +42,7 @@ def setup_logging():
         log.addHandler(console_handler)
 
     # Apply the same formatter to the root logger so every module
-    # (clients, security_config, packs_router, etc.) gets timestamps.
+    # (clients, security_config, marketplace routes, etc.) gets timestamps.
     root = logging.getLogger()
     root.handlers = []
     root.addHandler(console_handler)

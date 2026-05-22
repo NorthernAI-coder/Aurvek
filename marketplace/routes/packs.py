@@ -41,10 +41,17 @@ from common import (
 )
 from save_images import resize_image_cover
 from security_guard_llm import check_security, is_security_guard_enabled
-from landing_wizard import is_claude_available, list_prompt_files, list_welcome_files, delete_all_landing_files, delete_all_welcome_files
-from landing_jobs import start_job, get_job, get_active_job_for_pack, get_active_welcome_job_for_pack
+from marketplace.landing.wizard import is_claude_available, list_prompt_files, list_welcome_files, delete_all_landing_files, delete_all_welcome_files
+from marketplace.landing.jobs import start_job, get_job, get_active_job_for_pack, get_active_welcome_job_for_pack
 from prompts import create_pack_directory, get_pack_path, get_pack_components_dir, sanitize_landing_reg_config
 from ranking import maybe_trigger_recalculation
+from marketplace.config import (
+    marketplace_public_landings_enabled,
+    require_checkout_enabled,
+    require_creator_tools_enabled,
+    require_discovery_enabled,
+    require_public_landings_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +84,8 @@ async def get_pack_landing_cached(public_id: str) -> dict:
     Returns:
         dict with pack data and pre-built filesystem path, or None if not found.
     """
+    require_public_landings_enabled()
+
     global _pack_landing_cache_stats
 
     # Fast path: cache hit
@@ -159,6 +168,10 @@ async def warmup_pack_landing_cache():
     Pre-load published packs into cache on startup.
     Uses PACK_ACCESS count to prioritize popular packs.
     """
+    if not marketplace_public_landings_enabled():
+        logger.info("Pack landing cache warmup disabled (marketplace public landings disabled)")
+        return
+
     if PACK_LANDING_CACHE_WARMUP <= 0:
         logger.info("Pack landing cache warmup disabled (PACK_LANDING_CACHE_WARMUP=0)")
         return
@@ -300,6 +313,8 @@ def _inject_pack_analytics(html_content: str, pack_id: int) -> str:
 
 @router.get("/admin/packs", response_class=HTMLResponse)
 async def admin_packs_list(request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
     await _require_admin_or_user(current_user)
@@ -315,6 +330,8 @@ async def admin_packs_list(request: Request, current_user: User = Depends(get_cu
 
 @router.get("/admin/packs/new", response_class=HTMLResponse)
 async def admin_pack_new(request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
     await _require_admin_or_user(current_user)
@@ -332,6 +349,8 @@ async def admin_pack_new(request: Request, current_user: User = Depends(get_curr
 
 @router.get("/admin/packs/edit/{pack_id}", response_class=HTMLResponse)
 async def admin_pack_edit(request: Request, pack_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
     await _require_admin_or_user(current_user)
@@ -384,6 +403,8 @@ async def admin_pack_edit(request: Request, pack_id: int, current_user: User = D
 
 @router.post("/api/packs")
 async def api_create_pack(request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -458,6 +479,8 @@ async def api_create_pack(request: Request, current_user: User = Depends(get_cur
 
 @router.get("/api/packs")
 async def api_list_packs(request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -471,6 +494,8 @@ async def api_list_packs(request: Request, current_user: User = Depends(get_curr
 
 @router.get("/api/packs/{pack_id}")
 async def api_get_pack(pack_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -487,6 +512,8 @@ async def api_get_pack(pack_id: int, current_user: User = Depends(get_current_us
 
 @router.put("/api/packs/{pack_id}")
 async def api_update_pack(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -623,6 +650,8 @@ async def api_update_pack(pack_id: int, request: Request, current_user: User = D
 
 @router.delete("/api/packs/{pack_id}")
 async def api_delete_pack(pack_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -660,6 +689,8 @@ async def api_delete_pack(pack_id: int, current_user: User = Depends(get_current
 
 @router.post("/api/packs/{pack_id}/items")
 async def api_add_pack_item(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -708,6 +739,8 @@ async def api_add_pack_item(pack_id: int, request: Request, current_user: User =
 
 @router.delete("/api/packs/{pack_id}/items/{prompt_id}")
 async def api_remove_pack_item(pack_id: int, prompt_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -722,6 +755,8 @@ async def api_remove_pack_item(pack_id: int, prompt_id: int, current_user: User 
 
 @router.put("/api/packs/{pack_id}/items/reorder")
 async def api_reorder_pack_items(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -742,6 +777,8 @@ async def api_reorder_pack_items(pack_id: int, request: Request, current_user: U
 
 @router.get("/api/packs/{pack_id}/available-prompts")
 async def api_available_prompts(pack_id: int, search: str = "", current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -760,6 +797,8 @@ async def api_available_prompts(pack_id: int, search: str = "", current_user: Us
 
 @router.post("/api/packs/{pack_id}/publish")
 async def api_publish_pack(pack_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -895,6 +934,8 @@ async def api_publish_pack(pack_id: int, current_user: User = Depends(get_curren
 
 @router.post("/api/packs/{pack_id}/unpublish")
 async def api_unpublish_pack(pack_id: int, current_user: User = Depends(get_current_user)):
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -922,6 +963,8 @@ async def api_upload_cover_image(
     current_user: User = Depends(get_current_user),
 ):
     """Upload a cover image for a pack (240, 512, fullsize at 16:9)."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1044,13 +1087,14 @@ async def serve_pack_cover(
         raise HTTPException(status_code=404, detail="No cover image")
 
     is_public_published = pack_row["status"] == "published" and pack_row["is_public"]
-    if not is_public_published:
-        # Allow admin (any pack) or owner (admin/user) to see covers on non-published packs
-        is_authorized = False
-        if current_user is not None:
-            is_owner = pack_row["created_by_user_id"] == current_user.id
-            is_authorized = (await current_user.is_admin) or is_owner
-        if not is_authorized:
+    # Allow admin (any pack) or owner to see covers even when public serving is disabled.
+    is_authorized = False
+    if current_user is not None:
+        is_owner = pack_row["created_by_user_id"] == current_user.id
+        is_authorized = (await current_user.is_admin) or is_owner
+
+    if not is_authorized:
+        if not is_public_published or not marketplace_public_landings_enabled():
             raise HTTPException(status_code=404, detail="No cover image")
 
     # cover_image stores the internal base path; append size + extension
@@ -1072,6 +1116,8 @@ async def api_delete_cover_image(
     current_user: User = Depends(get_current_user),
 ):
     """Delete all cover image files for a pack and clear the DB field."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1212,6 +1258,8 @@ async def admin_pack_landing_config(
     current_user: User = Depends(get_current_user),
 ):
     """Configuration page for Pack Landing Pages."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
 
@@ -1287,6 +1335,8 @@ async def pack_ai_wizard_generate(
     current_user: User = Depends(get_current_user),
 ):
     """Start a background job to generate a landing page for a pack via AI Wizard."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1414,6 +1464,8 @@ async def pack_ai_wizard_modify(
     current_user: User = Depends(get_current_user),
 ):
     """Start a background job to modify an existing pack landing page via AI Wizard."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1529,6 +1581,8 @@ async def pack_ai_wizard_status(
     current_user: User = Depends(get_current_user),
 ):
     """Get the status of a pack landing page generation/modification job."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1573,6 +1627,8 @@ async def pack_ai_wizard_active_job(
     current_user: User = Depends(get_current_user),
 ):
     """Check if there's an active (pending/running) job for this pack."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -1979,6 +2035,8 @@ async def pack_landing_list_files(
     current_user: User = Depends(get_current_user),
 ):
     """List all files in the pack's landing page directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -2007,6 +2065,8 @@ async def pack_landing_delete_all_files(
     current_user: User = Depends(get_current_user),
 ):
     """Delete all landing page files for a pack (preserves images)."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -2045,6 +2105,8 @@ async def pack_landing_create_page(
     current_user: User = Depends(get_current_user),
 ):
     """Create a new HTML page in the pack landing directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -2107,6 +2169,8 @@ async def pack_landing_delete_page(
     current_user: User = Depends(get_current_user),
 ):
     """Delete an HTML page from the pack landing directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -2141,6 +2205,8 @@ async def pack_landing_edit_page(
     current_user: User = Depends(get_current_user),
 ):
     """Render the CodeMirror editor for a pack landing page."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
 
@@ -2206,6 +2272,8 @@ async def pack_landing_save_page(
     current_user: User = Depends(get_current_user),
 ):
     """Save a pack landing page from the CodeMirror editor (base64-encoded content)."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2261,6 +2329,8 @@ async def pack_landing_list_components(
     current_user: User = Depends(get_current_user),
 ):
     """Render the components list page for a pack."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -2306,6 +2376,8 @@ async def pack_landing_edit_component(
     current_user: User = Depends(get_current_user),
 ):
     """Render the editor for a pack landing component."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request})
 
@@ -2366,6 +2438,8 @@ async def pack_landing_save_component(
     current_user: User = Depends(get_current_user),
 ):
     """Save a pack landing component (base64-encoded content)."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2414,6 +2488,8 @@ async def pack_landing_create_component(
     current_user: User = Depends(get_current_user),
 ):
     """Create a new component file for a pack landing page."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2481,6 +2557,8 @@ async def pack_landing_delete_component(
     current_user: User = Depends(get_current_user),
 ):
     """Delete a component file from a pack landing page."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2520,6 +2598,8 @@ async def pack_landing_list_images(
     current_user: User = Depends(get_current_user),
 ):
     """List images in the pack's static/img/ directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2559,6 +2639,8 @@ async def pack_landing_upload_images(
     current_user: User = Depends(get_current_user),
 ):
     """Upload images to the pack's static/img/ directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2644,6 +2726,8 @@ async def pack_landing_delete_image(
     current_user: User = Depends(get_current_user),
 ):
     """Delete an image from a pack landing page's static/img/ directory."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2723,6 +2807,8 @@ async def api_revoke_pack_access(user_id: int, pack_id: int, current_user: User 
 
 @router.get("/api/explore/packs")
 async def api_explore_packs(search: str = "", page: int = 1, limit: int = 24, mine: int = 0, current_user: User = Depends(get_current_user)):
+    require_discovery_enabled()
+
     if page < 1:
         page = 1
     if limit < 1 or limit > 48:
@@ -2746,6 +2832,8 @@ async def api_explore_packs(search: str = "", page: int = 1, limit: int = 24, mi
 @router.get("/api/explore/packs/{pack_id}/items")
 async def api_explore_pack_items(pack_id: int):
     """Return items for a published public pack (used by explorer modal)."""
+    require_discovery_enabled()
+
     async with get_db_connection(readonly=True) as conn:
         pack = await get_pack(conn, pack_id)
         if not pack or pack["status"] != "published" or not pack["is_public"]:
@@ -2757,6 +2845,8 @@ async def api_explore_pack_items(pack_id: int):
 @router.post("/api/packs/{pack_id}/claim-free")
 async def api_claim_free_pack(pack_id: int, current_user: User = Depends(get_current_user)):
     """Claim a free pack for the logged-in user (grants PACK_ACCESS)."""
+    require_checkout_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -2817,6 +2907,8 @@ async def check_pack_access_endpoint(pack_id: int, current_user: User = Depends(
 @router.post("/api/packs/{pack_id}/purchase")
 async def api_purchase_pack(pack_id: int, request: Request, current_user: User = Depends(get_current_user)):
     """Create a Stripe Checkout Session to purchase a paid pack."""
+    require_checkout_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -3023,6 +3115,8 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
 @router.get("/api/packs/{pack_id}/purchases")
 async def api_get_pack_purchases(pack_id: int, current_user: User = Depends(get_current_user)):
     """Return purchase history for a pack (admin or pack creator only)."""
+    require_creator_tools_enabled()
+
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
@@ -3199,12 +3293,16 @@ async def _get_landing_pack(public_id: str):
 @router.get("/pack/{public_id}/{slug}")
 async def pack_landing_redirect_trailing_slash(public_id: str, slug: str):
     """Redirect /pack/x/y -> /pack/x/y/ so relative URLs work correctly."""
+    require_public_landings_enabled()
+
     return RedirectResponse(url=f"/pack/{public_id}/{slug}/", status_code=301)
 
 
 @router.get("/pack/{public_id}/{slug}/register", response_class=HTMLResponse)
 async def pack_register_page(request: Request, public_id: str, slug: str):
     """Registration page served from pack landing. Full implementation in Phase 1D-3."""
+    require_public_landings_enabled()
+
     pack = await _get_landing_pack(public_id)
     if not pack:
         return _landing_404()
@@ -3221,6 +3319,8 @@ async def pack_register_page(request: Request, public_id: str, slug: str):
 async def pack_landing_static(public_id: str, slug: str, resource_path: str):
     """Serve static resources (CSS, JS, images) for custom pack landing pages."""
     try:
+        require_public_landings_enabled()
+
         if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
             return _landing_404()
 
@@ -3268,6 +3368,8 @@ async def pack_landing_page(request: Request, public_id: str, slug: str):
     Otherwise render the default Jinja2 template with pack data.
     """
     try:
+        require_public_landings_enabled()
+
         if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
             return _landing_404()
 

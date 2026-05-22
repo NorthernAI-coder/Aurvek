@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+import atagia_sync
 from atagia_sync import (
     get_atagia_sync_status,
     record_atagia_message_link,
@@ -12,8 +13,13 @@ from atagia_sync import (
 
 
 class FakeBridge:
-    def __init__(self, fail_message_ids: set[int] | None = None) -> None:
+    def __init__(
+        self,
+        fail_message_ids: set[int] | None = None,
+        transient_lock_failures: dict[int, int] | None = None,
+    ) -> None:
         self.fail_message_ids = fail_message_ids or set()
+        self.transient_lock_failures = transient_lock_failures or {}
         self.ingest_calls: list[dict[str, Any]] = []
         self.flush_calls = 0
         self.last_error: Any | None = None
@@ -46,6 +52,16 @@ class FakeBridge:
                 "confirmation_strategy": confirmation_strategy,
             }
         )
+        remaining_lock_failures = self.transient_lock_failures.get(int(message_id or 0), 0)
+        if remaining_lock_failures:
+            self.transient_lock_failures[int(message_id or 0)] = remaining_lock_failures - 1
+            self.last_error = {
+                "operation": "ingest_message",
+                "error_type": "OperationalError",
+                "message": "database is locked",
+            }
+            return False
+
         if int(message_id or 0) in self.fail_message_ids:
             self.last_error = {
                 "operation": "ingest_message",
@@ -156,6 +172,43 @@ async def test_sync_all_history_records_errors_without_stopping_run(mock_db) -> 
     assert status["linked_messages"] == 2
     assert status["pending_messages"] == 1
     assert status["latest_run"]["status"] == "completed_with_errors"
+
+
+@pytest.mark.asyncio
+async def test_sync_all_history_retries_transient_atagia_database_locks(
+    mock_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_sleep(delay_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(atagia_sync, "_sleep_before_retry", no_sleep)
+    monkeypatch.setattr(atagia_sync, "TRANSIENT_INGEST_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+
+    async with mock_db() as conn:
+        await conn.execute(
+            "INSERT INTO CONVERSATIONS (id, user_id, role_id) VALUES (6, 18, 81)"
+        )
+        await conn.execute(
+            """
+            INSERT INTO MESSAGES (id, conversation_id, user_id, message, type, date)
+            VALUES (60, 6, 18, 'locked once', 'user', '2026-05-01 13:00:00')
+            """
+        )
+        await conn.commit()
+
+    bridge = FakeBridge(transient_lock_failures={60: 2})
+    summary = await sync_all_history(batch_size=10, bridge=bridge)
+
+    assert summary.status == "completed"
+    assert summary.processed_messages == 1
+    assert summary.linked_messages == 1
+    assert summary.failed_messages == 0
+    assert [call["message_id"] for call in bridge.ingest_calls] == [60, 60, 60]
+
+    status = await get_atagia_sync_status()
+    assert status["linked_messages"] == 1
+    assert status["pending_messages"] == 0
 
 
 @pytest.mark.asyncio

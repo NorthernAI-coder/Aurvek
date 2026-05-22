@@ -409,21 +409,24 @@ AURVEK/
 ├── database.py             # Async SQLite with connection pooling
 ├── ai_calls.py             # Unified AI provider interface + streaming
 ├── common.py               # Configuration, constants, cost calculations
-├── prompts.py              # Marketplace logic & file management
+├── prompts.py              # Prompt CRUD, publishing policy & file management
 ├── clients.py              # Shared API clients (Stripe, Twilio, Deepgram)
 ├── ranking.py              # Explore ranking algorithm & scheduling
 ├── message_search.py       # FTS5 full-text message search
-├── storefront_service.py   # Creator profiles & storefront logic
+├── marketplace/            # Optional marketplace package boundary
+│   ├── config.py           # Marketplace flags and kill-switch config
+│   ├── runtime.py          # Marketplace startup/runtime config refresh
+│   ├── landing/            # Landing wizard and async job helpers
+│   ├── middleware/         # Marketplace-specific middleware
+│   ├── routes/             # Marketplace routers (admin, packs, discovery, analytics, checkout, geo, ranking, domains)
+│   └── services/           # Storefront and marketplace service logic
 ├── twilio_async.py         # Async Twilio client (httpx, no SDK)
 ├── welcome_service.py      # Welcome page resolution & serving
 ├── security_guard_llm.py   # LLM-based content moderation
 ├── elevenlabs_service.py   # Voice calls, transcripts, agent management
 ├── whatsapp.py             # Twilio WhatsApp integration
 ├── middleware/
-│   ├── security.py         # Request filtering, IP blocking, WAF escalation
-│   └── custom_domains.py   # Custom domain resolution & caching
-├── routes/
-│   └── custom_domains.py   # Custom domain API endpoints
+│   └── security.py         # Request filtering, IP blocking, WAF escalation
 ├── tools/
 │   ├── watchdog.py         # Pre/post watchdog + hint escalation
 │   ├── llm_caller.py       # Non-streaming LLM caller for background tasks

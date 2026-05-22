@@ -99,6 +99,48 @@ async def test_finalize_activates_only_matching_pending_attachment(mock_db, tmp_
 
 
 @pytest.mark.asyncio
+async def test_pending_attachment_bytes_are_scoped_to_owner_and_conversation(mock_db, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(file_storage, "FILE_BLOB_ROOT", tmp_path / "file_blobs")
+    async with mock_db() as conn:
+        await _seed_user_conversation(conn, user_id=11, conversation_id=21)
+        await _seed_user_conversation(conn, user_id=12, conversation_id=22)
+
+    pending = await file_storage.create_pending_text_attachment(
+        user_id=11,
+        conversation_id=21,
+        text_content="pending text",
+        filename="pending.txt",
+    )
+
+    result = await file_storage.read_pending_attachment_bytes(
+        pending.public_id,
+        user_id=11,
+        conversation_id=21,
+    )
+    wrong_user = await file_storage.read_pending_attachment_bytes(
+        pending.public_id,
+        user_id=12,
+        conversation_id=21,
+    )
+    wrong_conversation = await file_storage.read_pending_attachment_bytes(
+        pending.public_id,
+        user_id=11,
+        conversation_id=22,
+    )
+
+    assert result is not None
+    data, attachment = result
+    assert data == b"pending text"
+    assert wrong_user is None
+    assert wrong_conversation is None
+
+    block = file_storage.attachment_record_to_block(attachment, data=data)
+    assert block["type"] == "text_file"
+    assert block["text_file"]["attachment_ref"] == pending.public_id
+    assert block["text_file"]["filename"] == "pending.txt"
+
+
+@pytest.mark.asyncio
 async def test_pending_pdf_block_includes_retry_file_hash(mock_db, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(file_storage, "FILE_BLOB_ROOT", tmp_path / "file_blobs")
     async with mock_db() as conn:

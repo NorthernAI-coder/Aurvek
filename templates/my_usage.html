@@ -222,6 +222,38 @@
     </div>
 </div>
 
+<!-- Session Health Summary -->
+<div class="section-container mb-4">
+    <div class="section-title"><i class="fas fa-heart-pulse me-2"></i>Session Health</div>
+    <div class="row">
+        <div class="col-md-3 col-6 mb-3">
+            <div class="stat-card info">
+                <div class="label">Current Active Minutes</div>
+                <div class="amount" id="wellbeingActiveMinutes">-</div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="stat-card primary">
+                <div class="label">User Messages</div>
+                <div class="amount" id="wellbeingUserMessages">-</div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="stat-card warning">
+                <div class="label">Reminders</div>
+                <div class="amount" id="wellbeingReminders">-</div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="stat-card success">
+                <div class="label">Long Sessions</div>
+                <div class="amount" id="wellbeingLongSessions">-</div>
+            </div>
+        </div>
+    </div>
+    <div class="text-muted small" id="wellbeingSummaryText">Loading session health...</div>
+</div>
+
 <div class="row">
     <!-- Usage by Type -->
     <div class="col-lg-5 mb-4">
@@ -281,6 +313,7 @@
 
             updateBalance(data.balance);
             updateStats(data.stats);
+            updateWellbeingSummary(data.wellbeing);
             updateUsageByType(data.by_type);
             updateChart(data.daily);
             updateDailyBreakdown(data.daily);
@@ -302,6 +335,24 @@
             formatNumber(stats.tokens_in || 0) + ' in / ' + formatNumber(stats.tokens_out || 0) + ' out';
         document.getElementById('statCost').textContent = '$' + (stats.total_cost || 0).toFixed(2);
         document.getElementById('statAvgDaily').textContent = '$' + (stats.avg_daily || 0).toFixed(2);
+    }
+
+    function updateWellbeingSummary(wellbeing) {
+        wellbeing = wellbeing || {};
+        const activeSession = wellbeing.active_session || {};
+        document.getElementById('wellbeingActiveMinutes').textContent =
+            activeSession.active_minutes !== undefined ? formatNumber(activeSession.active_minutes) : '-';
+        document.getElementById('wellbeingUserMessages').textContent = formatNumber(wellbeing.user_messages || 0);
+        document.getElementById('wellbeingReminders').textContent = formatNumber(wellbeing.reminders_shown || 0);
+        document.getElementById('wellbeingLongSessions').textContent = formatNumber(wellbeing.long_sessions || 0);
+
+        const summaryText = document.getElementById('wellbeingSummaryText');
+        if (summaryText) {
+            const sessionText = activeSession.id
+                ? `Current status: ${activeSession.current_severity || 'normal'}`
+                : 'No active continuous session';
+            summaryText.textContent = `${sessionText}. ${formatNumber(wellbeing.sessions || 0)} sessions in this period.`;
+        }
     }
 
     function updateUsageByType(byType) {

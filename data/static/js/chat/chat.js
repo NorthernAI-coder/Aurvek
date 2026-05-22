@@ -10,6 +10,7 @@ let allConversationsLoaded = false;
 let oldestLoadedActivity = null;
 let oldestLoadedId = null;
 let currentAbortController = null;
+let controller = null;
 let currentTimer = null;
 let lastSelectedConversationId = null;
 var botname = "bot";
@@ -1146,22 +1147,17 @@ function sendMessage(messageText, options = {}) {
     imagePreviews.innerHTML = '';
 
     const filesForRetry = Array.from(outgoingFiles || []);
+    const hadOutgoingAttachments = filesForRetry.length > 0;
     const retryRangeBaseStart = Number.isInteger(parseInt(options.pdfPageStart, 10))
         ? parseInt(options.pdfPageStart, 10)
         : 1;
-    const renderedAttachmentElements = processFiles(
-        outgoingFiles || [],
-        formData,
-        imagePreviews,
-        sendConversationId,
-        {
-            pdfPageStart: options.pdfPageStart || null,
-            pdfPageEnd: options.pdfPageEnd || null,
-        }
-    ) || [];
-    if (!options.filesOverride) {
-        attachedFiles = [];
-    }
+    const attachmentDisplayOptions = {
+        pdfPageStart: options.pdfPageStart || null,
+        pdfPageEnd: options.pdfPageEnd || null,
+    };
+    let renderedAttachmentElements = [];
+    renderedAttachmentElements.cancelled = false;
+    renderedAttachmentElements.attachmentRefs = [];
 
     // Hoisted for error cleanup access across the entire promise chain
     let botMessageElement = null;
@@ -1171,10 +1167,19 @@ function sendMessage(messageText, options = {}) {
     let streamSucceeded = false;
     let pdfTooLargeError = null;
     let pdfRangeRetryStarted = false;
+    let uploadedAttachmentRefs = [];
     userStopped = false;
 
+    function discardUploadedRefs() {
+        if (uploadedAttachmentRefs.length === 0) return;
+        if (typeof discardUploadedAttachmentRefs === 'function') {
+            discardUploadedAttachmentRefs(sendConversationId, uploadedAttachmentRefs);
+        }
+        uploadedAttachmentRefs = [];
+    }
+
     function cleanupFailedStream(userMsgEl, botMsgEl, restoreText) {
-        const hadAttachments = formData.getAll('file').length > 0;
+        const hadAttachments = hadOutgoingAttachments;
         renderedAttachmentElements.cancelled = true;
 
         // Remove empty/partial bot bubble
@@ -1389,18 +1394,61 @@ function sendMessage(messageText, options = {}) {
 
     controller = new AbortController();
     const signal = controller.signal;
+    const attachmentTimeoutMessage = 'The request timed out while Aurvek was processing the message. Uploaded files were not linked to a saved message; please try again or choose a smaller PDF range.';
 
     toggleSendButton('Stop');
 
-    secureFetch(`/api/conversations/${sendConversationId}/messages`, {
+    Promise.resolve()
+    .then(() => {
+        if (!hadOutgoingAttachments) {
+            return [];
+        }
+        if (typeof uploadAttachmentsForMessage !== 'function') {
+            const error = new Error('Attachment upload is not available. Reload the page and try again.');
+            error.uploadFailed = true;
+            throw error;
+        }
+        return uploadAttachmentsForMessage(
+            filesForRetry,
+            sendConversationId,
+            {
+                ...attachmentDisplayOptions,
+                signal,
+            }
+        );
+    })
+    .then((uploadedElements) => {
+        if (uploadedElements && uploadedElements.length) {
+            renderedAttachmentElements = uploadedElements;
+            const refs = (uploadedElements.attachmentRefs || [])
+                .map((attachment) => attachment.attachment_ref)
+                .filter(Boolean);
+            if (refs.length > 0) {
+                uploadedAttachmentRefs = refs;
+                formData.append('attachment_refs', JSON.stringify(refs));
+            }
+        }
+        if (hadOutgoingAttachments && !formData.has('attachment_refs')) {
+            const error = new Error('Attachment upload did not complete.');
+            error.uploadFailed = true;
+            throw error;
+        }
+        if (!options.filesOverride) {
+            attachedFiles = [];
+        }
+        return secureFetch(`/api/conversations/${sendConversationId}/messages`, {
         method: 'POST',
         body: formData,
         signal: signal,
+        });
     })
     .then(response => {
 
         const extractServerError = (resp) => {
             if (!resp) return Promise.resolve('Request failed');
+            if (resp.status === 524) {
+                return Promise.resolve(attachmentTimeoutMessage);
+            }
             return resp.clone().json()
                 .then((body) => {
                     if (!body || typeof body !== 'object') return `Request failed (${resp.status})`;
@@ -1418,9 +1466,11 @@ function sendMessage(messageText, options = {}) {
 
         if (!response) {
             // secureFetch returned null (session expired)
+            discardUploadedRefs();
             return null;
         }
         if (response.status === 401) {
+            discardUploadedRefs();
             return response.json().then(data => {
                 if (data.redirect) {
                     window.location.href = data.redirect;
@@ -1429,6 +1479,7 @@ function sendMessage(messageText, options = {}) {
             });
         }
         if (response.status === 403) {
+            discardUploadedRefs();
             cleanupFailedStream(userMessageElement, botMessageElement, true);
             document.getElementById('loading-indicator').style.display = 'none';
 
@@ -1465,15 +1516,18 @@ function sendMessage(messageText, options = {}) {
                 .then((body) => {
                     if (body && (body.error_code === 'pdf_too_large' || body.pdf_too_large === true)) {
                         pdfTooLargeError = body;
+                        discardUploadedRefs();
                         showPdfRangeRetryModal(body);
                         return null;
                     }
+                    discardUploadedRefs();
                     cleanupFailedStream(userMessageElement, botMessageElement, true);
                     const msg = body?.error || body?.message || body?.detail || `Request failed (${response.status})`;
                     NotificationModal.error('Send failed', String(msg));
                     return null;
                 })
                 .catch(() => {
+                    discardUploadedRefs();
                     cleanupFailedStream(userMessageElement, botMessageElement, true);
                     return extractServerError(response).then((msg) => {
                         NotificationModal.error('Send failed', String(msg));
@@ -1483,6 +1537,7 @@ function sendMessage(messageText, options = {}) {
         }
 
         if (!response.body) {
+            discardUploadedRefs();
             cleanupFailedStream(userMessageElement, botMessageElement, true);
             NotificationModal.error('Send failed', 'No response stream received from server.');
             return null;
@@ -1702,7 +1757,7 @@ function sendMessage(messageText, options = {}) {
 						}
 						if (!streamContentReceived && !streamErrorOccurred) {
 							cleanupFailedStream(userMessageElement, botMessageElement, true);
-							const hadAttachments = formData.getAll('file').length > 0;
+                            const hadAttachments = hadOutgoingAttachments;
 						if (hadAttachments) {
 							NotificationModal.error('Empty response',
 								'The AI returned an empty response. Files were uploaded but the response failed. Please re-attach your files and try again.');
@@ -1742,7 +1797,7 @@ function sendMessage(messageText, options = {}) {
 	                            }
 	                            if (!streamContentReceived && !streamErrorOccurred) {
 	                                cleanupFailedStream(userMessageElement, botMessageElement, true);
-                                const hadAttachments = formData.getAll('file').length > 0;
+                                const hadAttachments = hadOutgoingAttachments;
                                 if (hadAttachments) {
                                     NotificationModal.error('Empty response',
                                         'The AI returned an empty response. Files were uploaded but the response failed. Please re-attach your files and try again.');
@@ -2036,7 +2091,34 @@ function sendMessage(messageText, options = {}) {
         });
     })
     .catch(error => {
+        if (error.uploadFailed) {
+            if (error.renderedAttachmentElements) {
+                renderedAttachmentElements = error.renderedAttachmentElements;
+                uploadedAttachmentRefs = typeof getAttachmentRefsFromUploadElements === 'function'
+                    ? getAttachmentRefsFromUploadElements(renderedAttachmentElements)
+                    : uploadedAttachmentRefs;
+            }
+            discardUploadedRefs();
+            if (botMessageElement && botMessageElement.parentNode) {
+                botMessageElement.remove();
+            }
+            if (userMessageElement && userMessageElement.parentNode) {
+                document.getElementById('message-text').value = messageText_raw;
+                userMessageElement.remove();
+            }
+            removeLoadingIndicator();
+            toggleSendButton('Send');
+            document.getElementById('message-text').disabled = false;
+            const submitBtn = document.querySelector('#form-message button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = false;
+            document.getElementById('message-text').focus();
+            document.getElementById('message-text').style.height = 'auto';
+            NotificationModal.error('Upload failed', error.message || 'Attachment upload failed before the message was sent.');
+            return;
+        }
+
         if (error.name === 'AbortError') {
+            discardUploadedRefs();
             removeLoadingIndicator();
             toggleSendButton('Send');
             document.getElementById('message-text').disabled = false;
@@ -2059,11 +2141,12 @@ function sendMessage(messageText, options = {}) {
             NotificationModal.warning('Stream interrupted',
                 'The response was interrupted. Partial content may have been saved. Reload to verify.');
         } else {
+            discardUploadedRefs();
             cleanupFailedStream(userMessageElement, botMessageElement, true);
-            const hadAttachments = formData.getAll('file').length > 0;
+            const hadAttachments = hadOutgoingAttachments;
             if (hadAttachments) {
                 NotificationModal.error('Message failed',
-                    'The AI could not process your message. Files were uploaded but the response failed. Please re-attach your files and send again.');
+                    attachmentTimeoutMessage);
             } else {
                 NotificationModal.error('Message failed',
                     'The message could not be sent. Your text has been restored. Please try again.');
@@ -3769,6 +3852,18 @@ function initIncognitoChatControls() {
     });
 }
 
+function getSelectedNewChatLlmId(options = {}) {
+    options = options || {};
+    const explicitLlmId = options.llm_id !== undefined ? options.llm_id : options.llmId;
+    const rawValue = explicitLlmId !== undefined && explicitLlmId !== null && explicitLlmId !== ''
+        ? explicitLlmId
+        : document.getElementById('llmDropdown')?.value;
+    const parsed = parseInt(rawValue, 10);
+    return isNaN(parsed) || parsed <= 0 ? null : parsed;
+}
+
+window.getSelectedNewChatLlmId = getSelectedNewChatLlmId;
+
 function startNewConversation(promptId = null, options = {}) {
     if (admin_view) {
         return Promise.resolve();
@@ -3795,6 +3890,10 @@ function startNewConversation(promptId = null, options = {}) {
     }
     if (incognito) {
         body.incognito = true;
+    }
+    const llmId = getSelectedNewChatLlmId(options);
+    if (llmId !== null) {
+        body.llm_id = llmId;
     }
 
     return maybeCloseCurrentIncognitoBeforeLeaving().then(canContinue => {
@@ -3841,6 +3940,13 @@ function stopReceivingStream(event) {
         event.preventDefault();
     }
     userStopped = true;
+    if (controller) {
+        try {
+            controller.abort();
+        } catch (err) {
+            console.warn('Could not abort active request:', err);
+        }
+    }
 
     fetch(`/api/conversations/${currentConversationId}/stop`, {
         method: 'POST'

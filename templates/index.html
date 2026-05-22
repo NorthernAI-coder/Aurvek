@@ -109,9 +109,12 @@
                         <div class="section-title"><i class="fas fa-file-alt"></i> Content</div>
                         <div class="d-flex flex-column">
                             <a href="/prompts" class="dashboard-card-link"><i class="fas fa-magic"></i> Prompts Management</a>
+                            {% if marketplace.creator_tools_enabled|default(false) %}
                             <a href="/admin/packs" class="dashboard-card-link"><i class="fas fa-box-open"></i> Manage Packs</a>
+                            {% endif %}
                             <a href="/admin/elevenlabs-agents" class="dashboard-card-link"><i class="fas fa-headset"></i> ElevenLabs Agents</a>
                             <!-- Landing Pages subsection -->
+                            {% if marketplace.creator_tools_enabled|default(false) %}
                             <hr class="my-2">
                             <div class="section-title" style="font-size: 0.9rem; margin-bottom: 0.5rem;">
                                 <i class="fas fa-globe"></i> Landing Pages
@@ -143,6 +146,7 @@
                             {% else %}
                             <p class="text-muted mb-0" style="font-size:0.85rem;">You don't have any prompts to configure. <a href="/prompts/new">Create your first prompt</a>.</p>
                             {% endif %}
+                            {% endif %}
                         </div>
                     </div>
                 </div>
@@ -151,11 +155,17 @@
                     <div class="section-container h-100">
                         <div class="section-title"><i class="fas fa-chart-line"></i> Business</div>
                         <div class="d-flex flex-column">
+                            {% if marketplace.creator_tools_enabled|default(false) %}
                             <a href="/my-earnings" class="dashboard-card-link"><i class="fas fa-dollar-sign"></i> My Earnings</a>
                             <a href="/curation-settings" class="dashboard-card-link"><i class="fas fa-star"></i> Curation Settings</a>
+                            {% endif %}
                             <a href="/my-branding" class="dashboard-card-link"><i class="fas fa-paint-brush"></i> My Branding</a>
+                            {% if marketplace.storefronts_enabled|default(false) %}
                             <a href="/my-storefront" class="dashboard-card-link"><i class="fas fa-store"></i> My Storefront</a>
+                            {% endif %}
+                            {% if marketplace.creator_tools_enabled|default(false) %}
                             <a href="/user/landing-analytics" class="dashboard-card-link"><i class="fas fa-chart-area"></i> Landing Analytics</a>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
@@ -206,6 +216,7 @@
                             <a href="/admin/task-manager" class="dashboard-card-link"><i class="fas fa-tasks"></i> Task Manager</a>
                             <a href="/admin/chat" class="dashboard-card-link"><i class="fas fa-comments"></i> Admin Chat</a>
                             <a href="/admin/usage" class="dashboard-card-link"><i class="fas fa-chart-pie"></i> Platform Usage</a>
+                            <a href="/admin/session-health" class="dashboard-card-link"><i class="fas fa-heart-pulse"></i> Session Health</a>
                             <a href="/admin/security" class="dashboard-card-link" style="color:var(--danger);"><i class="fas fa-shield-alt" style="color:var(--danger);"></i> Security Operations</a>
                             <a href="/admin/security-guard" class="dashboard-card-link" style="color:var(--danger);"><i class="fas fa-user-shield" style="color:var(--danger);"></i> Security Guard</a>
                             <a href="/admin/geo" class="dashboard-card-link" style="color:var(--danger);"><i class="fas fa-globe" style="color:var(--danger);"></i> Geo-Blocking</a>
@@ -251,6 +262,7 @@
                             <a href="/admin/telegram" class="dashboard-card-link" style="color: #0088cc;"><i class="fab fa-telegram" style="color: #0088cc;"></i> Telegram</a>
                             <a href="/admin/pricing" class="dashboard-card-link"><i class="fas fa-tags"></i> Admin Pricing</a>
                             <a href="/admin/ranking" class="dashboard-card-link"><i class="fas fa-sort-amount-down"></i> Ranking Config</a>
+                            <a href="/admin/marketplace" class="dashboard-card-link"><i class="fas fa-store-slash"></i> Marketplace Controls</a>
                             <a href="/admin/discount-list" class="dashboard-card-link"><i class="fas fa-percent"></i> Manage Discounts</a>
                             <!-- Dev Mode toggle -->
                             <div class="d-flex justify-content-between align-items-center mb-2 px-1">

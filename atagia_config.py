@@ -137,6 +137,16 @@ async def save_atagia_admin_config(payload: dict[str, Any]) -> dict[str, str]:
     return {key: fresh.get(key, "") for key in updates}
 
 
+async def reset_atagia_admin_config() -> dict[str, str]:
+    """Remove saved Atagia overrides so env/default values take effect again."""
+    async with database.get_db_connection() as conn:
+        await conn.execute("DELETE FROM SYSTEM_CONFIG WHERE key LIKE 'atagia\\_%' ESCAPE '\\'")
+        await conn.commit()
+
+    invalidate_atagia_config_cache()
+    return await get_atagia_config()
+
+
 async def preview_bridge_config_from_admin_payload(payload: dict[str, Any]) -> AtagiaBridgeConfig:
     """Build a connection-test config from unsaved admin values."""
     current = await get_atagia_config()
@@ -249,11 +259,13 @@ def _admin_payload_to_config_updates(
     }
 
     api_key = _clean(payload.get("service_api_key"))
-    if api_key or not preserve_blank_secret:
+    clear_service_api_key = _parse_bool(payload.get("clear_service_api_key"))
+    if api_key or clear_service_api_key or not preserve_blank_secret:
         updates["atagia_service_api_key"] = api_key or ""
 
     admin_api_key = _clean(payload.get("admin_api_key"))
-    if admin_api_key or not preserve_blank_secret:
+    clear_admin_api_key = _parse_bool(payload.get("clear_admin_api_key"))
+    if admin_api_key or clear_admin_api_key or not preserve_blank_secret:
         updates["atagia_admin_api_key"] = admin_api_key or ""
 
     return updates

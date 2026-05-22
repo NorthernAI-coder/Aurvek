@@ -370,6 +370,239 @@
 #chat-folders-container {
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.folder-item {
+    min-width: 0;
+}
+
+.folder-item > .d-flex.align-items-center.flex-grow-1 {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.folder-item .folder-name {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    line-height: 1.25;
+}
+
+.folder-actions {
+    flex: 0 0 auto;
+}
+
+.folder-chat-item,
+.folder-chat-item .chat-content-container,
+.folder-chat-item .chat-content {
+    min-width: 0;
+}
+
+.folder-chat-item .chat-content {
+    flex: 1 1 auto;
+}
+
+.folder-chat-item .chat-menu {
+    flex: 0 0 auto;
+}
+
+.folder-chat-item .chat-name {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Theme-aware chat scrollbars: sidebar, folder lists, and message history. */
+html[data-theme="default"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(64, 68, 75, 0.45);
+    --chat-scrollbar-thumb: rgba(142, 161, 225, 0.62);
+    --chat-scrollbar-thumb-hover: rgba(142, 161, 225, 0.88);
+    --chat-scrollbar-border: 2px solid rgba(32, 34, 37, 0.75);
+}
+
+html[data-theme="light"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(224, 231, 239, 0.8);
+    --chat-scrollbar-thumb: rgba(0, 86, 179, 0.45);
+    --chat-scrollbar-thumb-hover: rgba(0, 86, 179, 0.7);
+    --chat-scrollbar-border: 2px solid rgba(248, 249, 250, 0.9);
+}
+
+html[data-theme="writer"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(212, 201, 184, 0.55);
+    --chat-scrollbar-thumb: rgba(109, 88, 64, 0.48);
+    --chat-scrollbar-thumb-hover: rgba(109, 88, 64, 0.72);
+    --chat-scrollbar-border: 2px solid rgba(240, 235, 227, 0.9);
+}
+
+html[data-theme="coder"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 6px;
+    --chat-scrollbar-track: rgba(60, 60, 60, 0.72);
+    --chat-scrollbar-thumb: rgba(0, 120, 212, 0.6);
+    --chat-scrollbar-thumb-hover: rgba(55, 148, 255, 0.84);
+    --chat-scrollbar-border: 2px solid rgba(37, 37, 38, 0.95);
+}
+
+html[data-theme="terminal"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 2px;
+    --chat-scrollbar-track: rgba(0, 35, 0, 0.9);
+    --chat-scrollbar-thumb: rgba(0, 255, 255, 0.5);
+    --chat-scrollbar-thumb-hover: rgba(0, 255, 0, 0.72);
+    --chat-scrollbar-border: 1px solid rgba(0, 0, 0, 0.9);
+}
+
+html[data-theme="eink"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 3px;
+    --chat-scrollbar-track: rgba(221, 221, 221, 0.85);
+    --chat-scrollbar-thumb: rgba(51, 51, 51, 0.48);
+    --chat-scrollbar-thumb-hover: rgba(0, 0, 0, 0.68);
+    --chat-scrollbar-border: 2px solid rgba(242, 242, 242, 0.95);
+}
+
+html[data-theme="memphis"] {
+    --chat-scrollbar-size: 11px;
+    --chat-scrollbar-radius: 2px;
+    --chat-scrollbar-track: rgba(255, 215, 0, 0.75);
+    --chat-scrollbar-thumb: rgba(194, 54, 0, 0.78);
+    --chat-scrollbar-thumb-hover: rgba(184, 0, 110, 0.88);
+    --chat-scrollbar-border: 2px solid rgba(0, 0, 0, 0.9);
+}
+
+html[data-theme="katarishoji"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(10, 25, 47, 0.72);
+    --chat-scrollbar-thumb: rgba(191, 161, 106, 0.62);
+    --chat-scrollbar-thumb-hover: rgba(212, 175, 55, 0.86);
+    --chat-scrollbar-border: 2px solid rgba(10, 25, 47, 0.95);
+}
+
+html[data-theme="xmas"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(26, 71, 42, 0.72);
+    --chat-scrollbar-thumb: rgba(255, 90, 90, 0.62);
+    --chat-scrollbar-thumb-hover: rgba(255, 216, 77, 0.84);
+    --chat-scrollbar-border: 2px solid rgba(15, 13, 14, 0.92);
+}
+
+html[data-theme="halloween"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 6px;
+    --chat-scrollbar-track: rgba(43, 21, 0, 0.82);
+    --chat-scrollbar-thumb: rgba(255, 102, 0, 0.66);
+    --chat-scrollbar-thumb-hover: rgba(255, 153, 51, 0.9);
+    --chat-scrollbar-border: 2px solid rgba(26, 13, 0, 0.95);
+}
+
+html[data-theme="valentinesday"] {
+    --chat-scrollbar-size: 10px;
+    --chat-scrollbar-radius: 999px;
+    --chat-scrollbar-track: rgba(255, 240, 245, 0.9);
+    --chat-scrollbar-thumb: rgba(199, 21, 133, 0.48);
+    --chat-scrollbar-thumb-hover: rgba(199, 21, 133, 0.72);
+    --chat-scrollbar-border: 2px solid rgba(255, 209, 220, 0.95);
+}
+
+html:is(
+    [data-theme="default"],
+    [data-theme="light"],
+    [data-theme="writer"],
+    [data-theme="coder"],
+    [data-theme="terminal"],
+    [data-theme="eink"],
+    [data-theme="memphis"],
+    [data-theme="katarishoji"],
+    [data-theme="xmas"],
+    [data-theme="halloween"],
+    [data-theme="valentinesday"]
+) :is(#sidebar, #chat-folders-container, .folder-chats-container, .chat-window, .search-results-list) {
+    scrollbar-width: thin;
+    scrollbar-color: var(--chat-scrollbar-thumb) var(--chat-scrollbar-track);
+}
+
+html:is(
+    [data-theme="default"],
+    [data-theme="light"],
+    [data-theme="writer"],
+    [data-theme="coder"],
+    [data-theme="terminal"],
+    [data-theme="eink"],
+    [data-theme="memphis"],
+    [data-theme="katarishoji"],
+    [data-theme="xmas"],
+    [data-theme="halloween"],
+    [data-theme="valentinesday"]
+) :is(#sidebar, #chat-folders-container, .folder-chats-container, .chat-window, .search-results-list)::-webkit-scrollbar {
+    width: var(--chat-scrollbar-size);
+    height: var(--chat-scrollbar-size);
+}
+
+html:is(
+    [data-theme="default"],
+    [data-theme="light"],
+    [data-theme="writer"],
+    [data-theme="coder"],
+    [data-theme="terminal"],
+    [data-theme="eink"],
+    [data-theme="memphis"],
+    [data-theme="katarishoji"],
+    [data-theme="xmas"],
+    [data-theme="halloween"],
+    [data-theme="valentinesday"]
+) :is(#sidebar, #chat-folders-container, .folder-chats-container, .chat-window, .search-results-list)::-webkit-scrollbar-track {
+    background: var(--chat-scrollbar-track);
+    border-radius: var(--chat-scrollbar-radius);
+}
+
+html:is(
+    [data-theme="default"],
+    [data-theme="light"],
+    [data-theme="writer"],
+    [data-theme="coder"],
+    [data-theme="terminal"],
+    [data-theme="eink"],
+    [data-theme="memphis"],
+    [data-theme="katarishoji"],
+    [data-theme="xmas"],
+    [data-theme="halloween"],
+    [data-theme="valentinesday"]
+) :is(#sidebar, #chat-folders-container, .folder-chats-container, .chat-window, .search-results-list)::-webkit-scrollbar-thumb {
+    background: var(--chat-scrollbar-thumb);
+    border: var(--chat-scrollbar-border);
+    border-radius: var(--chat-scrollbar-radius);
+    background-clip: padding-box;
+}
+
+html:is(
+    [data-theme="default"],
+    [data-theme="light"],
+    [data-theme="writer"],
+    [data-theme="coder"],
+    [data-theme="terminal"],
+    [data-theme="eink"],
+    [data-theme="memphis"],
+    [data-theme="katarishoji"],
+    [data-theme="xmas"],
+    [data-theme="halloween"],
+    [data-theme="valentinesday"]
+) :is(#sidebar, #chat-folders-container, .folder-chats-container, .chat-window, .search-results-list)::-webkit-scrollbar-thumb:hover {
+    background: var(--chat-scrollbar-thumb-hover);
 }
 
 /* "Load more" button for the folders list */

@@ -4,6 +4,8 @@
     let homeData = null;
     let welcomeMessages = null;
     const canManage = window._homeConfig && window._homeConfig.canManage;
+    const marketplaceEnabled = !window._homeConfig || window._homeConfig.marketplaceEnabled !== false;
+    const marketplaceDiscoveryEnabled = !window._homeConfig || window._homeConfig.marketplaceDiscoveryEnabled !== false;
     const minimizedWindows = new Set();
     let readTimers = {};
 
@@ -25,7 +27,9 @@
             savedMinimized.forEach(function(id) { minimizedWindows.add(id); });
 
             render();
-            await loadWelcomeMessages();
+            if (marketplaceEnabled) {
+                await loadWelcomeMessages();
+            }
         } catch (e) {
             console.error('Home init error:', e);
         }
@@ -36,10 +40,14 @@
         renderGreeting();
         renderChatInput();
         renderFavorites();
-        renderLatestPrompts();
-        renderMyLibrary('prompts');
+        if (marketplaceEnabled) {
+            renderLatestPrompts();
+            renderMyLibrary('prompts');
+        }
         bindEvents();
-        applyMinimizedState();
+        if (marketplaceEnabled) {
+            applyMinimizedState();
+        }
     }
 
     // ==================== Branding ====================
@@ -155,10 +163,13 @@
 
     // ==================== Latest Prompts ====================
     function renderLatestPrompts() {
+        if (!marketplaceEnabled || !marketplaceDiscoveryEnabled) return;
+
         var items = homeData.latest_prompts || [];
         if (!items.length) return;
 
         var section = document.getElementById('win-latest');
+        if (!section) return;
         section.style.display = '';
 
         var now = new Date();
@@ -189,6 +200,7 @@
         var list = document.getElementById('home-library-list');
         var emptyEl = document.getElementById('home-library-empty');
         var viewAllBtn = document.getElementById('home-view-all-btn');
+        if (!list || !emptyEl || !viewAllBtn) return;
         var items;
         var maxItems = 5;
 
@@ -231,6 +243,7 @@
     // ==================== View All Modal ====================
     function openViewAllModal(tab) {
         var overlay = document.getElementById('home-modal-overlay');
+        if (!overlay) return;
         overlay.style.display = '';
         renderModalList(tab || 'prompts');
         var tabs = document.querySelectorAll('#home-modal-tabs .home-tab');
@@ -243,6 +256,7 @@
 
     function renderModalList(tab) {
         var list = document.getElementById('home-modal-list');
+        if (!list) return;
         var items = (tab === 'packs') ? (homeData.packs || []) : (homeData.prompts || []);
 
         list.innerHTML = items.map(function(item) {
@@ -264,12 +278,17 @@
     }
 
     function closeModal() {
-        document.getElementById('home-modal-overlay').style.display = 'none';
+        var overlay = document.getElementById('home-modal-overlay');
+        if (overlay) overlay.style.display = 'none';
     }
 
     // ==================== Welcome Messages ====================
 
     async function loadWelcomeMessages() {
+        if (!marketplaceEnabled) return;
+        var welcomeWindow = document.getElementById('win-welcome');
+        if (!welcomeWindow) return;
+
         try {
             var resp = await fetch('/api/home/welcome-messages');
             if (!resp.ok) return;
@@ -278,7 +297,7 @@
 
             if (!welcomeMessages.length) {
                 // No messages: hide window, prune from minimized
-                document.getElementById('win-welcome').style.display = 'none';
+                welcomeWindow.style.display = 'none';
                 if (minimizedWindows.has('welcome')) {
                     minimizedWindows.delete('welcome');
                     saveMinimizedState();
@@ -288,7 +307,7 @@
 
             // Show welcome window (unless minimized)
             if (!minimizedWindows.has('welcome')) {
-                document.getElementById('win-welcome').style.display = '';
+                welcomeWindow.style.display = '';
             }
 
             renderWelcomeSelector();
@@ -309,6 +328,7 @@
     function renderWelcomeSelector() {
         var layout = document.querySelector('.welcome-layout');
         var selector = document.getElementById('welcome-selector');
+        if (!layout || !selector) return;
 
         // If only 1 message, hide selector
         if (welcomeMessages.length === 1) {
@@ -371,6 +391,7 @@
         });
 
         var display = document.getElementById('welcome-display');
+        if (!display) return;
 
         var avatarHtml = msg.image_url
             ? '<img src="' + escapeHtml(msg.image_url) + '" alt="">'
@@ -544,6 +565,7 @@
 
     function renderDock() {
         var dock = document.getElementById('dock');
+        if (!dock) return;
         if (minimizedWindows.size === 0) {
             dock.classList.remove('visible');
             document.body.style.paddingBottom = '';
@@ -582,8 +604,10 @@
     function checkRowVisibility() {
         var row = document.getElementById('windows-row');
         if (!row) return;
-        var latestHidden = document.getElementById('win-latest').style.display === 'none';
-        var libraryHidden = document.getElementById('win-library').style.display === 'none';
+        var latestEl = document.getElementById('win-latest');
+        var libraryEl = document.getElementById('win-library');
+        var latestHidden = !latestEl || latestEl.style.display === 'none';
+        var libraryHidden = !libraryEl || libraryEl.style.display === 'none';
 
         if (latestHidden && libraryHidden) {
             row.style.display = 'none';
@@ -664,42 +688,53 @@
 
         // Tab toggles (library)
         var tabToggle = document.getElementById('home-tab-toggle');
-        tabToggle.addEventListener('click', function(e) {
-            var btn = e.target.closest('.home-tab');
-            if (!btn) return;
-            var tab = btn.getAttribute('data-tab');
-            tabToggle.querySelectorAll('.home-tab').forEach(function(t) { t.classList.remove('active'); });
-            btn.classList.add('active');
-            renderMyLibrary(tab);
-        });
+        if (tabToggle) {
+            tabToggle.addEventListener('click', function(e) {
+                var btn = e.target.closest('.home-tab');
+                if (!btn) return;
+                var tab = btn.getAttribute('data-tab');
+                tabToggle.querySelectorAll('.home-tab').forEach(function(t) { t.classList.remove('active'); });
+                btn.classList.add('active');
+                renderMyLibrary(tab);
+            });
+        }
 
         // View All button
-        document.getElementById('home-view-all-btn').addEventListener('click', function(e) {
-            e.preventDefault();
-            var activeTab = tabToggle.querySelector('.home-tab.active');
-            openViewAllModal(activeTab ? activeTab.getAttribute('data-tab') : 'prompts');
-        });
+        var viewAllBtn = document.getElementById('home-view-all-btn');
+        if (viewAllBtn && tabToggle) {
+            viewAllBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                var activeTab = tabToggle.querySelector('.home-tab.active');
+                openViewAllModal(activeTab ? activeTab.getAttribute('data-tab') : 'prompts');
+            });
+        }
 
         // Modal
-        document.getElementById('home-modal-close').addEventListener('click', closeModal);
-        document.getElementById('home-modal-overlay').addEventListener('click', function(e) {
-            if (e.target === this) closeModal();
-        });
+        var modalClose = document.getElementById('home-modal-close');
+        if (modalClose) modalClose.addEventListener('click', closeModal);
+        var modalOverlay = document.getElementById('home-modal-overlay');
+        if (modalOverlay) {
+            modalOverlay.addEventListener('click', function(e) {
+                if (e.target === this) closeModal();
+            });
+        }
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') closeModal();
         });
 
         var modalTabs = document.getElementById('home-modal-tabs');
-        modalTabs.addEventListener('click', function(e) {
-            var btn = e.target.closest('.home-tab');
-            if (!btn) return;
-            var tab = btn.getAttribute('data-tab');
-            modalTabs.querySelectorAll('.home-tab').forEach(function(t) { t.classList.remove('active'); });
-            btn.classList.add('active');
-            var title = document.querySelector('.home-modal-title');
-            if (title) title.textContent = (tab === 'packs') ? 'All Packs' : 'All Prompts';
-            renderModalList(tab);
-        });
+        if (modalTabs) {
+            modalTabs.addEventListener('click', function(e) {
+                var btn = e.target.closest('.home-tab');
+                if (!btn) return;
+                var tab = btn.getAttribute('data-tab');
+                modalTabs.querySelectorAll('.home-tab').forEach(function(t) { t.classList.remove('active'); });
+                btn.classList.add('active');
+                var title = document.querySelector('.home-modal-title');
+                if (title) title.textContent = (tab === 'packs') ? 'All Packs' : 'All Prompts';
+                renderModalList(tab);
+            });
+        }
 
         // Window minimize buttons
         document.querySelectorAll('.window-minimize-btn').forEach(function(btn) {

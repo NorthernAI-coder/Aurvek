@@ -325,6 +325,53 @@ async def discard_pending_attachments(public_ids: Iterable[str] | None, reason: 
         logger.info("Discarded %d pending attachment(s): %s", len(refs), reason)
 
 
+async def discard_pending_attachments_for_user(
+    public_ids: Iterable[str] | None,
+    *,
+    user_id: int,
+    conversation_id: int,
+    reason: str = "",
+) -> int:
+    refs = [ref for ref in (public_ids or []) if ref]
+    if not refs:
+        return 0
+    blob_ids: list[int] = []
+    discarded = 0
+    async with database.get_db_connection() as conn:
+        await ensure_file_storage_schema(conn)
+        placeholders = ",".join("?" for _ in refs)
+        params = (*refs, user_id, conversation_id)
+        cursor = await conn.execute(
+            f"""
+            SELECT DISTINCT blob_id
+            FROM FILE_ATTACHMENTS
+            WHERE status = 'pending'
+              AND public_id IN ({placeholders})
+              AND user_id = ?
+              AND conversation_id = ?
+            """,
+            params,
+        )
+        blob_ids = [int(row[0]) for row in await cursor.fetchall()]
+        cursor = await conn.execute(
+            f"""
+            DELETE FROM FILE_ATTACHMENTS
+            WHERE status = 'pending'
+              AND public_id IN ({placeholders})
+              AND user_id = ?
+              AND conversation_id = ?
+            """,
+            params,
+        )
+        discarded = int(cursor.rowcount or 0)
+        await conn.commit()
+    if blob_ids:
+        await prune_unreferenced_blobs(blob_ids)
+    if reason and discarded:
+        logger.info("Discarded %d pending attachment(s): %s", discarded, reason)
+    return discarded
+
+
 async def discard_stale_pending_attachments(max_age_minutes: int = 120) -> int:
     """Delete old pending attachment refs left behind by interrupted uploads."""
     blob_ids: list[int] = []
@@ -467,6 +514,113 @@ async def resolve_attachment_for_user(
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def resolve_pending_attachment_for_user(
+    conn: aiosqlite.Connection,
+    *,
+    public_id: str,
+    user_id: int,
+    conversation_id: int,
+    require_kind: str | None = None,
+) -> dict[str, Any] | None:
+    clauses = [
+        "fa.public_id = ?",
+        "fa.status = 'pending'",
+        "fb.status = 'ready'",
+        "fa.user_id = ?",
+        "fa.conversation_id = ?",
+    ]
+    params: list[Any] = [public_id, user_id, conversation_id]
+    if require_kind:
+        clauses.append("fa.attachment_type = ?")
+        params.append(require_kind)
+
+    cursor = await conn.execute(
+        f"""
+        SELECT fa.*, fb.sha256, fb.size_bytes AS blob_size_bytes, fb.kind,
+               fb.mime_detected, fb.storage_key, fb.page_count, fb.text_line_count
+        FROM FILE_ATTACHMENTS fa
+        JOIN FILE_BLOBS fb ON fb.id = fa.blob_id
+        WHERE {" AND ".join(clauses)}
+        """,
+        params,
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def read_pending_attachment_bytes(
+    public_id: str,
+    *,
+    user_id: int,
+    conversation_id: int,
+    require_kind: str | None = None,
+) -> tuple[bytes, dict[str, Any]] | None:
+    async with database.get_db_connection(readonly=True) as conn:
+        attachment = await resolve_pending_attachment_for_user(
+            conn,
+            public_id=public_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            require_kind=require_kind,
+        )
+        if not attachment:
+            return None
+        path = await _attachment_storage_path(conn, attachment, variant=None)
+    if not path.exists():
+        return None
+    data = await asyncio.to_thread(path.read_bytes)
+    return data, attachment
+
+
+def attachment_record_to_block(
+    attachment: dict[str, Any],
+    *,
+    data: bytes | None = None,
+) -> dict[str, Any]:
+    public_id = str(attachment["public_id"])
+    filename = str(
+        attachment.get("display_name")
+        or attachment.get("original_filename")
+        or "attachment"
+    )
+    kind = str(attachment.get("attachment_type") or attachment.get("kind") or "")
+
+    if kind == "pdf":
+        doc_info: dict[str, Any] = {
+            "attachment_ref": public_id,
+            "url": attachment_download_url(public_id),
+            "filename": filename,
+            "pages": int(attachment.get("page_count") or 0),
+        }
+        if data is not None:
+            doc_info["file_hash"] = hashlib.sha1(data).hexdigest()
+        return {"type": "document_url", "document_url": doc_info}
+
+    if kind == "text":
+        return {
+            "type": "text_file",
+            "text_file": {
+                "attachment_ref": public_id,
+                "url": attachment_download_url(public_id),
+                "filename": filename,
+                "lines": int(attachment.get("text_line_count") or 0),
+            },
+        }
+
+    if kind == "image":
+        return {
+            "type": "image_url",
+            "image_url": {
+                "attachment_ref": public_id,
+                "url": attachment_content_url(public_id, variant=THUMB_VARIANT),
+                "fullsize_url": attachment_content_url(public_id),
+                "filename": filename,
+            },
+        }
+
+    raise ValueError(f"Unsupported attachment kind: {kind}")
 
 
 async def get_attachment_path_for_user(

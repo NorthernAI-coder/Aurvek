@@ -1,0 +1,459 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}Marketplace Controls - AURVEK{% endblock %}
+
+{% block page_title %}Marketplace Controls{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Control public marketplace surfaces without disabling core login, chat, users, or private prompts.</p>
+{% endblock %}
+
+{% block styles %}
+<style>
+    .marketplace-status-pill,
+    .marketplace-source-pill,
+    .marketplace-effective-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border-radius: 999px;
+        border: 1px solid var(--border-color);
+        padding: 5px 10px;
+        font-size: 0.76rem;
+        font-weight: 800;
+        line-height: 1;
+        white-space: nowrap;
+    }
+    .marketplace-status-pill.status-success,
+    .marketplace-effective-pill.is-active {
+        color: var(--success);
+        border-color: rgba(67, 181, 129, 0.45);
+        background: rgba(67, 181, 129, 0.08);
+    }
+    .marketplace-status-pill.status-danger,
+    .marketplace-effective-pill.is-off {
+        color: var(--danger);
+        border-color: rgba(237, 66, 69, 0.42);
+        background: rgba(237, 66, 69, 0.08);
+    }
+    .marketplace-status-pill.status-warning,
+    .marketplace-effective-pill.is-partial {
+        color: var(--warning);
+        border-color: rgba(250, 166, 26, 0.42);
+        background: rgba(250, 166, 26, 0.08);
+    }
+    .marketplace-source-pill.source-environment {
+        color: var(--warning);
+        border-color: rgba(250, 166, 26, 0.42);
+    }
+    .marketplace-source-pill.source-system_config {
+        color: var(--accent);
+        border-color: rgba(114, 137, 218, 0.42);
+    }
+    .marketplace-source-pill.source-default {
+        color: var(--text-secondary);
+    }
+    .marketplace-header-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+    }
+    .marketplace-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    .marketplace-summary-card {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary);
+        padding: 14px;
+        min-height: 96px;
+    }
+    .marketplace-summary-label {
+        color: var(--text-muted);
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0;
+        text-transform: uppercase;
+    }
+    .marketplace-summary-value {
+        color: var(--text-primary);
+        font-size: 1.05rem;
+        font-weight: 800;
+        margin-top: 8px;
+    }
+    .marketplace-summary-note {
+        color: var(--text-secondary);
+        font-size: 0.8rem;
+        margin-top: 6px;
+    }
+    .marketplace-flag-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+    .marketplace-flag-row {
+        display: grid;
+        grid-template-columns: 36px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary);
+        padding: 13px;
+    }
+    .marketplace-flag-row-main {
+        grid-column: 1 / -1;
+        border-color: var(--accent);
+        box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .marketplace-flag-row.is-locked {
+        opacity: 0.78;
+    }
+    .marketplace-flag-icon {
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg-secondary);
+        color: var(--accent);
+        border: 1px solid var(--border-color);
+    }
+    .marketplace-flag-name {
+        color: var(--text-primary);
+        font-weight: 800;
+        margin-bottom: 3px;
+    }
+    .marketplace-flag-description {
+        color: var(--text-secondary);
+        font-size: 0.82rem;
+        line-height: 1.35;
+        margin-bottom: 8px;
+    }
+    .marketplace-flag-meta {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+    .marketplace-lock-note {
+        color: var(--warning);
+        font-size: 0.78rem;
+        margin-top: 8px;
+    }
+    .marketplace-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        margin-top: 16px;
+    }
+    #marketplaceSaveStatus {
+        color: var(--text-muted);
+        font-size: 0.84rem;
+        min-height: 1.2em;
+    }
+    @media (max-width: 900px) {
+        .marketplace-summary-grid,
+        .marketplace-flag-grid {
+            grid-template-columns: 1fr;
+        }
+        .marketplace-flag-row {
+            grid-template-columns: 32px minmax(0, 1fr);
+        }
+        .marketplace-flag-row .form-check {
+            grid-column: 2;
+            justify-self: start;
+        }
+        .marketplace-actions {
+            justify-content: stretch;
+        }
+        .marketplace-actions .btn {
+            flex: 1 1 160px;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="section-container" id="marketplaceAdminPanel">
+    <div class="marketplace-header-row">
+        <div class="section-title mb-0">
+            <i class="fas fa-store-slash"></i> Runtime Controls
+        </div>
+        <span id="marketplaceStatusBadge" class="marketplace-status-pill status-{{ marketplace_admin_config.status_class }}">
+            <i class="fas fa-circle"></i>
+            <span>{{ marketplace_admin_config.status_label }}</span>
+        </span>
+    </div>
+
+    <script type="application/json" id="marketplaceConfigInitial">{{ marketplace_admin_config|tojson }}</script>
+
+    <div class="marketplace-summary-grid">
+        <div class="marketplace-summary-card">
+            <div class="marketplace-summary-label">Runtime</div>
+            <div class="marketplace-summary-value" id="marketplaceRuntimeLabel">{{ marketplace_admin_config.status_label }}</div>
+            <div class="marketplace-summary-note">Applied immediately in this app process and refreshed across workers.</div>
+        </div>
+        <div class="marketplace-summary-card">
+            <div class="marketplace-summary-label">Storage</div>
+            <div class="marketplace-summary-value">SYSTEM_CONFIG</div>
+            <div class="marketplace-summary-note">Persists across restarts unless env overrides it.</div>
+        </div>
+        <div class="marketplace-summary-card">
+            <div class="marketplace-summary-label">Overrides</div>
+            <div class="marketplace-summary-value" id="marketplaceOverrideLabel">
+                {% if marketplace_admin_config.has_env_overrides %}Environment{% else %}None{% endif %}
+            </div>
+            <div class="marketplace-summary-note">Environment variables are treated as emergency locks.</div>
+        </div>
+    </div>
+
+    <div class="marketplace-flag-grid" id="marketplaceFlagGrid">
+        {% for flag in marketplace_admin_config.flags %}
+        {% set icon_class = 'fas fa-toggle-on' %}
+        {% if flag.key == 'marketplace_public_landings_enabled' %}
+            {% set icon_class = 'fas fa-globe' %}
+        {% elif flag.key == 'marketplace_checkout_enabled' %}
+            {% set icon_class = 'fas fa-credit-card' %}
+        {% elif flag.key == 'marketplace_storefronts_enabled' %}
+            {% set icon_class = 'fas fa-store' %}
+        {% elif flag.key == 'marketplace_discovery_enabled' %}
+            {% set icon_class = 'fas fa-compass' %}
+        {% elif flag.key == 'marketplace_creator_tools_enabled' %}
+            {% set icon_class = 'fas fa-screwdriver-wrench' %}
+        {% endif %}
+        <div class="marketplace-flag-row {% if flag.key == 'marketplace_enabled' %}marketplace-flag-row-main{% endif %} {% if flag.env_override %}is-locked{% endif %}"
+             data-flag-row="{{ flag.key }}">
+            <div class="marketplace-flag-icon">
+                <i class="{{ icon_class }}"></i>
+            </div>
+            <div>
+                <div class="marketplace-flag-name">{{ flag.label }}</div>
+                <div class="marketplace-flag-description">{{ flag.description }}</div>
+                <div class="marketplace-flag-meta">
+                    <span class="marketplace-effective-pill {% if flag.effective %}is-active{% else %}is-off{% endif %}" id="mpEffective_{{ flag.key }}">
+                        {% if flag.effective %}Active{% else %}Off{% endif %}
+                    </span>
+                    <span class="marketplace-source-pill source-{{ flag.source }}" id="mpSource_{{ flag.key }}">
+                        {{ flag.source|replace('_', ' ')|title }}
+                    </span>
+                </div>
+                {% if flag.env_override %}
+                <div class="marketplace-lock-note">
+                    <i class="fas fa-lock me-1"></i>{{ flag.env_var }} controls this value.
+                </div>
+                {% endif %}
+            </div>
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input marketplace-flag-toggle"
+                       type="checkbox"
+                       role="switch"
+                       id="mpToggle_{{ flag.key }}"
+                       data-key="{{ flag.key }}"
+                       {% if flag.desired %}checked{% endif %}
+                       {% if flag.env_override %}disabled{% endif %}>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="marketplace-actions">
+        <button type="button" class="btn btn-outline-secondary" onclick="applyMarketplacePreset('private')">
+            <i class="fas fa-lock me-1"></i> Private Webchat Mode
+        </button>
+        <button type="button" class="btn btn-outline-secondary" onclick="applyMarketplacePreset('all_on')">
+            <i class="fas fa-power-off me-1"></i> Enable All
+        </button>
+        <button type="button" class="btn btn-primary" id="marketplaceSaveBtn" onclick="saveMarketplaceConfig()">
+            <i class="fas fa-save me-1"></i> Save Controls
+        </button>
+    </div>
+    <div id="marketplaceSaveStatus" class="mt-2"></div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+    let marketplaceConfigState = null;
+
+    function marketplaceNotify(type, title, message) {
+        if (window.NotificationModal && typeof NotificationModal[type] === 'function') {
+            NotificationModal[type](title, message);
+            return;
+        }
+        console.log(title + ': ' + message);
+    }
+
+    function marketplaceStatusFromFlags(flags) {
+        const master = flags.find(flag => flag.key === 'marketplace_enabled');
+        const masterOn = master ? master.desired : true;
+        flags.forEach(flag => {
+            flag.effective = flag.key === 'marketplace_enabled' ? flag.desired : masterOn && flag.desired;
+        });
+
+        if (!masterOn) {
+            return { status: 'disabled', status_label: 'Disabled', status_class: 'danger' };
+        }
+
+        const subflags = flags.filter(flag => flag.key !== 'marketplace_enabled');
+        if (subflags.every(flag => flag.effective)) {
+            return { status: 'enabled', status_label: 'Enabled', status_class: 'success' };
+        }
+
+        return { status: 'partial', status_label: 'Partial', status_class: 'warning' };
+    }
+
+    function buildMarketplaceDraftConfig() {
+        if (!marketplaceConfigState) return null;
+        const flags = marketplaceConfigState.flags.map(flag => {
+            const checkbox = document.querySelector(`.marketplace-flag-toggle[data-key="${flag.key}"]`);
+            return {
+                ...flag,
+                desired: checkbox ? checkbox.checked : flag.desired
+            };
+        });
+        const status = marketplaceStatusFromFlags(flags);
+        return {
+            ...marketplaceConfigState,
+            ...status,
+            flags
+        };
+    }
+
+    function renderMarketplacePreview(config, updateCheckboxes) {
+        if (!config) return;
+        const badge = document.getElementById('marketplaceStatusBadge');
+        if (badge) {
+            badge.classList.remove('status-success', 'status-warning', 'status-danger');
+            badge.classList.add('status-' + config.status_class);
+            const label = badge.querySelector('span');
+            if (label) label.textContent = config.status_label;
+        }
+
+        const runtimeLabel = document.getElementById('marketplaceRuntimeLabel');
+        if (runtimeLabel) runtimeLabel.textContent = config.status_label;
+
+        const overrideLabel = document.getElementById('marketplaceOverrideLabel');
+        if (overrideLabel) overrideLabel.textContent = config.has_env_overrides ? 'Environment' : 'None';
+
+        config.flags.forEach(flag => {
+            const checkbox = document.querySelector(`.marketplace-flag-toggle[data-key="${flag.key}"]`);
+            if (checkbox && updateCheckboxes) {
+                checkbox.checked = flag.desired;
+                checkbox.disabled = !!flag.env_override;
+            }
+
+            const row = document.querySelector(`[data-flag-row="${flag.key}"]`);
+            if (row) row.classList.toggle('is-locked', !!flag.env_override);
+
+            const effective = document.getElementById('mpEffective_' + flag.key);
+            if (effective) {
+                effective.classList.remove('is-active', 'is-off', 'is-partial');
+                if (flag.effective) {
+                    effective.classList.add('is-active');
+                    effective.textContent = 'Active';
+                } else if (flag.key !== 'marketplace_enabled' && config.status === 'disabled' && flag.desired) {
+                    effective.classList.add('is-partial');
+                    effective.textContent = 'Off by master';
+                } else {
+                    effective.classList.add('is-off');
+                    effective.textContent = 'Off';
+                }
+            }
+
+            const source = document.getElementById('mpSource_' + flag.key);
+            if (source) {
+                source.classList.remove('source-environment', 'source-system_config', 'source-default');
+                source.classList.add('source-' + flag.source);
+                source.textContent = flag.source.replace('_', ' ').replace(/\b\w/g, char => char.toUpperCase());
+            }
+        });
+    }
+
+    function renderMarketplaceConfig(config) {
+        marketplaceConfigState = config;
+        renderMarketplacePreview(config, true);
+    }
+
+    function updateMarketplaceDraftPreview() {
+        renderMarketplacePreview(buildMarketplaceDraftConfig(), false);
+    }
+
+    function initMarketplaceAdmin() {
+        const initialScript = document.getElementById('marketplaceConfigInitial');
+        if (!initialScript) return;
+
+        try {
+            renderMarketplaceConfig(JSON.parse(initialScript.textContent));
+        } catch (error) {
+            console.error('Failed to parse marketplace config', error);
+            return;
+        }
+
+        document.querySelectorAll('.marketplace-flag-toggle').forEach(toggle => {
+            toggle.addEventListener('change', updateMarketplaceDraftPreview);
+        });
+    }
+
+    function applyMarketplacePreset(mode) {
+        const toggles = document.querySelectorAll('.marketplace-flag-toggle:not(:disabled)');
+        toggles.forEach(toggle => {
+            toggle.checked = mode === 'all_on';
+        });
+        updateMarketplaceDraftPreview();
+    }
+
+    async function saveMarketplaceConfig() {
+        const saveBtn = document.getElementById('marketplaceSaveBtn');
+        const status = document.getElementById('marketplaceSaveStatus');
+        const flags = {};
+
+        document.querySelectorAll('.marketplace-flag-toggle:not(:disabled)').forEach(toggle => {
+            flags[toggle.dataset.key] = toggle.checked;
+        });
+
+        if (!Object.keys(flags).length) {
+            marketplaceNotify('warning', 'Marketplace Controls', 'All marketplace controls are locked by environment variables.');
+            return;
+        }
+
+        if (saveBtn) saveBtn.disabled = true;
+        if (status) status.textContent = 'Saving...';
+
+        try {
+            const response = await secureFetch('/api/admin/marketplace-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ flags })
+            });
+
+            if (!response) return;
+            const data = await response.json();
+            if (data.config) renderMarketplaceConfig(data.config);
+
+            if (response.ok && data.success) {
+                if (status) status.textContent = data.message || 'Saved.';
+                marketplaceNotify('success', 'Marketplace Controls', data.message || 'Marketplace controls saved.');
+            } else {
+                if (status) status.textContent = data.message || 'Could not save marketplace controls.';
+                marketplaceNotify('error', 'Marketplace Controls', data.message || 'Could not save marketplace controls.');
+            }
+        } catch (error) {
+            console.error('Error saving marketplace controls:', error);
+            if (status) status.textContent = 'Could not save marketplace controls.';
+            marketplaceNotify('error', 'Marketplace Controls', 'Could not save marketplace controls.');
+        } finally {
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', initMarketplaceAdmin);
+</script>
+{% endblock %}

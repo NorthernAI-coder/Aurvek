@@ -95,6 +95,14 @@ class CustomDomainMiddleware(BaseHTTPMiddleware):
         if is_primary_domain(host):
             return await call_next(request)
 
+        from marketplace.config import marketplace_public_landings_enabled
+        if not marketplace_public_landings_enabled():
+            return Response(
+                content=self._get_404_html(),
+                status_code=404,
+                media_type="text/html"
+            )
+
         # Check if this is a custom domain
         domain_data = await self._get_domain_data(host)
 

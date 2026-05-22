@@ -304,46 +304,6 @@ async def test_qr_generation():
         return {"status": "FAIL", "reason": str(e)}
 
 
-def test_time_tools():
-    """Test timezone tools (local, no API)."""
-    print("\n[TEST] Time Tools (local)")
-
-    try:
-        import pytz
-        from datetime import datetime
-
-        # Test get_time
-        tz = pytz.timezone("America/New_York")
-        ny_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
-        print(f"  [OK] get_time: New York = {ny_time}")
-
-        # Test timezone difference
-        tz1 = pytz.timezone("America/New_York")
-        tz2 = pytz.timezone("Europe/Madrid")
-        time1 = datetime.now(tz1)
-        time2 = datetime.now(tz2)
-        diff = time2 - time1
-        hours, remainder = divmod(abs(diff.total_seconds()), 3600)
-        print(f"  [OK] get_time_difference: NY to Madrid = {int(hours)}h")
-
-        # Test convert_time
-        from_tz = pytz.timezone("UTC")
-        to_tz = pytz.timezone("Asia/Tokyo")
-        test_time = datetime.strptime("2026-01-31 12:00:00", "%Y-%m-%d %H:%M:%S")
-        from_time = from_tz.localize(test_time)
-        to_time = from_time.astimezone(to_tz)
-        print(f"  [OK] convert_time: UTC 12:00 = Tokyo {to_time.strftime('%H:%M')}")
-
-        return {"status": "OK"}
-
-    except ImportError as e:
-        print(f"  [ERROR] Missing dependency: {e}")
-        return {"status": "FAIL", "reason": f"Missing: {e}"}
-    except Exception as e:
-        print(f"  [ERROR] {e}")
-        return {"status": "FAIL", "reason": str(e)}
-
-
 async def test_openai_image_api():
     """Test OpenAI image generation API."""
     print("\n[TEST] OpenAI Image Generation API")
@@ -579,7 +539,6 @@ async def run_all_tests(quick=False):
     print("LOCAL TESTS (No API calls)")
     print("=" * 60)
 
-    results['time_tools'] = test_time_tools()
     results['qr_generation'] = await test_qr_generation()
     results['registered_tools'] = test_registered_tools()
     results['dramatiq'] = test_dramatiq_setup()

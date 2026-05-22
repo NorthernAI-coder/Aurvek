@@ -1,0 +1,537 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}Session Health - Admin - AURVEK{% endblock %}
+
+{% block styles %}
+<style>
+    .stat-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 1rem;
+        height: 100%;
+        border-left: 3px solid var(--accent);
+    }
+    .stat-card.info { border-left-color: var(--info); }
+    .stat-card.warning { border-left-color: var(--warning); }
+    .stat-card.success { border-left-color: var(--success); }
+    .stat-card.danger { border-left-color: var(--danger); }
+    .stat-card .label {
+        color: var(--text-secondary);
+        font-size: 0.82rem;
+    }
+    .stat-card .amount {
+        color: var(--text-primary);
+        font-size: 1.55rem;
+        font-weight: 700;
+    }
+    .policy-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 16px;
+    }
+    .policy-grid textarea {
+        min-height: 96px;
+    }
+    .filters-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: end;
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    .filter-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .filter-group label {
+        color: var(--text-secondary);
+        font-size: 0.8rem;
+        font-weight: 500;
+    }
+    .filter-group input,
+    .filter-group select {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        color: var(--text-primary);
+        padding: 6px 10px;
+    }
+    .severity-badge {
+        border-radius: 12px;
+        display: inline-flex;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 3px 8px;
+        text-transform: capitalize;
+    }
+    .severity-normal { background: rgba(108,117,125,.18); color: var(--text-secondary); }
+    .severity-soft { background: rgba(52,152,219,.18); color: var(--info); }
+    .severity-intense { background: rgba(250,166,26,.18); color: var(--warning); }
+    .severity-strong { background: rgba(231,76,60,.18); color: var(--danger); }
+    .table td {
+        vertical-align: middle;
+    }
+</style>
+{% endblock %}
+
+{% block page_title %}Session Health{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Continuous-session metrics, break reminder policy, and reminder events</p>
+{% endblock %}
+
+{% block page_actions %}
+<button class="btn btn-outline-secondary btn-sm" onclick="refreshSessionHealth()">
+    <i class="fas fa-sync-alt me-1"></i> Refresh
+</button>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-md-3 col-6 mb-3">
+        <div class="stat-card info">
+            <div class="label">Active Sessions</div>
+            <div class="amount" id="overviewActive">-</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="stat-card warning">
+            <div class="label">Intense Sessions</div>
+            <div class="amount" id="overviewIntense">-</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="stat-card success">
+            <div class="label">Reminders Shown</div>
+            <div class="amount" id="overviewReminders">-</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-6 mb-3">
+        <div class="stat-card danger">
+            <div class="label">Events Last 7 Days</div>
+            <div class="amount" id="overviewEvents">-</div>
+        </div>
+    </div>
+</div>
+
+<div class="section-container mb-4">
+    <div class="section-title"><i class="fas fa-sliders-h me-2"></i>Policy</div>
+    <form id="sessionHealthPolicyForm">
+        <div class="policy-grid">
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="wellbeing_enabled">
+                <label class="form-check-label" for="wellbeing_enabled">Break reminders enabled</label>
+            </div>
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="wellbeing_allow_snooze">
+                <label class="form-check-label" for="wellbeing_allow_snooze">Allow snooze</label>
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_mode">Mode</label>
+                <select class="form-select" id="wellbeing_mode">
+                    <option value="informational">Informational</option>
+                    <option value="strict">Strict at strong threshold</option>
+                </select>
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_idle_gap_minutes">Idle gap minutes</label>
+                <input class="form-control" type="number" min="5" max="240" id="wellbeing_idle_gap_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_soft_minutes">Soft minutes</label>
+                <input class="form-control" type="number" min="5" id="wellbeing_soft_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_soft_user_messages">Soft user messages</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_soft_user_messages">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_soft_user_words">Soft user words</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_soft_user_words">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_intense_minutes">Intense minutes</label>
+                <input class="form-control" type="number" min="10" id="wellbeing_intense_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_intense_user_messages">Intense user messages</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_intense_user_messages">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_intense_user_words">Intense user words</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_intense_user_words">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_strong_minutes">Strong minutes</label>
+                <input class="form-control" type="number" min="15" id="wellbeing_strong_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_strong_user_messages">Strong user messages</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_strong_user_messages">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_cooldown_minutes">Cooldown minutes</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_cooldown_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_snooze_minutes">Snooze minutes</label>
+                <input class="form-control" type="number" min="1" id="wellbeing_snooze_minutes">
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_notice_text_soft">Soft reminder text</label>
+                <textarea class="form-control" id="wellbeing_notice_text_soft"></textarea>
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_notice_text_intense">Intense reminder text</label>
+                <textarea class="form-control" id="wellbeing_notice_text_intense"></textarea>
+            </div>
+            <div>
+                <label class="form-label" for="wellbeing_notice_text_strong">Strong reminder text</label>
+                <textarea class="form-control" id="wellbeing_notice_text_strong"></textarea>
+            </div>
+        </div>
+        <div class="mt-3">
+            <button type="submit" class="btn btn-primary">
+                <i class="fas fa-save me-1"></i> Save Policy
+            </button>
+        </div>
+    </form>
+</div>
+
+<div class="section-container mb-4">
+    <div class="section-title"><i class="fas fa-heart-pulse me-2"></i>Live Session Health</div>
+    <div class="filters-row">
+        <div class="filter-group">
+            <label>Search User</label>
+            <input type="text" id="liveSearch" placeholder="Username or user id">
+        </div>
+        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadLiveSessions()">
+            <i class="fas fa-search me-1"></i> Apply
+        </button>
+    </div>
+    <div class="table-wrapper">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>User</th>
+                    <th>Started</th>
+                    <th>Last Activity</th>
+                    <th class="text-end">Minutes</th>
+                    <th class="text-end">User Msgs</th>
+                    <th class="text-end">Words</th>
+                    <th class="text-end">Convs</th>
+                    <th class="text-end">Voice</th>
+                    <th class="text-end">Reminders</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="liveSessionsTable">
+                <tr><td colspan="10" class="text-center text-muted py-4">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="section-container">
+    <div class="section-title"><i class="fas fa-list-check me-2"></i>Reminder Events</div>
+    <div class="filters-row">
+        <div class="filter-group">
+            <label>Event Type</label>
+            <select id="eventTypeFilter">
+                <option value="">All events</option>
+                <option value="reminder_shown">Reminder shown</option>
+                <option value="reminder_dismissed">Dismissed</option>
+                <option value="reminder_snoozed">Snoozed</option>
+                <option value="pause_started">Pause started</option>
+                <option value="pause_completed">Pause completed</option>
+                <option value="session_started">Session started</option>
+                <option value="session_closed">Session closed</option>
+                <option value="severity_changed">Severity changed</option>
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Severity</label>
+            <select id="severityFilter">
+                <option value="">All severities</option>
+                <option value="normal">Normal</option>
+                <option value="soft">Soft</option>
+                <option value="intense">Intense</option>
+                <option value="strong">Strong</option>
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Search User</label>
+            <input type="text" id="eventSearch" placeholder="Username or user id">
+        </div>
+        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="loadReminderEvents(1)">
+            <i class="fas fa-filter me-1"></i> Apply
+        </button>
+    </div>
+    <div class="table-wrapper">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>User</th>
+                    <th>Event</th>
+                    <th>Severity</th>
+                    <th>Threshold</th>
+                    <th class="text-end">Observed</th>
+                    <th class="text-end">Conversation</th>
+                </tr>
+            </thead>
+            <tbody id="eventsTable">
+                <tr><td colspan="7" class="text-center text-muted py-4">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="d-flex justify-content-between align-items-center mt-3">
+        <button class="btn btn-outline-secondary btn-sm" id="eventsPrev" onclick="changeEventsPage(-1)">Previous</button>
+        <span class="text-muted" id="eventsPageInfo">Page 1</span>
+        <button class="btn btn-outline-secondary btn-sm" id="eventsNext" onclick="changeEventsPage(1)">Next</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+    const policyKeys = [
+        'wellbeing_enabled',
+        'wellbeing_allow_snooze',
+        'wellbeing_mode',
+        'wellbeing_idle_gap_minutes',
+        'wellbeing_soft_minutes',
+        'wellbeing_soft_user_messages',
+        'wellbeing_soft_user_words',
+        'wellbeing_intense_minutes',
+        'wellbeing_intense_user_messages',
+        'wellbeing_intense_user_words',
+        'wellbeing_strong_minutes',
+        'wellbeing_strong_user_messages',
+        'wellbeing_cooldown_minutes',
+        'wellbeing_snooze_minutes',
+        'wellbeing_notice_text_soft',
+        'wellbeing_notice_text_intense',
+        'wellbeing_notice_text_strong'
+    ];
+    let eventsPage = 1;
+    let eventsTotal = 0;
+    let eventsPerPage = 50;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        loadPolicy();
+        loadLiveSessions();
+        loadReminderEvents(1);
+        document.getElementById('sessionHealthPolicyForm').addEventListener('submit', savePolicy);
+        document.getElementById('liveSearch').addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') loadLiveSessions();
+        });
+        document.getElementById('eventSearch').addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') loadReminderEvents(1);
+        });
+    });
+
+    async function apiFetch(url, options) {
+        const fetcher = typeof secureFetch === 'function' ? secureFetch : fetch;
+        return fetcher(url, {
+            credentials: 'include',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...(options && options.headers ? options.headers : {})
+            }
+        });
+    }
+
+    async function loadPolicy() {
+        try {
+            const response = await apiFetch('/api/admin/session-health/config');
+            if (!response.ok) throw new Error('Failed to load policy');
+            const data = await response.json();
+            for (const key of policyKeys) {
+                const input = document.getElementById(key);
+                if (!input || !data.config[key]) continue;
+                const value = data.config[key].value;
+                if (input.type === 'checkbox') {
+                    input.checked = Boolean(value);
+                } else {
+                    input.value = value;
+                }
+            }
+        } catch (error) {
+            NotificationModal.error('Error', 'Failed to load session health policy');
+        }
+    }
+
+    async function savePolicy(event) {
+        event.preventDefault();
+        const payload = {};
+        for (const key of policyKeys) {
+            const input = document.getElementById(key);
+            if (!input) continue;
+            payload[key] = input.type === 'checkbox' ? input.checked : input.value;
+        }
+        try {
+            const response = await apiFetch('/api/admin/session-health/config', {
+                method: 'PUT',
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) throw new Error('Failed to save policy');
+            NotificationModal.success('Saved', 'Session health policy updated');
+            await loadPolicy();
+        } catch (error) {
+            NotificationModal.error('Error', 'Failed to save session health policy');
+        }
+    }
+
+    async function loadLiveSessions() {
+        const params = new URLSearchParams();
+        const search = document.getElementById('liveSearch').value.trim();
+        if (search) params.set('search', search);
+        params.set('limit', '100');
+        try {
+            const response = await apiFetch('/api/admin/session-health/live?' + params.toString());
+            if (!response.ok) throw new Error('Failed to load live sessions');
+            const data = await response.json();
+            updateOverview(data.overview || {});
+            renderLiveSessions(data.sessions || []);
+        } catch (error) {
+            document.getElementById('liveSessionsTable').innerHTML = '<tr><td colspan="10" class="text-center text-danger py-4">Failed to load live sessions</td></tr>';
+        }
+    }
+
+    function updateOverview(overview) {
+        setText('overviewActive', formatNumber(overview.active_sessions || 0));
+        setText('overviewIntense', formatNumber(overview.intense_sessions || 0));
+        setText('overviewReminders', formatNumber(overview.reminders_shown || 0));
+        setText('overviewEvents', formatNumber(overview.events_7d || 0));
+    }
+
+    function renderLiveSessions(sessions) {
+        const tbody = document.getElementById('liveSessionsTable');
+        if (!sessions.length) {
+            tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-4">No active sessions</td></tr>';
+            return;
+        }
+        tbody.innerHTML = sessions.map(session => `
+            <tr>
+                <td>${escapeHtml(session.username || ('User #' + session.user_id))}</td>
+                <td>${formatDateTime(session.started_at)}</td>
+                <td>${formatDateTime(session.last_activity_at)}</td>
+                <td class="text-end">${formatNumber(session.active_minutes || 0)}</td>
+                <td class="text-end">${formatNumber(session.user_messages_count || 0)}</td>
+                <td class="text-end">${formatNumber(session.user_word_count || 0)}</td>
+                <td class="text-end">${formatNumber(session.conversation_count || 0)}</td>
+                <td class="text-end">${formatDuration(session.voice_call_seconds || 0)}</td>
+                <td class="text-end">${formatNumber(session.reminders_shown || 0)}</td>
+                <td>${severityBadge(session.current_severity || 'normal')}</td>
+            </tr>
+        `).join('');
+    }
+
+    async function loadReminderEvents(page) {
+        eventsPage = Math.max(1, page || eventsPage);
+        const params = new URLSearchParams();
+        params.set('page', String(eventsPage));
+        params.set('per_page', String(eventsPerPage));
+        const eventType = document.getElementById('eventTypeFilter').value;
+        const severity = document.getElementById('severityFilter').value;
+        const search = document.getElementById('eventSearch').value.trim();
+        if (eventType) params.set('event_type', eventType);
+        if (severity) params.set('severity', severity);
+        if (search) params.set('search', search);
+
+        try {
+            const response = await apiFetch('/api/admin/session-health/events?' + params.toString());
+            if (!response.ok) throw new Error('Failed to load events');
+            const data = await response.json();
+            eventsTotal = data.total || 0;
+            eventsPerPage = data.per_page || 50;
+            renderEvents(data.events || []);
+            updateEventsPager();
+        } catch (error) {
+            document.getElementById('eventsTable').innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Failed to load events</td></tr>';
+        }
+    }
+
+    function renderEvents(events) {
+        const tbody = document.getElementById('eventsTable');
+        if (!events.length) {
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">No events found</td></tr>';
+            return;
+        }
+        tbody.innerHTML = events.map(event => `
+            <tr>
+                <td>${formatDateTime(event.created_at)}</td>
+                <td>${escapeHtml(event.username || ('User #' + event.user_id))}</td>
+                <td>${escapeHtml(event.event_type || '-')}</td>
+                <td>${severityBadge(event.severity || 'normal')}</td>
+                <td>${escapeHtml(event.threshold_key || '-')}</td>
+                <td class="text-end">${event.observed_value === null || event.observed_value === undefined ? '-' : formatNumber(event.observed_value)}</td>
+                <td class="text-end">${event.conversation_id || '-'}</td>
+            </tr>
+        `).join('');
+    }
+
+    function changeEventsPage(delta) {
+        loadReminderEvents(eventsPage + delta);
+    }
+
+    function updateEventsPager() {
+        const lastPage = Math.max(1, Math.ceil(eventsTotal / eventsPerPage));
+        document.getElementById('eventsPageInfo').textContent = `Page ${eventsPage} of ${lastPage} (${formatNumber(eventsTotal)} events)`;
+        document.getElementById('eventsPrev').disabled = eventsPage <= 1;
+        document.getElementById('eventsNext').disabled = eventsPage >= lastPage;
+    }
+
+    function refreshSessionHealth() {
+        loadLiveSessions();
+        loadReminderEvents(eventsPage);
+    }
+
+    function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    }
+
+    function severityBadge(severity) {
+        const safe = escapeHtml(severity || 'normal');
+        return `<span class="severity-badge severity-${safe}">${safe}</span>`;
+    }
+
+    function formatNumber(value) {
+        const number = Number(value || 0);
+        if (number >= 1000000) return (number / 1000000).toFixed(1) + 'M';
+        if (number >= 1000) return (number / 1000).toFixed(1) + 'K';
+        return String(Math.round(number));
+    }
+
+    function formatDuration(seconds) {
+        const total = Number(seconds || 0);
+        if (total < 60) return total + 's';
+        const minutes = Math.floor(total / 60);
+        if (minutes < 60) return minutes + 'm';
+        const hours = Math.floor(minutes / 60);
+        return hours + 'h ' + (minutes % 60) + 'm';
+    }
+
+    function formatDateTime(value) {
+        if (!value) return '-';
+        const normalized = String(value).replace(' ', 'T') + (String(value).includes('Z') ? '' : 'Z');
+        const date = new Date(normalized);
+        if (Number.isNaN(date.getTime())) return escapeHtml(value);
+        return date.toLocaleString();
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+</script>
+{% endblock %}

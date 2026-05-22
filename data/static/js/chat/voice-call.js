@@ -120,6 +120,7 @@
 
         function setState(state, message, options = {}) {
             currentState = state;
+            window.WellbeingVoiceActive = ['connecting', 'active', 'updating'].includes(state);
             if (message) {
                 statusText.textContent = message;
             }
@@ -427,11 +428,32 @@
                     },
                     body: JSON.stringify(sessionBody)
                 });
-                if (response && !response.ok) {
-                    console.warn('Failed to mark ElevenLabs session as active');
+                if (!response) {
+                    return {
+                        ok: false,
+                        message: 'No response received when starting the voice session.'
+                    };
                 }
+                if (!response.ok) {
+                    let message = 'Failed to start the voice session.';
+                    let error = null;
+                    try {
+                        const payload = await response.json();
+                        error = payload && payload.error;
+                        message = (payload && (payload.message || payload.error)) || message;
+                    } catch (_) {
+                        // ignore
+                    }
+                    console.warn('Failed to mark ElevenLabs session as active');
+                    return { ok: false, error, message };
+                }
+                return { ok: true };
             } catch (error) {
                 console.error('Error notifying session start:', error);
+                return {
+                    ok: false,
+                    message: 'Could not notify the server that the voice session started.'
+                };
             }
         }
 
@@ -463,6 +485,14 @@
             if (!Conversation) {
                 setState('error', 'ElevenLabs SDK not available on this page.', {
                     helper: 'Reload the page or verify /sdk/elevenlabs-client.js'
+                });
+                return;
+            }
+
+            const wellbeingStatus = window.WellbeingReminders && window.WellbeingReminders.latestStatus;
+            if (wellbeingStatus && (wellbeingStatus.active_pause || wellbeingStatus.reminder?.requires_pause)) {
+                setState('error', 'A break pause is required before starting a voice call.', {
+                    helper: 'Use the break reminder prompt before continuing.'
                 });
                 return;
             }
@@ -654,7 +684,30 @@
 
         async function handleConnected(info) {
             activeSessionId = extractSessionId(info);
-            await markSessionStarted(activeSessionId);
+            const sessionResult = await markSessionStarted(activeSessionId);
+            if (!sessionResult.ok) {
+                const shouldRefreshWellbeing = sessionResult.error === 'wellbeing_pause_active'
+                    || sessionResult.error === 'wellbeing_pause_required';
+                if (shouldRefreshWellbeing && window.WellbeingReminders && typeof window.WellbeingReminders.refresh === 'function') {
+                    await window.WellbeingReminders.refresh();
+                }
+                const ref = conversationRef;
+                activeSessionId = null;
+                conversationRef = null;
+                setState('error', sessionResult.message || 'A break pause is required before starting a voice call.', {
+                    helper: shouldRefreshWellbeing ? 'Use the break reminder prompt before continuing.' : 'Try again when ready.'
+                });
+                lockChatInputs(false);
+                closeButton.disabled = false;
+                if (ref && typeof ref.endSession === 'function') {
+                    try {
+                        await ref.endSession();
+                    } catch (error) {
+                        console.error('Error closing rejected ElevenLabs session:', error);
+                    }
+                }
+                return;
+            }
             setState('active', 'Call active. Speak normally.');
         }
 

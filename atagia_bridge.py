@@ -880,10 +880,21 @@ def _resolve_source_seq(value: int | str | None) -> int | None:
 
 
 def _bridge_exception(operation: str, exc: Exception) -> dict[str, str]:
+    message = str(exc)
+    if (
+        isinstance(exc, TypeError)
+        and "unexpected keyword argument 'proxies'" in message
+    ):
+        message = (
+            f"{message}. This is an Atagia/httpx compatibility issue: the "
+            "Atagia package is calling httpx.AsyncClient(proxies=...), which "
+            "was removed in httpx 0.28. Update Atagia to use the current httpx "
+            "API, or run Atagia with httpx<0.28."
+        )
     return {
         "operation": operation,
         "error_type": exc.__class__.__name__,
-        "message": str(exc),
+        "message": message,
     }
 
 

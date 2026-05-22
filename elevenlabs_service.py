@@ -13,6 +13,7 @@ import aiofiles
 from common import custom_unescape, generate_user_hash, sanitize_name, users_directory
 from database import get_db_connection, DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, is_lock_error
 from log_config import logger
+from wellbeing_service import record_voice_transcript_activity
 
 # Import the load balancer to get valid API keys
 try:
@@ -330,6 +331,19 @@ class ElevenLabsService:
                         saved_messages,
                         conversation_id,
                     )
+                    try:
+                        await record_voice_transcript_activity(
+                            user_id=user_id,
+                            conversation_id=conversation_id,
+                            transcript=transcript,
+                            session_id=session_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[wellbeing] Failed to record voice transcript activity for conversation %s",
+                            conversation_id,
+                            exc_info=True,
+                        )
                     return (saved_messages, last_user_message_id, last_bot_message_id)
 
                 except sqlite3.OperationalError as exc:

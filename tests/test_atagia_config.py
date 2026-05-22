@@ -98,6 +98,37 @@ async def test_save_atagia_admin_config_preserves_existing_api_key_when_blank(mo
 
 
 @pytest.mark.asyncio
+async def test_save_atagia_admin_config_clears_api_keys_when_requested(mock_db):
+    import atagia_config
+
+    atagia_config.invalidate_atagia_config_cache()
+    async with mock_db() as conn:
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("atagia_service_api_key", "existing-secret"),
+        )
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("atagia_admin_api_key", "existing-admin-secret"),
+        )
+        await conn.commit()
+
+    await atagia_config.save_atagia_admin_config(
+        {
+            "transport": "local",
+            "service_api_key": "",
+            "admin_api_key": "",
+            "clear_service_api_key": True,
+            "clear_admin_api_key": True,
+        }
+    )
+    config = await atagia_config.get_atagia_config()
+
+    assert config["atagia_service_api_key"] == ""
+    assert config["atagia_admin_api_key"] == ""
+
+
+@pytest.mark.asyncio
 async def test_preview_atagia_config_uses_saved_api_key_when_form_key_blank(mock_db):
     import atagia_config
 
@@ -148,3 +179,55 @@ async def test_atagia_global_incognito_is_normalized_off(mock_db):
     assert config["atagia_incognito"] == "false"
     assert bridge_config.incognito is False
     assert saved["atagia_incognito"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_reset_atagia_admin_config_removes_saved_overrides(mock_db, monkeypatch):
+    import atagia_config
+
+    for key in (
+        "ATAGIA_ENABLED",
+        "ATAGIA_TRANSPORT",
+        "ATAGIA_DB_PATH",
+        "ATAGIA_BASE_URL",
+        "ATAGIA_SERVICE_API_KEY",
+        "ATAGIA_ADMIN_API_KEY",
+        "ATAGIA_MODE",
+        "ATAGIA_ASSISTANT_MODE",
+        "ATAGIA_PLATFORM_ID",
+        "ATAGIA_CHARACTER_ID",
+        "ATAGIA_USER_PERSONA_ID",
+        "ATAGIA_OPERATIONAL_PROFILE",
+        "ATAGIA_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    atagia_config.invalidate_atagia_config_cache()
+    async with mock_db() as conn:
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("atagia_transport", "http"),
+        )
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("atagia_base_url", "http://127.0.0.1:8100"),
+        )
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("atagia_service_api_key", "existing-secret"),
+        )
+        await conn.execute(
+            "INSERT INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+            ("other_config", "kept"),
+        )
+        await conn.commit()
+
+    config = await atagia_config.reset_atagia_admin_config()
+
+    assert config["atagia_transport"] == "auto"
+    assert config["atagia_base_url"] == ""
+    assert config["atagia_service_api_key"] == ""
+    async with mock_db() as conn:
+        cursor = await conn.execute("SELECT value FROM SYSTEM_CONFIG WHERE key = ?", ("other_config",))
+        row = await cursor.fetchone()
+    assert row[0] == "kept"

@@ -35,6 +35,8 @@
     <!-- Favorite Chips -->
     <div class="home-favorites" id="home-favorites" style="display:none"></div>
 
+    {% set marketplace_home_sections_enabled = marketplace.enabled|default(false) %}
+    {% if marketplace_home_sections_enabled %}
     <!-- Windows Area -->
     <div class="windows-area" id="windows-area">
         <!-- Welcome Messages Window (hidden by default, shown if messages exist) -->
@@ -61,6 +63,7 @@
         <!-- Two Columns: Latest + Library -->
         <div class="windows-row" id="windows-row">
             <!-- Latest Prompts Window -->
+            {% if marketplace.discovery_enabled|default(false) %}
             <div class="window" id="win-latest" data-dock-id="latest" style="display:none">
                 <div class="window-header">
                     <div class="window-header-icon latest"><i class="fas fa-bolt"></i></div>
@@ -74,6 +77,7 @@
                     </div>
                 </div>
             </div>
+            {% endif %}
 
             <!-- My Library Window -->
             <div class="window" id="win-library" data-dock-id="library">
@@ -94,14 +98,18 @@
                     <div class="home-empty" id="home-library-empty" style="display:none">
                         <i class="fas fa-compass"></i>
                         <p>No prompts yet</p>
+                        {% if marketplace.discovery_enabled|default(false) %}
                         <a href="/explore" class="home-empty-link">Explore to find your first AI assistant</a>
+                        {% endif %}
                     </div>
                 </div>
             </div>
         </div>
     </div>
+    {% endif %}
 </div>
 
+{% if marketplace_home_sections_enabled %}
 <!-- Dock -->
 <div class="dock" id="dock"></div>
 
@@ -119,12 +127,15 @@
         <div class="home-modal-list" id="home-modal-list"></div>
     </div>
 </div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
 <script>
     window._homeConfig = {
-        canManage: {{ 'true' if is_admin|default(false) or is_user|default(false) else 'false' }}
+        canManage: {{ 'true' if is_admin|default(false) or is_user|default(false) else 'false' }},
+        marketplaceEnabled: {{ 'true' if marketplace.enabled|default(false) else 'false' }},
+        marketplaceDiscoveryEnabled: {{ 'true' if marketplace.discovery_enabled|default(false) else 'false' }}
     };
 </script>
 <script src="{{ get_static_url('/static/js/home.js') }}"></script>

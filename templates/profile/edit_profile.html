@@ -185,6 +185,7 @@
                     <small class="text-muted d-block">Go straight to your conversations</small>
                 </label>
             </div>
+            {% if marketplace.discovery_enabled|default(false) %}
             <div class="form-check mt-2">
                 <input class="form-check-input" type="radio" name="afterLogin" id="afterLoginExplore" value="/explore">
                 <label class="form-check-label" for="afterLoginExplore">
@@ -192,6 +193,7 @@
                     <small class="text-muted d-block">Browse and discover public products</small>
                 </label>
             </div>
+            {% endif %}
             <div class="form-check mt-2">
                 <input class="form-check-input" type="radio" name="afterLogin" id="afterLoginDashboard" value="/dashboard">
                 <label class="form-check-label" for="afterLoginDashboard">
