@@ -16,10 +16,10 @@ def response_json(response):
 
 @pytest.fixture
 def warmup_endpoint_mocks(monkeypatch):
-    import ai_calls
+    from chat.routes import warmup as warmup_routes
 
-    monkeypatch.setattr(ai_calls, "decode_jwt_cached", lambda token, secret: {"sub": "7"})
-    monkeypatch.setattr(ai_calls, "verify_token_expiration", lambda payload: True)
+    monkeypatch.setattr(warmup_routes, "decode_jwt_cached", lambda token, secret: {"sub": "7"})
+    monkeypatch.setattr(warmup_routes, "verify_token_expiration", lambda payload: True)
 
     async def allow_rate_limit(*args, **kwargs):
         return True
@@ -36,10 +36,10 @@ def warmup_endpoint_mocks(monkeypatch):
     async def fake_get_or_prepare(cache_key, prepare_snapshot):
         return {"context_count": 3}, "hit"
 
-    monkeypatch.setattr(ai_calls, "check_rate_limit", allow_rate_limit)
-    monkeypatch.setattr(ai_calls, "_load_warmup_conversation_state", fake_state)
-    monkeypatch.setattr(ai_calls, "warmup_get_or_prepare", fake_get_or_prepare)
-    return ai_calls
+    monkeypatch.setattr(warmup_routes, "check_rate_limit", allow_rate_limit)
+    monkeypatch.setattr(warmup_routes, "_load_warmup_conversation_state", fake_state)
+    monkeypatch.setattr(warmup_routes, "warmup_get_or_prepare", fake_get_or_prepare)
+    return warmup_routes
 
 
 @pytest.mark.asyncio

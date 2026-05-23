@@ -20,6 +20,7 @@ from common import (
 )
 from database import get_db_connection
 from marketplace.config import require_discovery_enabled
+from marketplace.services.entitlements import active_entitlement_condition
 from models import User
 from ranking import maybe_trigger_recalculation
 from save_images import generate_img_token
@@ -208,8 +209,9 @@ async def explore_prompts(
                        END as is_mine,
                        p.purchase_price,
                        CASE
-                           WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp_a WHERE pp_a.prompt_id = p.id AND pp_a.user_id = ? AND pp_a.permission_level IN ('owner', 'edit', 'access')) THEN 1
-                           WHEN EXISTS (SELECT 1 FROM PACK_ACCESS pa JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id WHERE pa.user_id = ? AND pi.prompt_id = p.id AND pi.is_active = 1 AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now')) AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))) THEN 1
+                           WHEN EXISTS (SELECT 1 FROM PROMPT_PERMISSIONS pp_a WHERE pp_a.prompt_id = p.id AND pp_a.user_id = ? AND pp_a.permission_level IN ('owner', 'edit')) THEN 1
+                           WHEN EXISTS (SELECT 1 FROM ENTITLEMENTS e_prompt WHERE e_prompt.user_id = ? AND e_prompt.asset_type = 'prompt' AND e_prompt.asset_id = p.id AND {active_entitlement_condition("e_prompt")}) THEN 1
+                           WHEN EXISTS (SELECT 1 FROM ENTITLEMENTS e_pack JOIN PACK_ITEMS pi ON e_pack.asset_id = pi.pack_id WHERE e_pack.user_id = ? AND e_pack.asset_type = 'pack' AND pi.prompt_id = p.id AND pi.is_active = 1 AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now')) AND {active_entitlement_condition("e_pack")}) THEN 1
                            ELSE 0
                        END as user_has_access,
                        p.has_landing_page
@@ -220,7 +222,7 @@ async def explore_prompts(
                 {order_clause}
                 LIMIT ? OFFSET ?
             """
-            await cursor.execute(query, [user_id, user_id, user_id, user_id, user_id] + params + [limit, offset])
+            await cursor.execute(query, [user_id, user_id, user_id, user_id, user_id, user_id] + params + [limit, offset])
             rows = await cursor.fetchall()
 
             prompt_ids = [row[0] for row in rows]

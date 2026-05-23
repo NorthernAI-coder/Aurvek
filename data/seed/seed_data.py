@@ -526,7 +526,7 @@ def seed_prompts(conn, admin_id):
 
 
 def seed_packs(conn, admin_id):
-    """Seed PACKS, PACK_ITEMS, PACK_ACCESS and copy pack welcome files."""
+    """Seed PACKS, PACK_ITEMS, ENTITLEMENTS and copy pack welcome files."""
     cursor = conn.cursor()
     user_dir = get_user_directory_path(ADMIN_USERNAME)
     data_dir = PROJECT_ROOT / "data"
@@ -549,9 +549,10 @@ def seed_packs(conn, admin_id):
 
         # Grant pack access to admin
         cursor.execute("""
-            INSERT INTO PACK_ACCESS (pack_id, user_id, granted_via)
-            VALUES (?, ?, ?)
-        """, (pack_id, admin_id, "seed"))
+            INSERT INTO ENTITLEMENTS
+            (user_id, asset_type, asset_id, source, source_ref_type, source_ref_id, status)
+            VALUES (?, 'pack', ?, 'manual_import', 'seed_pack', ?, 'active')
+        """, (admin_id, pack_id, f"{admin_id}:{pack_id}"))
 
         # Create pack directory and copy welcome
         pack_name_sanitized = pack_data["name"].lower().replace(" ", "_")

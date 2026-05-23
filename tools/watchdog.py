@@ -4,7 +4,7 @@ Activated per-prompt via PROMPTS.watchdog_config JSON field.
 Runs asynchronously via Dramatiq - does NOT block the conversation.
 
 NOT a tool that the LLM invokes. Only a Dramatiq actor enqueued
-from ai_calls.py post-save.
+from ai_runtime persistence post-save.
 """
 
 import asyncio
@@ -64,7 +64,7 @@ PRE_WATCHDOG_MAX_HINT_CHARS = 500
 
 
 def _assert_billable_claude_system_key(**kwargs):
-    from ai_calls import assert_billable_claude_system_key
+    from ai_runtime.billing import assert_billable_claude_system_key
 
     return assert_billable_claude_system_key(**kwargs)
 

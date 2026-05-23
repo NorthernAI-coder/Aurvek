@@ -1,0 +1,2 @@
+class MultiAiBillingError(RuntimeError):
+    pass

@@ -14,8 +14,8 @@ from database import (
     get_db_connection,
     is_lock_error,
 )
+from chat.services.conversations import create_conversation_core
 from log_config import logger
-from prompts import can_user_access_prompt
 
 
 def sanitize_chat_title(name: str | None, max_len: int = 25) -> str:
@@ -171,108 +171,6 @@ async def mutate_external_platforms(user_id: int, mutate_fn: Callable[[dict], An
     return await _run_begin_immediate("mutate_external_platforms", _work)
 
 
-async def _create_conversation_core(
-    user_id: int,
-    cursor,
-    current_user,
-    prompt_id: int | None = None,
-    folder_id: int | None = None,
-    strict_prompt_access: bool = False,
-    llm_id: int | None = None,
-) -> int:
-    """Create a conversation using user defaults and return its ID."""
-    await cursor.execute(
-        "SELECT llm_id, current_prompt_id FROM USER_DETAILS WHERE user_id = ?",
-        (user_id,),
-    )
-    user_details = await cursor.fetchone()
-    if not user_details:
-        raise ValueError("User details not found")
-
-    effective_llm_id = llm_id if llm_id is not None else user_details[0]
-    effective_prompt_id = prompt_id if prompt_id is not None else user_details[1]
-
-    if effective_prompt_id:
-        if current_user:
-            if not await can_user_access_prompt(current_user, effective_prompt_id, cursor):
-                if strict_prompt_access:
-                    raise PermissionError("Access denied to this prompt")
-                effective_prompt_id = None
-        else:
-            # No user object -- simple existence check
-            await cursor.execute("SELECT id FROM PROMPTS WHERE id = ?", (effective_prompt_id,))
-            if not await cursor.fetchone():
-                effective_prompt_id = None
-
-    default_extension_id = None
-    if effective_prompt_id:
-        await cursor.execute(
-            """
-            SELECT forced_llm_id, allowed_llms, extensions_enabled
-            FROM PROMPTS
-            WHERE id = ?
-            """,
-            (effective_prompt_id,),
-        )
-        prompt_row = await cursor.fetchone()
-        if prompt_row:
-            if prompt_row[0]:
-                effective_llm_id = prompt_row[0]
-                logger.info(f"[FORCED_LLM] Prompt {effective_prompt_id} has forced_llm_id={effective_llm_id}, overriding user default")
-            elif prompt_row[1]:
-                allowed_ids = orjson.loads(prompt_row[1])
-                if allowed_ids and int(effective_llm_id) not in allowed_ids:
-                    effective_llm_id = allowed_ids[0]
-                    logger.info(f"[ALLOWED_LLMS] Selected LLM not in allowed list for prompt {effective_prompt_id}, using first allowed: {effective_llm_id}")
-
-            if prompt_row[2]:
-                await cursor.execute(
-                    """
-                    SELECT id
-                    FROM PROMPT_EXTENSIONS
-                    WHERE prompt_id = ? AND is_default = 1
-                    LIMIT 1
-                    """,
-                    (effective_prompt_id,),
-                )
-                ext = await cursor.fetchone()
-                if not ext:
-                    await cursor.execute(
-                        """
-                        SELECT id
-                        FROM PROMPT_EXTENSIONS
-                        WHERE prompt_id = ?
-                        ORDER BY display_order
-                        LIMIT 1
-                        """,
-                        (effective_prompt_id,),
-                    )
-                    ext = await cursor.fetchone()
-                if ext:
-                    default_extension_id = ext[0]
-
-    await cursor.execute(
-        "SELECT COALESCE(enabled, 1) FROM LLM WHERE id = ?",
-        (effective_llm_id,),
-    )
-    llm_row = await cursor.fetchone()
-    if not llm_row:
-        raise ValueError("LLM model not found")
-    if not bool(llm_row[0]) and int(effective_llm_id) != int(user_details[0] or 0):
-        raise ValueError("This LLM model is disabled")
-
-    await cursor.execute(
-        """
-        INSERT INTO CONVERSATIONS (user_id, llm_id, role_id, folder_id, active_extension_id, last_activity)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        RETURNING id
-        """,
-        (user_id, effective_llm_id, effective_prompt_id, folder_id, default_extension_id),
-    )
-    row = await cursor.fetchone()
-    return row[0]
-
-
 async def ensure_platform_conversation(
     user_id: int,
     platform: str,
@@ -329,7 +227,7 @@ async def ensure_platform_conversation(
                 platforms[platform] = {}
             platforms[platform].pop("conversation_id", None)
 
-        new_conv_id = await _create_conversation_core(
+        new_conv_id = await create_conversation_core(
             user_id,
             cursor,
             current_user,
@@ -363,7 +261,7 @@ async def create_new_platform_conversation(
     """Create a new conversation and overwrite the platform binding atomically."""
 
     async def _work(conn, cursor):
-        new_conv_id = await _create_conversation_core(user_id, cursor, current_user)
+        new_conv_id = await create_conversation_core(user_id, cursor, current_user)
 
         await cursor.execute(
             "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
@@ -575,3 +473,141 @@ async def get_chats_list(
         else "Use !set <id> to switch conversation."
     )
     return header + "\n\n" + "\n".join(lines) + "\n\n" + footer
+
+
+async def is_platform_conversation(conversation_id: int, platform: str) -> bool:
+    """Check if a conversation is assigned to an external platform."""
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
+        await cursor.execute(
+            "SELECT external_platforms FROM USER_DETAILS "
+            "WHERE user_id IN (SELECT user_id FROM conversations WHERE id = ?)",
+            (conversation_id,),
+        )
+        result = await cursor.fetchone()
+        if not result:
+            return False
+
+        external_platforms = orjson.loads(result[0]) if result[0] else {}
+        platform_data = external_platforms.get(platform, {})
+        platform_conversation_id = platform_data.get("conversation_id")
+        if platform_conversation_id is None:
+            return False
+        try:
+            return int(platform_conversation_id) == int(conversation_id)
+        except (TypeError, ValueError):
+            return str(platform_conversation_id) == str(conversation_id)
+
+
+async def is_whatsapp_conversation(conversation_id: int) -> bool:
+    """Check if a conversation is assigned to WhatsApp."""
+    return await is_platform_conversation(conversation_id, "whatsapp")
+
+
+async def is_telegram_conversation(conversation_id: int) -> bool:
+    """Check if a conversation is assigned to Telegram."""
+    return await is_platform_conversation(conversation_id, "telegram")
+
+
+async def change_response_mode(
+    user_id: int,
+    new_mode: str,
+    platform: str = "whatsapp",
+    conn=None,
+) -> str:
+    """
+    Change the default response mode for a user's external platform.
+
+    This preserves the command-handler semantics used by WhatsApp, Telegram,
+    and AI-side confirmation flows: update the platform JSON for the user and
+    return the human-readable confirmation string.
+    """
+    if new_mode not in ("voice", "text"):
+        return "Error changing mode: invalid mode"
+    if platform not in ("whatsapp", "telegram"):
+        return "Error changing mode: invalid platform"
+
+    async def _write(db_conn):
+        await db_conn.execute(
+            """UPDATE USER_DETAILS SET external_platforms =
+               json_set(COALESCE(NULLIF(external_platforms, ''), '{}'), ?, ?)
+               WHERE user_id = ?""",
+            (f"$.{platform}.answer", new_mode, user_id),
+        )
+        await db_conn.commit()
+
+    try:
+        if conn is not None:
+            await _write(conn)
+        else:
+            async with get_db_connection() as owned_conn:
+                await _write(owned_conn)
+        return f"Changed to {'voice' if new_mode == 'voice' else 'text'} mode"
+    except Exception as e:
+        logger.error(f"Error in change_response_mode: {e}")
+        return f"Error changing mode: {str(e)}"
+
+
+async def change_conversation_response_mode(
+    user_id: int,
+    platform: str,
+    conversation_id: int,
+    mode: str,
+):
+    """Change response mode for an assigned external-platform conversation."""
+    if platform not in ("whatsapp", "telegram"):
+        return {
+            "success": False,
+            "error": "invalid_platform",
+            "message": "Invalid platform. Use whatsapp or telegram.",
+        }
+    if mode not in ("voice", "text"):
+        return {
+            "success": False,
+            "error": "invalid_mode",
+            "message": "Invalid mode. Use voice or text.",
+        }
+
+    async def _work(conn, cursor):
+        await cursor.execute(
+            "SELECT user_id FROM CONVERSATIONS WHERE id = ?",
+            (conversation_id,),
+        )
+        row = await cursor.fetchone()
+        if not row or row[0] != user_id:
+            await conn.rollback()
+            return {
+                "success": False,
+                "error": "conversation_not_found",
+                "message": "Conversation not found.",
+            }
+
+        await cursor.execute(
+            "SELECT external_platforms FROM USER_DETAILS WHERE user_id = ?",
+            (user_id,),
+        )
+        details = await cursor.fetchone()
+        platforms = orjson.loads(details[0]) if details and details[0] else {}
+        platform_data = platforms.get(platform, {})
+        if not isinstance(platform_data, dict) or platform_data.get("conversation_id") != conversation_id:
+            await conn.rollback()
+            return {
+                "success": False,
+                "error": "conversation_not_assigned",
+                "message": f"Conversation is not assigned to {platform}.",
+            }
+
+        platforms[platform]["answer"] = mode
+        await cursor.execute(
+            "UPDATE USER_DETAILS SET external_platforms = ? WHERE user_id = ?",
+            (orjson.dumps(platforms).decode("utf-8"), user_id),
+        )
+        await conn.commit()
+        return {
+            "success": True,
+            "error": None,
+            "message": f"Response mode changed to {mode}",
+            "mode": mode,
+        }
+
+    return await _run_begin_immediate("change_response_mode", _work)

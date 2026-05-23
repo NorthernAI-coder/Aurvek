@@ -15,6 +15,7 @@ import orjson
 
 from database import get_db_connection
 from log_config import logger
+from integrations.delivery import deliver_to_platform, send_platform_error
 from common import get_balance, get_user_billing_info, get_effective_billing_info, consume_token
 from gransabio_config import (
     get_gransabio_config,
@@ -790,7 +791,7 @@ async def generate_via_gransabio(
             return
 
         # Reset stop signal AFTER lock acquisition (prevents N+1 clearing N's stop)
-        from ai_calls import stop_signals as _stop_signals
+        from chat.services.stop_signals import stop_signals as _stop_signals
         _stop_signals[conversation_id] = False
 
         # --- 5. POST /project/new -> project_id ---
@@ -1063,7 +1064,7 @@ async def generate_via_gransabio(
         # --- 13. Save to DB ---
         if save_to_db:
             try:
-                from ai_calls import save_content_to_db
+                from ai_runtime.persistence.messages import save_content_to_db
 
                 save_result = await save_content_to_db(
                     content,
@@ -1147,7 +1148,8 @@ async def generate_via_gransabio(
 async def _load_context_messages(conversation_id: int) -> list[dict]:
     """Load and parse conversation history for context. Shared by watchdog and generation."""
     from datetime import datetime, timezone, timedelta
-    from ai_calls import parse_stored_message, custom_unescape, flatten_multi_ai_context
+    from ai_runtime.context.formatting import flatten_multi_ai_context, parse_stored_message
+    from common import custom_unescape
 
     context_start = (
         datetime.now(timezone.utc) - timedelta(days=60)
@@ -1168,86 +1170,12 @@ async def _load_context_messages(conversation_id: int) -> list[dict]:
 
 
 async def _deliver_to_platform(platform: str, ctx: dict, text: str):
-    """Send accumulated text to the appropriate external channel.
-
-    Supports answer_mode="voice" for Telegram (TTS + voice message)
-    and WhatsApp (TTS + audio media), matching the behavior of the
-    existing webhook handlers.
-    """
-    answer_mode = ctx.get("answer_mode", "text")
-    conversation_id = ctx.get("conversation_id", 0)
-
-    if platform == "telegram":
-        from app import async_telegram, _chunk_telegram_response
-        chat_id = ctx.get("chat_id")
-        if not chat_id:
-            logger.error("_deliver_to_platform: missing chat_id for telegram")
-            return
-
-        if answer_mode == "voice":
-            try:
-                from app import handle_tts_request
-                audio_path, error = await handle_tts_request(
-                    None,
-                    {"text": text, "author": "bot", "conversationId": conversation_id},
-                    None,  # current_user not needed for TTS
-                    is_whatsapp=True,
-                    tts_context="external",
-                )
-                if not error and audio_path:
-                    from pathlib import Path
-                    audio_file = Path(audio_path)
-                    if audio_file.exists():
-                        voice_bytes = audio_file.read_bytes()
-                        await async_telegram.send_voice(chat_id, voice_bytes)
-                        return
-            except Exception as tts_err:
-                logger.warning("Telegram TTS failed, falling back to text: %s", tts_err)
-            # Fallback to text
-        for chunk in _chunk_telegram_response(text):
-            await async_telegram.send_message(chat_id, chunk)
-
-    elif platform == "whatsapp":
-        from app import async_twilio
-        from_number = ctx.get("from_number")
-        to_number = ctx.get("to_number")
-
-        if answer_mode == "voice":
-            try:
-                from app import handle_tts_request
-                audio_path, error = await handle_tts_request(
-                    None,
-                    {"text": text, "author": "bot", "conversationId": conversation_id},
-                    None,
-                    is_whatsapp=True,
-                    tts_context="external",
-                )
-                if not error and audio_path:
-                    from common import PRIMARY_APP_DOMAIN
-                    audio_url = f"https://{PRIMARY_APP_DOMAIN}/{audio_path}"
-                    await async_twilio.send_message(
-                        body="",
-                        media_url=[audio_url],
-                        from_=to_number, to=from_number,
-                    )
-                    return
-            except Exception as tts_err:
-                logger.warning("WhatsApp TTS failed, falling back to text: %s", tts_err)
-            # Fallback to text
-        await async_twilio.send_message(body=text, from_=to_number, to=from_number)
-
-    else:
-        logger.error("_deliver_to_platform: unknown platform %s", platform)
+    await deliver_to_platform(platform, ctx, text)
 
 
 async def _send_platform_error(platform: str, ctx: dict, error_msg: str):
     """Best-effort error delivery to external channel."""
-    try:
-        await _deliver_to_platform(platform, ctx, error_msg)
-    except Exception as exc:
-        logger.warning(
-            "_send_platform_error: failed to deliver error to %s: %s", platform, exc
-        )
+    await send_platform_error(platform, ctx, error_msg)
 
 
 async def process_gransabio_external(
@@ -1286,7 +1214,7 @@ async def process_gransabio_external(
                 user_id = result[0]
 
         # --- 1b. own_only guard (GranSabio uses server-side keys, no BYOK) ---
-        from ai_calls import check_own_only_gransabio
+        from ai_runtime.context.assembly import check_own_only_gransabio
         own_only_err = await check_own_only_gransabio(user_id, conversation_id)
         if own_only_err:
             await _send_platform_error(platform, platform_context, own_only_err)
@@ -1324,14 +1252,14 @@ async def process_gransabio_external(
             return
 
         # --- 4. Rate limit ---
-        from ai_calls import apply_rate_limit
+        from ai_runtime.context.assembly import apply_rate_limit
         rate_ok, rate_err = await apply_rate_limit(user_id)
         if not rate_ok:
             await _send_platform_error(platform, platform_context, rate_err or "Rate limit exceeded.")
             return
 
         # --- 5. Input moderation ---
-        from ai_calls import run_input_moderation
+        from ai_runtime.context.assembly import run_input_moderation
         flagged, _categories = await run_input_moderation(user_message, None, bool(enable_moderation))
         if flagged:
             await _deliver_to_platform(
@@ -1341,13 +1269,13 @@ async def process_gransabio_external(
             return
 
         # --- 6. Update chat name if first message ---
-        from ai_calls import update_chat_name_if_empty
+        from ai_runtime.context.assembly import update_chat_name_if_empty
         await update_chat_name_if_empty(conversation_id, user_message)
 
-        # --- 7. Build prompt context (delegated to ai_calls) ---
+        # --- 7. Build prompt context (delegated to AI runtime) ---
         context_messages_dicts = await _load_context_messages(conversation_id)
 
-        from ai_calls import build_full_prompt_context
+        from ai_runtime.context.assembly import build_full_prompt_context
         prompt_ctx = await build_full_prompt_context(
             user_id=user_id,
             prompt_id=prompt_id,
@@ -1364,7 +1292,8 @@ async def process_gransabio_external(
 
         # --- 8. Handle watchdog takeover if build_full_prompt_context detected one ---
         if prompt_ctx["action"] in ("takeover", "takeover_lock"):
-            from ai_calls import watchdog_takeover_response_requestfree, save_content_to_db
+            from ai_runtime.persistence.messages import save_content_to_db
+            from ai_runtime.watchdog.takeover import watchdog_takeover_response_requestfree
 
             # Include current user message in context (not yet saved to DB)
             ctx_with_current = list(prompt_ctx["takeover_context_messages"] or [])
@@ -1662,7 +1591,7 @@ _STOP_CHECK_INTERVAL = 2.0  # Check Redis at most every 2 seconds
 async def check_stop_signal(conversation_id: int, redis_available: bool) -> bool:
     """Check if stop has been requested. Fast path first (local), then Redis (throttled)."""
     # Import at runtime to avoid circular imports
-    from ai_calls import stop_signals
+    from chat.services.stop_signals import stop_signals
 
     # Fast path: local dict (always checked, no Redis roundtrip)
     if stop_signals.get(conversation_id):

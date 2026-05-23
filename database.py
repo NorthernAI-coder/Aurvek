@@ -288,36 +288,6 @@ async def get_available_prompts_for_pack(conn, pack_id, search="", limit=30):
     return await cursor.fetchall()
 
 
-async def grant_pack_access(conn, pack_id, user_id, granted_via="admin_grant"):
-    """Grant a user access to a pack. Ignores if already granted (UNIQUE constraint)."""
-    await conn.execute(
-        """INSERT OR IGNORE INTO PACK_ACCESS (pack_id, user_id, granted_via)
-           VALUES (?, ?, ?)""",
-        (pack_id, user_id, granted_via),
-    )
-    await conn.commit()
-
-
-async def revoke_pack_access(conn, pack_id, user_id):
-    """Revoke a user's access to a pack."""
-    await conn.execute(
-        "DELETE FROM PACK_ACCESS WHERE pack_id = ? AND user_id = ?",
-        (pack_id, user_id),
-    )
-    await conn.commit()
-
-
-async def check_pack_access(conn, pack_id, user_id):
-    """Check if a user has active access to a pack."""
-    cursor = await conn.execute(
-        """SELECT 1 FROM PACK_ACCESS
-           WHERE pack_id = ? AND user_id = ?
-             AND (expires_at IS NULL OR expires_at > datetime('now'))""",
-        (pack_id, user_id),
-    )
-    return await cursor.fetchone() is not None
-
-
 async def create_pack_purchase(conn, buyer_user_id, pack_id, amount, currency="USD",
                                 payment_method="stripe", payment_reference=None, status="completed"):
     """Record a pack purchase in PACK_PURCHASES. Returns the new row ID."""

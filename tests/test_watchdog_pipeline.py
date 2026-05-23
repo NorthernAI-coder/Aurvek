@@ -495,7 +495,7 @@ class TestRunWatchdogEvaluation:
         events = get_watchdog_events(db_path, conv_id=1)
         assert events[0]["action_taken"] == "hint_generated"
 
-        # State has empty hint (won't be injected by ai_calls.py falsy check)
+        # State has empty hint (won't be injected by runtime falsy check)
         state = get_watchdog_state(db_path, conv_id=1)
         assert state is not None
         assert state["pending_hint"] == ""
@@ -833,7 +833,7 @@ class TestConsecutiveHintCounter:
         assert state["consecutive_hint_count"] == 1
         assert state["pending_hint"] == "Redirect now"
 
-        # Simulate hint consumption (what ai_calls.py does after using the hint)
+        # Simulate hint consumption after the runtime uses the hint
         conn = sqlite3.connect(db_path)
         conn.execute(
             "UPDATE WATCHDOG_STATE SET pending_hint = NULL, hint_severity = NULL WHERE conversation_id = 1"

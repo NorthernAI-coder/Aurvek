@@ -1,6 +1,6 @@
 """
 Non-streaming LLM caller for background tasks (watchdog, future plugins).
-Avoids circular imports with ai_calls.py.
+Avoids circular imports with the streaming AI runtime.
 Uses aiohttp direct HTTP calls to each provider.
 """
 

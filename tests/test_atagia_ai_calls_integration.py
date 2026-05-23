@@ -86,7 +86,7 @@ class DummyUser:
 
 
 def test_message_text_for_atagia_summarizes_multimodal_without_binary_payloads():
-    import ai_calls
+    from ai_runtime.atagia.context import _message_text_for_atagia
 
     message = [
         {"type": "text", "text": "remember this"},
@@ -94,7 +94,7 @@ def test_message_text_for_atagia_summarizes_multimodal_without_binary_payloads()
         {"type": "document_bytes", "filename": "brief.pdf", "data": "BASE64PDF"},
     ]
 
-    text = ai_calls._message_text_for_atagia(message)
+    text = _message_text_for_atagia(message)
 
     assert "remember this" in text
     assert "[Image attached]" in text
@@ -105,12 +105,12 @@ def test_message_text_for_atagia_summarizes_multimodal_without_binary_payloads()
 
 @pytest.mark.asyncio
 async def test_augment_prompt_fetches_atagia_context_and_appends_system_prompt(monkeypatch):
-    import ai_calls
+    from ai_runtime.atagia import context as atagia_context
 
     bridge = FakeBridge({"system_prompt": "Memory says: prefers short answers."})
-    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+    monkeypatch.setattr(atagia_context, "get_atagia_bridge", lambda: bridge)
 
-    prompt = await ai_calls._augment_prompt_with_atagia_context(
+    prompt = await atagia_context._augment_prompt_with_atagia_context(
         "Base system prompt",
         user_id=7,
         conversation_id=99,
@@ -139,12 +139,12 @@ async def test_augment_prompt_fetches_atagia_context_and_appends_system_prompt(m
 
 @pytest.mark.asyncio
 async def test_atagia_context_decision_marks_primary_context_and_suppresses_local_history(monkeypatch):
-    import ai_calls
+    from ai_runtime.atagia import context as atagia_context
 
     bridge = FakeBridge({"system_prompt": "Memory says: prefers short answers."})
-    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+    monkeypatch.setattr(atagia_context, "get_atagia_bridge", lambda: bridge)
 
-    decision = await ai_calls._resolve_atagia_context(
+    decision = await atagia_context._resolve_atagia_context(
         "Base system prompt",
         user_id=7,
         conversation_id=99,
@@ -155,17 +155,17 @@ async def test_atagia_context_decision_marks_primary_context_and_suppresses_loca
     assert decision.active is True
     assert decision.reason == "active"
     assert "Memory says: prefers short answers." in decision.full_prompt
-    assert ai_calls._context_messages_for_provider(local_history, decision) == []
+    assert atagia_context._context_messages_for_provider(local_history, decision) == []
 
 
 @pytest.mark.asyncio
 async def test_atagia_context_decision_keeps_local_history_when_context_missing(monkeypatch):
-    import ai_calls
+    from ai_runtime.atagia import context as atagia_context
 
     bridge = FakeBridge(None)
-    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+    monkeypatch.setattr(atagia_context, "get_atagia_bridge", lambda: bridge)
 
-    decision = await ai_calls._resolve_atagia_context(
+    decision = await atagia_context._resolve_atagia_context(
         "Base system prompt",
         user_id=7,
         conversation_id=99,
@@ -176,15 +176,15 @@ async def test_atagia_context_decision_keeps_local_history_when_context_missing(
     assert decision.active is False
     assert decision.reason == "no_context"
     assert decision.full_prompt == "Base system prompt"
-    assert ai_calls._context_messages_for_provider(local_history, decision) == local_history
+    assert atagia_context._context_messages_for_provider(local_history, decision) == local_history
 
 
 @pytest.mark.asyncio
 async def test_record_atagia_assistant_response_flattens_multi_ai_payload(monkeypatch):
-    import ai_calls
+    from ai_runtime.atagia import recording as atagia_recording
 
     bridge = FakeBridge()
-    monkeypatch.setattr(ai_calls, "get_atagia_bridge", lambda: bridge)
+    monkeypatch.setattr(atagia_recording, "get_atagia_bridge", lambda: bridge)
     combined_response = orjson.dumps(
         {
             "multi_ai": True,
@@ -195,7 +195,7 @@ async def test_record_atagia_assistant_response_flattens_multi_ai_payload(monkey
         }
     ).decode()
 
-    recorded = await ai_calls._record_atagia_assistant_response(
+    recorded = await atagia_recording._record_atagia_assistant_response(
         user_id=7,
         conversation_id=99,
         content=combined_response,
@@ -220,8 +220,8 @@ async def test_record_atagia_assistant_response_flattens_multi_ai_payload(monkey
 
 @pytest.mark.asyncio
 async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(monkeypatch):
-    import ai_calls
-    from chat_warmup import WarmupCacheKey
+    from ai_runtime.context import warmup as runtime_warmup
+    from chat.services.warmup import WarmupCacheKey
 
     warmup_calls = []
 
@@ -235,9 +235,9 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
         warmup_calls.append((user_id, conversation_id, prompt_id, incognito))
         return True
 
-    monkeypatch.setattr(ai_calls, "_load_warmup_context_messages", fake_context_messages)
-    monkeypatch.setattr(ai_calls, "_load_warmup_prompt_runtime_snapshot", fake_prompt_runtime)
-    monkeypatch.setattr(ai_calls, "_warmup_atagia_sidecar", fake_warmup_atagia)
+    monkeypatch.setattr(runtime_warmup, "_load_warmup_context_messages", fake_context_messages)
+    monkeypatch.setattr(runtime_warmup, "_load_warmup_prompt_runtime_snapshot", fake_prompt_runtime)
+    monkeypatch.setattr(runtime_warmup, "_warmup_atagia_sidecar", fake_warmup_atagia)
 
     key = WarmupCacheKey(
         user_id=7,
@@ -248,7 +248,7 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
         last_message_id=10,
         mode="single",
     )
-    snapshot = await ai_calls._build_chat_warmup_snapshot(
+    snapshot = await runtime_warmup._build_chat_warmup_snapshot(
         conversation_id=99,
         current_user=DummyUser(),
         state={

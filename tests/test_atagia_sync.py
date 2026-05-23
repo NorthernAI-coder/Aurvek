@@ -220,7 +220,7 @@ async def test_sync_all_history_skips_hidden_incognito_conversations(mock_db) ->
         await conn.execute(
             "INSERT INTO CONVERSATIONS (id, user_id, role_id) VALUES (5, 13, 90)"
         )
-        from conversation_privacy import ensure_conversation_privacy_schema, mark_conversation_incognito
+        from chat.services.privacy import ensure_conversation_privacy_schema, mark_conversation_incognito
 
         await ensure_conversation_privacy_schema(conn)
         await mark_conversation_incognito(

@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS LLM (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     machine TEXT NOT NULL,
     model TEXT NOT NULL,
+    provider_key TEXT,
+    provider_model_id TEXT,
+    enabled INTEGER DEFAULT 1,
+    max_output_tokens INTEGER DEFAULT 0,
     input_token_cost REAL DEFAULT 0,
     output_token_cost REAL DEFAULT 0
 );
@@ -249,8 +253,8 @@ def seed_llm(db_path, llm_id=1, machine="GPT", model="gpt-4o"):
     """Insert a test LLM row."""
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "INSERT INTO LLM (id, machine, model) VALUES (?, ?, ?)",
-        (llm_id, machine, model),
+        "INSERT INTO LLM (id, machine, model, provider_key, provider_model_id) VALUES (?, ?, ?, ?, ?)",
+        (llm_id, machine, model, machine.lower(), model),
     )
     conn.commit()
     conn.close()

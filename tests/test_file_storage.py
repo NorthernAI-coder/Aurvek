@@ -6,7 +6,7 @@ import orjson
 import pytest
 
 import file_storage
-from conversation_privacy import delete_conversation_rows, ensure_conversation_privacy_schema
+from chat.services.privacy import delete_conversation_rows, ensure_conversation_privacy_schema
 
 
 async def _seed_user_conversation(conn, *, user_id: int = 1, conversation_id: int = 1) -> None:

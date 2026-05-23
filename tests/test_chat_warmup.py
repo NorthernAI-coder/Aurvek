@@ -3,8 +3,8 @@ import asyncio
 import pytest
 from cachetools import TTLCache
 
-import chat_warmup
-from chat_warmup import (
+import chat.services.warmup as chat_warmup
+from chat.services.warmup import (
     WarmupCacheKey,
     clear_warmup_cache,
     get_or_prepare,

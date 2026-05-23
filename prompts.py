@@ -35,10 +35,11 @@ from common import (
     templates,
     users_directory,
     VALID_NOTICE_PERIODS,
-    MAX_FREE_INITIAL_BALANCE,
 )
 from security_config import is_forbidden_prompt_name
 from marketplace.config import marketplace_creator_tools_enabled, marketplace_discovery_enabled
+from marketplace.landing.cache import invalidate_landing_cache
+from marketplace.services.entitlements import user_has_prompt_access as user_has_prompt_entitlement_access
 
 router = APIRouter()
 
@@ -52,25 +53,7 @@ async def can_user_access_prompt(user: User, prompt_id: int, cursor) -> bool:
     if await user.is_admin:
         return True
 
-    await cursor.execute(
-        "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
-        (prompt_id, user.id),
-    )
-    perm = await cursor.fetchone()
-    if perm and perm[0] in ("owner", "edit", "access"):
-        return True
-
-    await cursor.execute(
-        """SELECT 1 FROM PACK_ACCESS pa
-           JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
-           WHERE pa.user_id = ?
-             AND pi.prompt_id = ?
-             AND pi.is_active = 1
-             AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now'))
-             AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
-        (user.id, prompt_id),
-    )
-    if await cursor.fetchone():
+    if await user_has_prompt_entitlement_access(cursor, user_id=user.id, prompt_id=prompt_id):
         return True
 
     await cursor.execute(
@@ -1043,7 +1026,6 @@ async def update_prompt(
 
     # Invalidate landing cache if prompt has a public_id
     if prompt_public_id:
-        from app import invalidate_landing_cache
         invalidate_landing_cache(prompt_public_id)
 
     return RedirectResponse(url=f"/prompts/edit/{prompt_id}?saved=1", status_code=303)
@@ -1092,6 +1074,7 @@ async def delete_prompt(prompt_id: int, current_user: User = Depends(get_current
                 (prompt_id,)
             )
             await conn.execute("DELETE FROM WELCOME_MESSAGES WHERE entity_type = 'prompt' AND entity_id = ?", (prompt_id,))
+            await conn.execute("DELETE FROM ENTITLEMENTS WHERE asset_type = 'prompt' AND asset_id = ?", (prompt_id,))
             await conn.execute('DELETE FROM PROMPT_PERMISSIONS WHERE prompt_id = ?', (prompt_id,))
             await conn.execute('DELETE FROM PROMPT_AGENT_MAPPING WHERE prompt_id = ?', (prompt_id,))
             await conn.execute('DELETE FROM PROMPT_SECTION_CONFIGS WHERE prompt_id = ?', (prompt_id,))
@@ -1135,7 +1118,6 @@ async def delete_prompt(prompt_id: int, current_user: User = Depends(get_current
 
             # Invalidate landing cache
             if prompt_public_id:
-                from app import invalidate_landing_cache
                 invalidate_landing_cache(prompt_public_id)
 
             return JSONResponse(content={"success": True}, status_code=200)
@@ -1216,6 +1198,7 @@ async def delete_prompts_batch(request: Request, current_user: User = Depends(ge
                     (prompt_id,)
                 )
                 await conn.execute("DELETE FROM WELCOME_MESSAGES WHERE entity_type = 'prompt' AND entity_id = ?", (prompt_id,))
+                await conn.execute("DELETE FROM ENTITLEMENTS WHERE asset_type = 'prompt' AND asset_id = ?", (prompt_id,))
                 await conn.execute('DELETE FROM PROMPT_PERMISSIONS WHERE prompt_id = ?', (prompt_id,))
                 await conn.execute('DELETE FROM PROMPT_AGENT_MAPPING WHERE prompt_id = ?', (prompt_id,))
                 await conn.execute('DELETE FROM PROMPT_SECTION_CONFIGS WHERE prompt_id = ?', (prompt_id,))
@@ -1255,7 +1238,6 @@ async def delete_prompts_batch(request: Request, current_user: User = Depends(ge
 
                 # Invalidate landing cache
                 if prompt_public_id:
-                    from app import invalidate_landing_cache
                     invalidate_landing_cache(prompt_public_id)
 
                 deleted_count += 1
@@ -1603,167 +1585,6 @@ def get_pack_components_dir(pack_id: int, pack_info: dict) -> str:
     """Get the components directory for a pack."""
     templates_dir = get_pack_templates_dir(pack_id, pack_info)
     return os.path.join(templates_dir, "components")
-
-
-# =============================================================================
-# Landing Registration Configuration
-# =============================================================================
-
-# Default configuration values for landing page registrations
-DEFAULT_LANDING_REGISTRATION_CONFIG = {
-    "default_llm_id": None,           # null = use prompt's forced_llm or system default (LLM id=1)
-    "public_prompts_access": True,    # true = can browse public prompts, false = captive
-    "allow_file_upload": False,
-    "allow_image_generation": False,
-    "initial_balance": 0.0,
-    "billing_mode": "customer_pays",      # "customer_pays" | "user_pays"
-    "billing_limit": None,            # Only used when billing_mode = "user_pays"
-    "billing_limit_action": "block",  # "block" | "notify" | "auto_refill"
-    "billing_auto_refill_amount": 10.0,  # Amount to increase limit by when auto_refill triggers
-    "billing_max_limit": None,        # Maximum limit cap for auto_refill (null = unlimited)
-    "category_access": None           # JSON array of category IDs or null (all)
-}
-
-
-async def get_landing_registration_config(prompt_id: int) -> dict:
-    """
-    Get the landing registration configuration for a prompt.
-    Returns merged config with defaults for any missing keys.
-    """
-    async with get_db_connection(readonly=True) as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT landing_registration_config, forced_llm_id FROM PROMPTS WHERE id = ?",
-                (prompt_id,)
-            )
-            result = await cursor.fetchone()
-
-            if not result:
-                raise HTTPException(status_code=404, detail="Prompt not found")
-
-            config_json = result[0]
-            forced_llm_id = result[1]
-
-            # Start with defaults
-            config = DEFAULT_LANDING_REGISTRATION_CONFIG.copy()
-
-            # Override with stored config if exists
-            if config_json:
-                try:
-                    stored_config = orjson.loads(config_json)
-                    config.update(stored_config)
-                except orjson.JSONDecodeError:
-                    logger.warning(f"Invalid JSON in landing_registration_config for prompt {prompt_id}")
-
-            # Add prompt's forced_llm_id for reference (not stored in config)
-            config["_prompt_forced_llm_id"] = forced_llm_id
-
-            return config
-
-
-def sanitize_landing_reg_config(config: dict, max_initial_balance: float = MAX_FREE_INITIAL_BALANCE) -> dict:
-    """
-    Sanitize and validate a landing_reg_config dict.
-    Whitelists known fields, validates types, and caps initial_balance.
-    Used by both prompts and packs.
-
-    Args:
-        config: raw config dict from user input
-        max_initial_balance: cap for initial_balance (varies by context)
-    """
-    sanitized = {}
-
-    # default_llm_id - must be integer or None
-    if "default_llm_id" in config:
-        val = config["default_llm_id"]
-        sanitized["default_llm_id"] = int(val) if val not in (None, "", "null") else None
-
-    # Boolean fields
-    for field in ["public_prompts_access", "allow_file_upload", "allow_image_generation"]:
-        if field in config:
-            sanitized[field] = bool(config[field])
-
-    # initial_balance - must be non-negative float, capped at max_initial_balance
-    if "initial_balance" in config:
-        try:
-            val = float(config.get("initial_balance", 0))
-        except (ValueError, TypeError):
-            val = 0.0
-        sanitized["initial_balance"] = round(min(max(0.0, val), max_initial_balance), 2)
-
-    # billing_mode - must be one of the allowed values
-    if "billing_mode" in config:
-        val = config["billing_mode"]
-        if val in ("customer_pays", "user_pays"):
-            sanitized["billing_mode"] = val
-
-    # billing_limit - must be positive float or None
-    if "billing_limit" in config:
-        val = config["billing_limit"]
-        if val in (None, "", "null"):
-            sanitized["billing_limit"] = None
-        else:
-            sanitized["billing_limit"] = max(0.0, float(val))
-
-    # billing_limit_action - must be one of the allowed values
-    if "billing_limit_action" in config:
-        val = config["billing_limit_action"]
-        if val in ("block", "notify", "auto_refill"):
-            sanitized["billing_limit_action"] = val
-
-    # billing_auto_refill_amount - must be positive float
-    if "billing_auto_refill_amount" in config:
-        val = config["billing_auto_refill_amount"]
-        if val not in (None, "", "null"):
-            sanitized["billing_auto_refill_amount"] = max(1.0, float(val))
-
-    # billing_max_limit - must be positive float or None
-    if "billing_max_limit" in config:
-        val = config["billing_max_limit"]
-        if val in (None, "", "null"):
-            sanitized["billing_max_limit"] = None
-        else:
-            sanitized["billing_max_limit"] = max(0.0, float(val))
-
-    # category_access - must be JSON array or None
-    if "category_access" in config:
-        val = config["category_access"]
-        if val in (None, "", "null"):
-            sanitized["category_access"] = None
-        elif isinstance(val, list):
-            sanitized["category_access"] = [int(x) for x in val]
-        elif isinstance(val, str):
-            try:
-                parsed = orjson.loads(val)
-                if isinstance(parsed, list):
-                    sanitized["category_access"] = [int(x) for x in parsed]
-            except (orjson.JSONDecodeError, ValueError):
-                pass
-
-    return sanitized
-
-
-async def set_landing_registration_config(prompt_id: int, config: dict) -> bool:
-    """
-    Set the landing registration configuration for a prompt.
-    Returns True on success, False on failure.
-    """
-    sanitized = sanitize_landing_reg_config(config, max_initial_balance=MAX_FREE_INITIAL_BALANCE)
-
-    try:
-        config_json = orjson.dumps(sanitized).decode('utf-8')
-
-        async with get_db_connection() as conn:
-            await conn.execute(
-                "UPDATE PROMPTS SET landing_registration_config = ? WHERE id = ?",
-                (config_json, prompt_id)
-            )
-            await conn.commit()
-
-        return True
-    except Exception as e:
-        logger.error(f"Error setting landing_registration_config for prompt {prompt_id}: {e}")
-        return False
 
 
 # =============================================================================
@@ -2303,7 +2124,7 @@ async def watchdog_suggest_config(
             detail=f"API key required for provider {machine} in own-only mode.",
         )
 
-    from ai_calls import assert_billable_claude_system_key
+    from ai_runtime.billing import assert_billable_claude_system_key
 
     wd_guard_error = assert_billable_claude_system_key(
         machine=machine,

@@ -28,7 +28,7 @@ def generate_mp3_task(conversation_id: int, user_id: int, is_admin: bool):
 @dramatiq.actor
 def download_elevenlabs_audio_task(conversation_id: int, session_id: str, user_id: int):
     import asyncio
-    from elevenlabs_service import service as elevenlabs_service
+    from integrations.elevenlabs.service import service as elevenlabs_service
     asyncio.run(elevenlabs_service.download_conversation_audio(conversation_id, session_id, user_id))
 
 
@@ -80,4 +80,3 @@ async def _run_gransabio_external(conversation_id, user_message, platform, platf
             http_client=client,
             estimated_timeout=estimated_timeout,
         )
-

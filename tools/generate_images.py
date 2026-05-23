@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from rediscfg import redis_client, broker
 from common import estimate_message_tokens, Cost
 from models import User, ConnectionManager
-from whatsapp import is_whatsapp_conversation
+from integrations.conversations import is_whatsapp_conversation
 from tools import register_tool, register_dramatiq_task, register_function_handler
 from save_images import save_image_locally, get_or_generate_img_token, resize_image
 from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id, get_user_from_phone_number

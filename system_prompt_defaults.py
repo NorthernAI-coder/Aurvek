@@ -1,7 +1,7 @@
 """Single source of truth for system prompt block defaults.
 
 Imported by:
-- ai_calls.py (runtime fallback when DB is unavailable or blocks are missing)
+- ai_runtime.context.system (runtime fallback when DB is unavailable or blocks are missing)
 - migration_system_prompt_blocks.py (seeding the DB table)
 
 Do NOT import heavy dependencies here -- this module must be lightweight.

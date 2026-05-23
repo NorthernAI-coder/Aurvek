@@ -6,9 +6,9 @@ class DummyUser:
 
 
 def test_claude_pdf_page_limit_error_becomes_retry_payload() -> None:
-    import ai_calls
+    from ai_runtime.errors import _provider_error_payload
 
-    payload = ai_calls._provider_error_payload(
+    payload = _provider_error_payload(
         "Claude",
         "invalid_request_error: A maximum of 100 PDF pages may be provided.",
         pdf_metadata={
@@ -36,9 +36,9 @@ def test_claude_pdf_page_limit_error_becomes_retry_payload() -> None:
 
 
 def test_claude_prompt_too_long_with_current_pdf_becomes_smaller_range_retry() -> None:
-    import ai_calls
+    from ai_runtime.errors import _provider_error_payload
 
-    payload = ai_calls._provider_error_payload(
+    payload = _provider_error_payload(
         "Claude",
         "invalid_request_error: prompt is too long: 200651 tokens > 200000 maximum",
         pdf_metadata={
@@ -73,9 +73,9 @@ def test_claude_prompt_too_long_with_current_pdf_becomes_smaller_range_retry() -
 
 
 def test_prompt_too_long_without_current_pdf_stays_plain_error() -> None:
-    import ai_calls
+    from ai_runtime.errors import _provider_error_payload
 
-    payload = ai_calls._provider_error_payload(
+    payload = _provider_error_payload(
         "Claude",
         "invalid_request_error: prompt is too long: 200651 tokens > 200000 maximum",
         pdf_metadata={
@@ -95,9 +95,9 @@ def test_prompt_too_long_without_current_pdf_stays_plain_error() -> None:
 
 
 def test_ranged_pdf_warning_tells_model_only_selected_pages_are_attached() -> None:
-    import ai_calls
+    from ai_runtime.attachments.pdf import _ranged_pdf_warning_text
 
-    warning = ai_calls._ranged_pdf_warning_text(
+    warning = _ranged_pdf_warning_text(
         "book_pages_1-80.pdf",
         page_start=1,
         page_end=80,

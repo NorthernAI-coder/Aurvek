@@ -11,7 +11,7 @@ from typing import Any, Literal
 import aiosqlite
 
 import database
-from conversation_privacy import ensure_conversation_privacy_schema
+from chat.services.privacy import ensure_conversation_privacy_schema
 
 logger = logging.getLogger(__name__)
 
@@ -579,7 +579,8 @@ async def _mark_run_finished(
 
 def _message_text_for_atagia_sync(value: Any) -> str:
     try:
-        from ai_calls import _message_text_for_atagia, parse_stored_message
+        from ai_runtime.atagia.context import _message_text_for_atagia
+        from ai_runtime.context.formatting import parse_stored_message
         from common import custom_unescape
 
         normalized = custom_unescape(value) if isinstance(value, str) else value

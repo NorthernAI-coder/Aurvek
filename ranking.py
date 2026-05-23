@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from database import get_db_connection
 from log_config import logger
+from marketplace.services.entitlements import active_entitlement_condition
 
 # ---------------------------------------------------------------------------
 # Default weights
@@ -81,7 +82,7 @@ def invalidate_ranking_config_cache() -> None:
 # ---------------------------------------------------------------------------
 _recalculation_running = False
 
-PROMPT_SIGNALS_SQL = """
+PROMPT_SIGNALS_SQL = f"""
 SELECT p.id, p.has_landing_page, p.created_at,
     COALESCE(pp.cnt, 0),
     COALESCE(pur.cnt, 0),
@@ -89,7 +90,12 @@ SELECT p.id, p.has_landing_page, p.created_at,
     COALESCE(cv.cnt, 0),
     COALESCE(fv.cnt, 0)
 FROM PROMPTS p
-LEFT JOIN (SELECT prompt_id, COUNT(*) cnt FROM PROMPT_PERMISSIONS WHERE permission_level='access' GROUP BY prompt_id) pp ON pp.prompt_id = p.id
+LEFT JOIN (
+    SELECT asset_id AS prompt_id, COUNT(*) cnt
+    FROM ENTITLEMENTS e
+    WHERE asset_type = 'prompt' AND {active_entitlement_condition("e")}
+    GROUP BY asset_id
+) pp ON pp.prompt_id = p.id
 LEFT JOIN (SELECT prompt_id, COUNT(*) cnt FROM PROMPT_PURCHASES GROUP BY prompt_id) pur ON pur.prompt_id = p.id
 LEFT JOIN (SELECT role_id, COUNT(DISTINCT user_id) cnt FROM CONVERSATIONS GROUP BY role_id) ch ON ch.role_id = p.id
 LEFT JOIN (SELECT prompt_id, COUNT(*) cnt FROM LANDING_PAGE_ANALYTICS WHERE converted=1 GROUP BY prompt_id) cv ON cv.prompt_id = p.id
@@ -97,12 +103,17 @@ LEFT JOIN (SELECT prompt_id, COUNT(*) cnt FROM FAVORITE_PROMPTS GROUP BY prompt_
 WHERE p.public = 1 AND p.is_unlisted = 0
 """
 
-PACK_SIGNALS_SQL = """
+PACK_SIGNALS_SQL = f"""
 SELECT pk.id, pk.has_custom_landing, pk.created_at,
     COALESCE(pa.cnt, 0),
     COALESCE(cv.cnt, 0)
 FROM PACKS pk
-LEFT JOIN (SELECT pack_id, COUNT(*) cnt FROM PACK_ACCESS GROUP BY pack_id) pa ON pa.pack_id = pk.id
+LEFT JOIN (
+    SELECT asset_id AS pack_id, COUNT(*) cnt
+    FROM ENTITLEMENTS e
+    WHERE asset_type = 'pack' AND {active_entitlement_condition("e")}
+    GROUP BY asset_id
+) pa ON pa.pack_id = pk.id
 LEFT JOIN (SELECT pack_id, COUNT(*) cnt FROM LANDING_PAGE_ANALYTICS WHERE converted=1 AND pack_id IS NOT NULL GROUP BY pack_id) cv ON cv.pack_id = pk.id
 WHERE pk.status = 'published' AND pk.is_public = 1
 """

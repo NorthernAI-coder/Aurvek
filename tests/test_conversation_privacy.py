@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from conversation_privacy import (
+from chat.services.privacy import (
     ensure_conversation_privacy_schema,
     get_conversation_privacy,
     mark_conversation_incognito,

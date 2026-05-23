@@ -870,9 +870,41 @@ CREATE TABLE PROMPT_PURCHASES (
     FOREIGN KEY (prompt_id) REFERENCES PROMPTS(id)
 );
 
-CREATE UNIQUE INDEX idx_prompt_purchases_unique ON PROMPT_PURCHASES(buyer_user_id, prompt_id);
 CREATE INDEX idx_prompt_purchases_prompt ON PROMPT_PURCHASES(prompt_id);
 CREATE UNIQUE INDEX idx_prompt_purchases_reference ON PROMPT_PURCHASES(payment_reference) WHERE payment_reference IS NOT NULL;
+
+-- =============================================================================
+-- ENTITLEMENTS (generic use-access ledger for prompts, packs, and future assets)
+-- =============================================================================
+CREATE TABLE ENTITLEMENTS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    asset_type TEXT NOT NULL CHECK(asset_type IN ('prompt', 'pack', 'skill_pack', 'memory_pack', 'plugin', 'workflow')),
+    asset_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_ref_type TEXT,
+    source_ref_id TEXT,
+    starts_at DATETIME,
+    expires_at DATETIME,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'pending', 'expired', 'revoked', 'refunded', 'suspended')),
+    metadata_json TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by_user_id INTEGER,
+    revoked_at DATETIME,
+    revoked_by_user_id INTEGER,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES USERS(id) ON DELETE SET NULL,
+    FOREIGN KEY (revoked_by_user_id) REFERENCES USERS(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_entitlements_user_asset_status ON ENTITLEMENTS(user_id, asset_type, asset_id, status);
+CREATE INDEX idx_entitlements_asset ON ENTITLEMENTS(asset_type, asset_id, status);
+CREATE INDEX idx_entitlements_user_status ON ENTITLEMENTS(user_id, status, starts_at, expires_at);
+CREATE INDEX idx_entitlements_expiry ON ENTITLEMENTS(status, expires_at);
+CREATE UNIQUE INDEX idx_entitlements_source_ref_unique
+    ON ENTITLEMENTS(user_id, asset_type, asset_id, source_ref_type, source_ref_id)
+    WHERE source_ref_type IS NOT NULL AND source_ref_id IS NOT NULL;
 
 -- =============================================================================
 -- WELCOME_MESSAGES (welcome message content per prompt or pack)

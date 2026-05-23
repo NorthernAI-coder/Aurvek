@@ -6,7 +6,8 @@ import orjson
 import pytest
 from fastapi import UploadFile
 
-import ai_calls
+from chat.routes import attachments as attachment_routes
+from chat.services import attachment_uploads
 import file_storage
 
 
@@ -33,9 +34,12 @@ def _upload_file(data: bytes) -> UploadFile:
 
 @pytest.mark.asyncio
 async def test_chunked_text_upload_creates_scoped_pending_attachment(mock_db, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(ai_calls, "get_db_connection", mock_db)
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
+    monkeypatch.setattr(attachment_routes, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_uploads, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_routes, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
+    monkeypatch.setattr(attachment_routes, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
     monkeypatch.setattr(file_storage, "FILE_BLOB_ROOT", tmp_path / "file_blobs")
 
     user = DummyUser()
@@ -48,7 +52,7 @@ async def test_chunked_text_upload_creates_scoped_pending_attachment(mock_db, tm
         await _seed_user_conversation(conn, user_id=user.id, conversation_id=conversation_id)
 
     for index, chunk in enumerate(chunks):
-        response = await ai_calls.upload_attachment_chunk(
+        response = await attachment_routes.upload_attachment_chunk(
             conversation_id=conversation_id,
             current_user=user,
             upload_id=upload_id,
@@ -61,7 +65,7 @@ async def test_chunked_text_upload_creates_scoped_pending_attachment(mock_db, tm
         )
         assert response.status_code == 200
 
-    complete = await ai_calls.complete_attachment_upload(
+    complete = await attachment_routes.complete_attachment_upload(
         conversation_id=conversation_id,
         current_user=user,
         upload_id=upload_id,
@@ -92,15 +96,18 @@ async def test_chunked_text_upload_creates_scoped_pending_attachment(mock_db, tm
 
 @pytest.mark.asyncio
 async def test_chunk_upload_rejects_metadata_mismatch(mock_db, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(ai_calls, "get_db_connection", mock_db)
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
+    monkeypatch.setattr(attachment_routes, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_uploads, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_routes, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
+    monkeypatch.setattr(attachment_routes, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES", 4)
 
     user = DummyUser()
     async with mock_db() as conn:
         await _seed_user_conversation(conn, user_id=user.id, conversation_id=42)
 
-    response = await ai_calls.upload_attachment_chunk(
+    response = await attachment_routes.upload_attachment_chunk(
         conversation_id=42,
         current_user=user,
         upload_id="upload_bad_123",
@@ -119,7 +126,8 @@ async def test_chunk_upload_rejects_metadata_mismatch(mock_db, tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_discard_uploaded_attachments_is_scoped(mock_db, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(ai_calls, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_routes, "get_db_connection", mock_db)
+    monkeypatch.setattr(attachment_uploads, "get_db_connection", mock_db)
     monkeypatch.setattr(file_storage, "FILE_BLOB_ROOT", tmp_path / "file_blobs")
 
     user = DummyUser()
@@ -140,7 +148,7 @@ async def test_discard_uploaded_attachments_is_scoped(mock_db, tmp_path, monkeyp
         filename="other.txt",
     )
 
-    response = await ai_calls.discard_uploaded_attachments(
+    response = await attachment_routes.discard_uploaded_attachments(
         conversation_id=43,
         current_user=user,
         attachment_refs=orjson.dumps([own.public_id, other.public_id]).decode(),
@@ -155,8 +163,8 @@ async def test_discard_uploaded_attachments_is_scoped(mock_db, tmp_path, monkeyp
 
 @pytest.mark.asyncio
 async def test_prune_stale_attachment_upload_chunks(mock_db, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
-    monkeypatch.setattr(ai_calls, "ATTACHMENT_UPLOAD_TTL_SECONDS", 60)
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_CHUNK_ROOT", tmp_path / "upload_chunks")
+    monkeypatch.setattr(attachment_uploads, "ATTACHMENT_UPLOAD_TTL_SECONDS", 60)
 
     stale = tmp_path / "upload_chunks" / "1" / "2" / "stale_upload"
     fresh = tmp_path / "upload_chunks" / "1" / "2" / "fresh_upload"
@@ -168,7 +176,7 @@ async def test_prune_stale_attachment_upload_chunks(mock_db, tmp_path, monkeypat
     import os
     os.utime(stale, (old_time, old_time))
 
-    pruned = await ai_calls.prune_stale_attachment_upload_chunks()
+    pruned = await attachment_uploads.prune_stale_attachment_upload_chunks()
 
     assert pruned == 1
     assert not stale.exists()

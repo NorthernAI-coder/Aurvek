@@ -1,8 +1,8 @@
 """
-FTS5 message search module.
+FTS5 message search service.
 
-Provides full-text search over the MESSAGES_FTS virtual table
-with query sanitization, snippet XSS protection, and async execution.
+Provides full-text search over the MESSAGES_FTS virtual table with query
+sanitization, snippet XSS protection, and async execution.
 """
 
 import html
@@ -23,7 +23,6 @@ def build_fts_query(raw_query: str) -> str:
         return ""
 
     parts = []
-    # Extract quoted phrases first
     phrase_pattern = re.compile(r'"([^"]*)"')
     phrases = phrase_pattern.findall(raw_query)
     for phrase in phrases:
@@ -31,10 +30,7 @@ def build_fts_query(raw_query: str) -> str:
         if stripped:
             parts.append(f'"{stripped}"')
 
-    # Remove quoted phrases from the raw query to get loose tokens
     remaining = phrase_pattern.sub("", raw_query).strip()
-
-    # Split remaining into tokens and clean each one
     dangerous_chars = re.compile(r'[*^{}\(\)\[\]|:]')
     if remaining:
         for token in remaining.split():
@@ -49,8 +45,8 @@ def sanitize_snippet(raw_snippet: str) -> str:
     """
     Sanitize an FTS5 snippet for safe HTML rendering.
 
-    Escapes all HTML entities first, then restores only the
-    <mark> and </mark> tags injected by FTS5 snippet().
+    Escapes all HTML entities first, then restores only the <mark> and </mark>
+    tags injected by FTS5 snippet().
     """
     safe = html.escape(raw_snippet)
     safe = safe.replace("&lt;mark&gt;", "<mark>").replace("&lt;/mark&gt;", "</mark>")
@@ -96,10 +92,6 @@ async def execute_search(
         limit: Maximum number of results to return.
         offset: Number of results to skip (pagination).
         conversation_id: Optional conversation scope filter.
-
-    Returns:
-        List of dicts with keys: message_id, conversation_id,
-        chat_name, type, date, snippet_html.
     """
     if conversation_id is not None:
         conv_filter = "AND m.conversation_id = :conversation_id"
@@ -115,10 +107,8 @@ async def execute_search(
     except Exception:
         privacy_filter = ""
 
-    sql = (
-        SEARCH_SQL
-        .replace("{privacy_filter}", privacy_filter)
-        .replace("{conv_filter}", conv_filter)
+    sql = SEARCH_SQL.replace("{privacy_filter}", privacy_filter).replace(
+        "{conv_filter}", conv_filter
     )
 
     params = {

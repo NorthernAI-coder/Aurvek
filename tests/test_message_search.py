@@ -1,12 +1,6 @@
-"""Tests for message_search module (build_fts_query and sanitize_snippet)."""
+"""Tests for chat message search helpers."""
 
-import sys
-import os
-
-# Add project root to path so we can import message_search
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-from message_search import build_fts_query, sanitize_snippet
+from chat.services.search import build_fts_query, sanitize_snippet
 
 
 class TestBuildFtsQuery:

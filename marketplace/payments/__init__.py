@@ -1,2 +1,1 @@
 """Marketplace payment helpers."""
-

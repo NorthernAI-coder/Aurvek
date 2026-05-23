@@ -181,4 +181,3 @@ async def record_disabled_marketplace_checkout(session, metadata: dict, checkout
                 checkout_type,
             )
             raise
-

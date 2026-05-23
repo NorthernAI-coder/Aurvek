@@ -7,6 +7,7 @@ import orjson
 
 from common import get_user_branding, slugify
 from database import get_db_connection
+from marketplace.services.entitlements import active_entitlement_condition
 from log_config import logger
 from security_config import is_forbidden_prompt_name
 
@@ -290,10 +291,35 @@ async def get_creator_storefront_data(
                 placeholders = ','.join('?' * len(prompt_ids))
                 cursor = await conn.execute(
                     f"""
-                    SELECT DISTINCT prompt_id FROM PROMPT_PERMISSIONS
-                    WHERE user_id = ? AND prompt_id IN ({placeholders})
+                    SELECT DISTINCT p.id
+                    FROM PROMPTS p
+                    WHERE p.id IN ({placeholders})
+                      AND (
+                          EXISTS (
+                              SELECT 1 FROM PROMPT_PERMISSIONS pp
+                              WHERE pp.prompt_id = p.id AND pp.user_id = ?
+                                AND pp.permission_level IN ('owner', 'edit')
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM ENTITLEMENTS e_prompt
+                              WHERE e_prompt.user_id = ?
+                                AND e_prompt.asset_type = 'prompt'
+                                AND e_prompt.asset_id = p.id
+                                AND {active_entitlement_condition("e_prompt")}
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM ENTITLEMENTS e_pack
+                              JOIN PACK_ITEMS pi ON e_pack.asset_id = pi.pack_id
+                              WHERE e_pack.user_id = ?
+                                AND e_pack.asset_type = 'pack'
+                                AND pi.prompt_id = p.id
+                                AND pi.is_active = 1
+                                AND (pi.disable_at IS NULL OR julianday(pi.disable_at) > julianday('now'))
+                                AND {active_entitlement_condition("e_pack")}
+                          )
+                      )
                     """,
-                    (viewer_user_id, *prompt_ids),
+                    (*prompt_ids, viewer_user_id, viewer_user_id, viewer_user_id),
                 )
                 rows = await cursor.fetchall()
                 viewer_access['prompt_ids'] = [r[0] for r in rows]
@@ -303,10 +329,21 @@ async def get_creator_storefront_data(
                 placeholders = ','.join('?' * len(pack_ids))
                 cursor = await conn.execute(
                     f"""
-                    SELECT pack_id FROM PACK_ACCESS
-                    WHERE user_id = ? AND pack_id IN ({placeholders})
+                    SELECT DISTINCT pk.id
+                    FROM PACKS pk
+                    WHERE pk.id IN ({placeholders})
+                      AND (
+                          pk.created_by_user_id = ?
+                          OR EXISTS (
+                              SELECT 1 FROM ENTITLEMENTS e_pack
+                              WHERE e_pack.user_id = ?
+                                AND e_pack.asset_type = 'pack'
+                                AND e_pack.asset_id = pk.id
+                                AND {active_entitlement_condition("e_pack")}
+                          )
+                      )
                     """,
-                    (viewer_user_id, *pack_ids),
+                    (*pack_ids, viewer_user_id, viewer_user_id),
                 )
                 rows = await cursor.fetchall()
                 viewer_access['pack_ids'] = [r[0] for r in rows]

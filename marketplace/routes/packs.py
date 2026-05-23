@@ -3,6 +3,7 @@ import os
 import re
 import base64
 import asyncio
+import secrets
 import stripe
 import orjson
 import logging
@@ -17,11 +18,18 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Redirect
 
 from models import User, Pack
 from auth import get_current_user
+from billing.discounts import (
+    DiscountError,
+    claim_discount_usage_for_checkout,
+    decrement_discount_usage,
+    restore_discount_usage_for_checkout,
+    validate_discount_code,
+)
 from database import (
     get_db_connection,
     create_pack, get_pack, get_user_packs, update_pack, delete_pack,
     get_pack_items, get_public_pack_items, add_pack_item, remove_pack_item, reorder_pack_items,
-    get_available_prompts_for_pack, grant_pack_access, revoke_pack_access, check_pack_access,
+    get_available_prompts_for_pack,
     count_user_packs, count_user_packs_today, get_public_packs,
     get_pack_by_public_id, create_pack_purchase, get_pack_purchase_by_reference,
     get_pack_purchases,
@@ -43,7 +51,14 @@ from save_images import resize_image_cover
 from security_guard_llm import check_security, is_security_guard_enabled
 from marketplace.landing.wizard import is_claude_available, list_prompt_files, list_welcome_files, delete_all_landing_files, delete_all_welcome_files
 from marketplace.landing.jobs import start_job, get_job, get_active_job_for_pack, get_active_welcome_job_for_pack
-from prompts import create_pack_directory, get_pack_path, get_pack_components_dir, sanitize_landing_reg_config
+from marketplace.services.entitlements import (
+    active_entitlement_condition,
+    grant_pack_entitlement,
+    revoke_entitlement,
+    user_has_pack_access as user_has_pack_entitlement_access,
+)
+from prompts import create_pack_directory, get_pack_path, get_pack_components_dir
+from marketplace.services.landing_registration import sanitize_landing_reg_config
 from ranking import maybe_trigger_recalculation
 from marketplace.config import (
     marketplace_public_landings_enabled,
@@ -106,7 +121,7 @@ async def get_pack_landing_cached(public_id: str) -> dict:
 
         # Query DB
         async with get_db_connection(readonly=True) as conn:
-            cursor = await conn.execute("""
+            cursor = await conn.execute(f"""
                 SELECT p.id, p.name, p.slug, p.description, p.cover_image,
                        p.is_paid, p.price, p.status, p.is_public,
                        p.has_custom_landing, p.created_by_user_id, p.tags,
@@ -166,7 +181,7 @@ def invalidate_pack_landing_cache(public_id: str):
 async def warmup_pack_landing_cache():
     """
     Pre-load published packs into cache on startup.
-    Uses PACK_ACCESS count to prioritize popular packs.
+    Uses active pack entitlements to prioritize popular packs.
     """
     if not marketplace_public_landings_enabled():
         logger.info("Pack landing cache warmup disabled (marketplace public landings disabled)")
@@ -178,15 +193,17 @@ async def warmup_pack_landing_cache():
 
     try:
         async with get_db_connection(readonly=True) as conn:
-            cursor = await conn.execute("""
+            cursor = await conn.execute(f"""
                 SELECT p.id, p.name, p.slug, p.description, p.cover_image,
                        p.is_paid, p.price, p.status, p.is_public,
                        p.has_custom_landing, p.created_by_user_id, p.tags,
                        p.public_id, u.username,
-                       COALESCE(COUNT(pa.id), 0) AS access_count
+                       COALESCE(COUNT(e.id), 0) AS access_count
                 FROM PACKS p
                 JOIN USERS u ON p.created_by_user_id = u.id
-                LEFT JOIN PACK_ACCESS pa ON pa.pack_id = p.id
+                LEFT JOIN ENTITLEMENTS e ON e.asset_type = 'pack'
+                    AND e.asset_id = p.id
+                    AND {active_entitlement_condition("e")}
                 WHERE p.public_id IS NOT NULL AND p.status = 'published'
                 GROUP BY p.id
                 ORDER BY access_count DESC
@@ -663,7 +680,9 @@ async def api_delete_pack(pack_id: int, current_user: User = Depends(get_current
         # Only allow deletion of draft packs or packs with no active access
         if pack_row["status"] != "draft":
             cursor = await conn.execute(
-                "SELECT COUNT(*) FROM PACK_ACCESS WHERE pack_id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))",
+                f"""SELECT COUNT(*) FROM ENTITLEMENTS e
+                    WHERE e.asset_type = 'pack' AND e.asset_id = ?
+                      AND {active_entitlement_condition("e")}""",
                 (pack_id,)
             )
             access_count = (await cursor.fetchone())[0]
@@ -2772,7 +2791,17 @@ async def api_grant_pack_access(user_id: int, pack_id: int, current_user: User =
         if not await cursor.fetchone():
             raise HTTPException(status_code=404, detail="User not found")
 
-        await grant_pack_access(conn, pack_id, user_id, granted_via="admin_grant")
+        await grant_pack_entitlement(
+            conn,
+            user_id=user_id,
+            pack_id=pack_id,
+            source="admin_grant",
+            source_ref_type="admin_pack_grant",
+            source_ref_id=f"{user_id}:{pack_id}",
+            metadata={"route": "api_grant_pack_access"},
+            created_by_user_id=current_user.id,
+            reactivate_inactive=True,
+        )
 
         # Record creator relationship
         creator_id = pack_row["created_by_user_id"] if pack_row else None
@@ -2781,9 +2810,9 @@ async def api_grant_pack_access(user_id: int, pack_id: int, current_user: User =
                 from common import upsert_creator_relationship
                 ucr_cursor = await conn.cursor()
                 await upsert_creator_relationship(ucr_cursor, user_id, creator_id, 'assigned_by', 'pack', pack_id)
-                await conn.commit()
             except Exception as ucr_err:
                 logger.warning(f"Could not record creator relationship for grant: {ucr_err}")
+        await conn.commit()
 
     return JSONResponse({"message": "Access granted"})
 
@@ -2796,7 +2825,16 @@ async def api_revoke_pack_access(user_id: int, pack_id: int, current_user: User 
         raise HTTPException(status_code=403, detail="Admin only")
 
     async with get_db_connection() as conn:
-        await revoke_pack_access(conn, pack_id, user_id)
+        await revoke_entitlement(
+            conn,
+            user_id=user_id,
+            asset_type="pack",
+            asset_id=pack_id,
+            status="revoked",
+            revoked_by_user_id=current_user.id,
+            metadata={"route": "api_revoke_pack_access"},
+        )
+        await conn.commit()
 
     return JSONResponse({"message": "Access revoked"})
 
@@ -2844,7 +2882,7 @@ async def api_explore_pack_items(pack_id: int):
 
 @router.post("/api/packs/{pack_id}/claim-free")
 async def api_claim_free_pack(pack_id: int, current_user: User = Depends(get_current_user)):
-    """Claim a free pack for the logged-in user (grants PACK_ACCESS)."""
+    """Claim a free pack for the logged-in user."""
     require_checkout_enabled()
 
     if current_user is None:
@@ -2858,7 +2896,7 @@ async def api_claim_free_pack(pack_id: int, current_user: User = Depends(get_cur
         if pack["is_paid"]:
             raise HTTPException(status_code=400, detail="This pack requires a purchase")
 
-        has_access = await check_pack_access(conn, pack_id, current_user.id)
+        has_access = await user_has_pack_entitlement_access(conn, user_id=current_user.id, pack_id=pack_id)
         if has_access:
             return JSONResponse({"message": "You already have access to this pack", "redirect": "/chat"})
 
@@ -2872,7 +2910,16 @@ async def api_claim_free_pack(pack_id: int, current_user: User = Depends(get_cur
         if not await active_cursor.fetchone():
             raise HTTPException(status_code=400, detail="This pack is currently unavailable")
 
-        await grant_pack_access(conn, pack_id, current_user.id, granted_via="claim_free")
+        await grant_pack_entitlement(
+            conn,
+            user_id=current_user.id,
+            pack_id=pack_id,
+            source="free_claim",
+            source_ref_type="free_pack_claim",
+            source_ref_id=f"{current_user.id}:{pack_id}",
+            metadata={"route": "api_claim_free_pack"},
+            created_by_user_id=pack["created_by_user_id"],
+        )
 
         # Record creator relationship
         creator_id = pack["created_by_user_id"] if pack else None
@@ -2881,9 +2928,9 @@ async def api_claim_free_pack(pack_id: int, current_user: User = Depends(get_cur
                 from common import upsert_creator_relationship
                 ucr_cursor = await conn.cursor()
                 await upsert_creator_relationship(ucr_cursor, current_user.id, creator_id, 'purchased_from', 'pack', pack_id)
-                await conn.commit()
             except Exception as ucr_err:
                 logger.warning(f"Could not record creator relationship for free claim: {ucr_err}")
+        await conn.commit()
 
     return JSONResponse({"message": "Pack claimed successfully", "redirect": "/chat"})
 
@@ -2895,11 +2942,7 @@ async def check_pack_access_endpoint(pack_id: int, current_user: User = Depends(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.execute(
-            "SELECT 1 FROM PACK_ACCESS WHERE pack_id = ? AND user_id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))",
-            (pack_id, current_user.id)
-        )
-        has_access = await cursor.fetchone() is not None
+        has_access = await user_has_pack_entitlement_access(conn, user_id=current_user.id, pack_id=pack_id)
 
     return {"has_access": has_access}
 
@@ -2930,7 +2973,7 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
         if pack["created_by_user_id"] == current_user.id:
             raise HTTPException(status_code=400, detail="You cannot purchase your own pack")
 
-        has_access = await check_pack_access(conn, pack_id, current_user.id)
+        has_access = await user_has_pack_entitlement_access(conn, user_id=current_user.id, pack_id=pack_id)
         if has_access:
             return JSONResponse({"message": "You already have access to this pack", "redirect": "/chat"})
 
@@ -2950,30 +2993,12 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
 
         # Validate and apply discount code
         if discount_code:
-            from datetime import date
-            cursor = await conn.execute(
-                "SELECT discount_value, active, usage_count, validity_date, unlimited_usage, unlimited_validity FROM DISCOUNTS WHERE code = ?",
-                (discount_code,)
-            )
-            discount = await cursor.fetchone()
-
-            if not discount or not discount["active"]:
-                raise HTTPException(status_code=400, detail="Invalid or inactive discount code")
-
-            if not discount["unlimited_validity"] and discount["validity_date"]:
-                from datetime import datetime as dt
-                validity = dt.strptime(discount["validity_date"], '%Y-%m-%d').date()
-                if date.today() > validity:
-                    raise HTTPException(status_code=400, detail="Discount code has expired")
-
-            if not discount["unlimited_usage"] and discount["usage_count"] is not None:
-                if discount["usage_count"] <= 0:
-                    raise HTTPException(status_code=400, detail="Discount code usage limit reached")
-
-            discount_value = float(discount["discount_value"])
-            if discount_value < 0 or discount_value > 100:
-                raise HTTPException(status_code=400, detail="Invalid discount value")
-            final_amount = max(0, original_price * (1 - discount_value / 100))
+            try:
+                discount = await validate_discount_code(discount_code, original_price, conn=conn)
+            except DiscountError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+            discount_value = discount.discount_value
+            final_amount = discount.final_amount
 
     # Reject amounts between $0.01-$0.49: below Stripe minimum but not a full discount
     if 0 < final_amount < 0.50:
@@ -2988,8 +3013,16 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
             # Atomic transaction: purchase + access grant + config + discount decrement
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                if discount_code:
+                    try:
+                        discount = await validate_discount_code(discount_code, original_price, conn=conn)
+                    except DiscountError as exc:
+                        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+                    if discount.final_amount != 0:
+                        raise HTTPException(status_code=400, detail="Discount does not fully cover this payment")
+
                 # Inline create_pack_purchase (avoid intermediate commit)
-                await conn.execute(
+                purchase_cursor = await conn.execute(
                     """INSERT INTO PACK_PURCHASES
                        (buyer_user_id, pack_id, amount, currency, payment_method, payment_reference, status)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -2997,11 +3030,19 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
                      f"discount_{discount_code}_user_{current_user.id}", "completed"),
                 )
 
-                # Inline grant_pack_access (avoid intermediate commit)
-                await conn.execute(
-                    """INSERT OR IGNORE INTO PACK_ACCESS (pack_id, user_id, granted_via)
-                       VALUES (?, ?, ?)""",
-                    (pack_id, current_user.id, "purchase"),
+                await grant_pack_entitlement(
+                    conn,
+                    user_id=current_user.id,
+                    pack_id=pack_id,
+                    source="discount_claim",
+                    source_ref_type="pack_purchase",
+                    source_ref_id=purchase_cursor.lastrowid,
+                    metadata={
+                        "payment_method": "free",
+                        "discount_code": discount_code or None,
+                        "amount": 0,
+                    },
+                    created_by_user_id=pack["created_by_user_id"],
                 )
 
                 # Apply landing_reg_config to buyer
@@ -3040,14 +3081,7 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
                     discount_code if discount_code else None
                 ))
 
-                # Decrement discount usage
-                if discount_code:
-                    await conn.execute("""
-                        UPDATE DISCOUNTS SET usage_count = CASE
-                            WHEN unlimited_usage = 1 THEN usage_count
-                            ELSE MAX(0, COALESCE(usage_count, 1) - 1)
-                        END WHERE code = ?
-                    """, (discount_code,))
+                await decrement_discount_usage(conn, discount_code)
 
                 # Record creator relationship
                 pack_creator_id = pack["created_by_user_id"] if pack else None
@@ -3078,7 +3112,29 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
 
     # Create Stripe Checkout Session
     base_url = str(request.base_url).rstrip('/')
+    discount_claimed = False
+    discount_claim_reference = None
     try:
+        if discount_code:
+            discount_claim_reference = f"discount-claim-{secrets.token_hex(16)}"
+            try:
+                discount = await claim_discount_usage_for_checkout(discount_code, original_price)
+            except DiscountError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+            discount_claimed = True
+            discount_value = discount.discount_value
+            final_amount = discount.final_amount
+            if final_amount == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Discount now fully covers this purchase. Please retry to claim it without Stripe.",
+                )
+            if 0 < final_amount < 0.50:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Final price after discount (${final_amount:.2f}) is below the minimum processing amount ($0.50). The discount must either cover the full price or leave at least $0.50."
+                )
+
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
@@ -3103,11 +3159,27 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
                 'final_amount': str(final_amount),
                 'discount_code': discount_code,
                 'discount_value': str(discount_value),
+                'discount_claimed': '1' if discount_claimed else '0',
+                'discount_claim_reference': discount_claim_reference or '',
             }
         )
         return JSONResponse({"checkout_url": session.url})
 
+    except HTTPException:
+        if discount_claimed:
+            await restore_discount_usage_for_checkout(
+                discount_code,
+                reference_id=discount_claim_reference,
+                user_id=current_user.id,
+            )
+        raise
     except stripe.error.StripeError as e:
+        if discount_claimed:
+            await restore_discount_usage_for_checkout(
+                discount_code,
+                reference_id=discount_claim_reference,
+                user_id=current_user.id,
+            )
         logger.error(f"Stripe error creating pack checkout: {e}")
         raise HTTPException(status_code=500, detail="Payment service error")
 

@@ -11,6 +11,9 @@ import json
 import logging
 from fastapi.responses import HTMLResponse
 from database import get_db_connection
+from marketplace.services.entitlements import active_entitlement_condition
+from marketplace.services.entitlements import user_has_pack_access as user_has_pack_entitlement_access
+from marketplace.services.entitlements import user_has_prompt_access as user_has_prompt_entitlement_access
 from prompts import get_prompt_info, get_prompt_path, get_pack_path
 
 logger = logging.getLogger(__name__)
@@ -92,13 +95,7 @@ async def build_world(world_type: str, world_id: int) -> dict | None:
 async def user_has_pack_access(user_id: int, pack_id: int) -> bool:
     """Check if a user currently has access to a pack."""
     async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.execute(
-            """SELECT 1 FROM PACK_ACCESS
-               WHERE pack_id = ? AND user_id = ?
-               AND (expires_at IS NULL OR expires_at > datetime('now'))""",
-            (pack_id, user_id),
-        )
-        return await cursor.fetchone() is not None
+        return await user_has_pack_entitlement_access(conn, user_id=user_id, pack_id=pack_id)
 
 
 async def user_has_prompt_access(user, prompt_id: int) -> bool:
@@ -106,34 +103,19 @@ async def user_has_prompt_access(user, prompt_id: int) -> bool:
     if user.all_prompts_access:
         return True
     async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.execute(
-            "SELECT 1 FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
-            (prompt_id, user.id),
-        )
-        if await cursor.fetchone():
-            return True
-        # Check via pack access
-        cursor = await conn.execute(
-            """SELECT 1 FROM PACK_ACCESS pa
-               JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
-               WHERE pi.prompt_id = ? AND pa.user_id = ?
-               AND pi.is_active = 1
-               AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
-            (prompt_id, user.id),
-        )
-        return await cursor.fetchone() is not None
+        return await user_has_prompt_entitlement_access(conn, user_id=user.id, prompt_id=prompt_id)
 
 
 async def _get_user_packs(user_id: int) -> list[dict]:
     """Return all packs a user has access to (id, name, cover_image)."""
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
-            """SELECT p.id, p.name, p.cover_image
+            f"""SELECT p.id, p.name, p.cover_image
                FROM PACKS p
-               JOIN PACK_ACCESS pa ON pa.pack_id = p.id
-               WHERE pa.user_id = ?
-               AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))
-               ORDER BY pa.granted_at DESC""",
+               JOIN ENTITLEMENTS e ON e.asset_type = 'pack' AND e.asset_id = p.id
+               WHERE e.user_id = ?
+               AND {active_entitlement_condition("e")}
+               ORDER BY e.created_at DESC, e.id DESC""",
             (user_id,),
         )
         return [dict(r) for r in await cursor.fetchall()]
@@ -143,17 +125,34 @@ async def _get_user_standalone_prompts(user_id: int) -> list[dict]:
     """Return prompts the user has access to that are NOT part of any pack they access."""
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
-            """SELECT DISTINCT pp.prompt_id AS id, pr.name
-               FROM PROMPT_PERMISSIONS pp
-               JOIN PROMPTS pr ON pr.id = pp.prompt_id
-               WHERE pp.user_id = ?
-               AND pp.prompt_id NOT IN (
+            f"""SELECT DISTINCT pr.id, pr.name
+               FROM PROMPTS pr
+               WHERE (
+                   EXISTS (
+                       SELECT 1 FROM PROMPT_PERMISSIONS pp
+                       WHERE pp.prompt_id = pr.id
+                         AND pp.user_id = ?
+                         AND pp.permission_level IN ('owner', 'edit')
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM ENTITLEMENTS e_prompt
+                       WHERE e_prompt.user_id = ?
+                         AND e_prompt.asset_type = 'prompt'
+                         AND e_prompt.asset_id = pr.id
+                         AND {active_entitlement_condition("e_prompt")}
+                   )
+               )
+               AND pr.id NOT IN (
                    SELECT pi.prompt_id FROM PACK_ITEMS pi
-                   JOIN PACK_ACCESS pa ON pa.pack_id = pi.pack_id
-                   WHERE pa.user_id = ?
+                   JOIN ENTITLEMENTS e_pack ON e_pack.asset_type = 'pack'
+                       AND e_pack.asset_id = pi.pack_id
+                   WHERE e_pack.user_id = ?
+                     AND pi.is_active = 1
+                     AND (pi.disable_at IS NULL OR julianday(pi.disable_at) > julianday('now'))
+                     AND {active_entitlement_condition("e_pack")}
                )
                ORDER BY pr.name""",
-            (user_id, user_id),
+            (user_id, user_id, user_id),
         )
         return [dict(r) for r in await cursor.fetchall()]
 
@@ -195,14 +194,14 @@ async def _get_prompt_parent_pack(user_id: int, prompt_id: int) -> dict | None:
     """Find the first pack a user can access that contains this prompt and has a welcome page."""
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
-            """SELECT p.id, p.name
+            f"""SELECT p.id, p.name
                FROM PACK_ITEMS pi
                JOIN PACKS p ON p.id = pi.pack_id
-               JOIN PACK_ACCESS pa ON pa.pack_id = p.id
-               WHERE pi.prompt_id = ? AND pa.user_id = ?
+               JOIN ENTITLEMENTS e ON e.asset_type = 'pack' AND e.asset_id = p.id
+               WHERE pi.prompt_id = ? AND e.user_id = ?
                AND pi.is_active = 1
-               AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))
-               ORDER BY pa.granted_at ASC
+               AND {active_entitlement_condition("e")}
+               ORDER BY e.created_at ASC, e.id ASC
                LIMIT 5""",
             (prompt_id, user_id),
         )

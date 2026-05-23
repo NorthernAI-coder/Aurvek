@@ -420,11 +420,17 @@ AURVEK/
 │   ├── middleware/         # Marketplace-specific middleware
 │   ├── routes/             # Marketplace routers (admin, packs, discovery, analytics, checkout, geo, ranking, domains)
 │   └── services/           # Storefront and marketplace service logic
+├── integrations/           # External platform and voice-call boundaries
+│   ├── conversations.py    # External conversation bindings and platform state
+│   ├── delivery.py         # External response delivery helpers
+│   ├── media.py            # External-channel speech-to-text helpers
+│   ├── platform_routes.py  # Shared WhatsApp/Telegram platform-mode API
+│   ├── elevenlabs/         # Voice-call routes, admin routes, SDK proxy, service layer
+│   ├── telegram/           # Telegram admin and webhook routes
+│   └── whatsapp/           # WhatsApp admin and webhook routes
 ├── twilio_async.py         # Async Twilio client (httpx, no SDK)
 ├── welcome_service.py      # Welcome page resolution & serving
 ├── security_guard_llm.py   # LLM-based content moderation
-├── elevenlabs_service.py   # Voice calls, transcripts, agent management
-├── whatsapp.py             # Twilio WhatsApp integration
 ├── middleware/
 │   └── security.py         # Request filtering, IP blocking, WAF escalation
 ├── tools/

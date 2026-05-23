@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from auth import get_current_user
+from billing.discounts import (
+    DiscountError,
+    claim_discount_usage_for_checkout,
+    decrement_discount_usage,
+    restore_discount_usage_for_checkout,
+    validate_discount_code,
+)
 from common import (
     AVATAR_TOKEN_EXPIRE_HOURS,
     CLOUDFLARE_BASE_URL,
@@ -23,6 +31,10 @@ from database import get_db_connection
 from log_config import logger
 from marketplace.config import require_checkout_enabled
 from marketplace.services.acquisition import apply_landing_config_to_user
+from marketplace.services.entitlements import (
+    grant_prompt_entitlement,
+    user_has_prompt_access as user_has_prompt_entitlement_access,
+)
 from models import User
 from save_images import generate_img_token
 
@@ -133,26 +145,7 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
         if creator_user_id == current_user.id:
             raise HTTPException(status_code=400, detail="You cannot purchase your own prompt")
 
-        # Check existing access via PROMPT_PERMISSIONS
-        await cursor.execute(
-            "SELECT permission_level FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND user_id = ?",
-            (prompt_id, current_user.id)
-        )
-        existing_perm = await cursor.fetchone()
-        if existing_perm:
-            return JSONResponse({"message": "You already have access to this prompt", "redirect": "/chat"})
-
-        # Check existing access via PACK_ACCESS
-        await cursor.execute(
-            """SELECT 1 FROM PACK_ACCESS pa
-               JOIN PACK_ITEMS pi ON pa.pack_id = pi.pack_id
-               WHERE pa.user_id = ? AND pi.prompt_id = ?
-               AND pi.is_active = 1
-               AND (pi.disable_at IS NULL OR pi.disable_at > datetime('now'))
-               AND (pa.expires_at IS NULL OR pa.expires_at > datetime('now'))""",
-            (current_user.id, prompt_id)
-        )
-        if await cursor.fetchone():
+        if await user_has_prompt_entitlement_access(cursor, user_id=current_user.id, prompt_id=prompt_id):
             return JSONResponse({"message": "You already have access to this prompt", "redirect": "/chat"})
 
     original_price = float(purchase_price)
@@ -161,29 +154,12 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
 
     # Validate and apply discount code
     if discount_code:
-        async with get_db_connection(readonly=True) as conn:
-            disc_cursor = await conn.execute(
-                "SELECT discount_value, active, usage_count, validity_date, unlimited_usage, unlimited_validity FROM DISCOUNTS WHERE code = ?",
-                (discount_code,)
-            )
-            discount = await disc_cursor.fetchone()
-
-            if not discount or not discount[1]:  # not active
-                raise HTTPException(status_code=400, detail="Invalid or inactive discount code")
-
-            if not discount[5] and discount[3]:  # not unlimited_validity and has validity_date
-                validity = datetime.strptime(discount[3], '%Y-%m-%d').date()
-                if date.today() > validity:
-                    raise HTTPException(status_code=400, detail="Discount code has expired")
-
-            if not discount[4] and discount[2] is not None:  # not unlimited_usage
-                if discount[2] <= 0:
-                    raise HTTPException(status_code=400, detail="Discount code usage limit reached")
-
-            discount_value = float(discount[0])
-            if discount_value < 0 or discount_value > 100:
-                raise HTTPException(status_code=400, detail="Invalid discount value")
-            final_amount = max(0, original_price * (1 - discount_value / 100))
+        try:
+            discount = await validate_discount_code(discount_code, original_price)
+        except DiscountError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        discount_value = discount.discount_value
+        final_amount = discount.final_amount
 
     # Reject amounts between $0.01-$0.49 (below Stripe minimum)
     if 0 < final_amount < 0.50:
@@ -200,18 +176,35 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
         async with get_db_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             try:
+                if discount_code:
+                    try:
+                        discount = await validate_discount_code(discount_code, original_price, conn=conn)
+                    except DiscountError as exc:
+                        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+                    if discount.final_amount != 0:
+                        raise HTTPException(status_code=400, detail="Discount does not fully cover this payment")
+
                 # Record purchase
-                await conn.execute(
+                purchase_cursor = await conn.execute(
                     """INSERT INTO PROMPT_PURCHASES
                        (buyer_user_id, prompt_id, amount, currency, payment_method, payment_reference, status)
                        VALUES (?, ?, 0.0, 'USD', 'free', ?, 'completed')""",
-                    (current_user.id, prompt_id, f"discount_{discount_code}_user_{current_user.id}")
+                    (current_user.id, prompt_id, f"discount_{discount_code or 'free'}_user_{current_user.id}_prompt_{prompt_id}_{int(datetime.now(timezone.utc).timestamp())}")
                 )
 
-                # Grant access
-                await conn.execute(
-                    "INSERT OR IGNORE INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'access')",
-                    (prompt_id, current_user.id)
+                await grant_prompt_entitlement(
+                    conn,
+                    user_id=current_user.id,
+                    prompt_id=prompt_id,
+                    source="discount_claim",
+                    source_ref_type="prompt_purchase",
+                    source_ref_id=purchase_cursor.lastrowid,
+                    metadata={
+                        "payment_method": "free",
+                        "discount_code": discount_code or None,
+                        "amount": 0,
+                    },
+                    created_by_user_id=creator_user_id,
                 )
 
                 # Set current_prompt_id
@@ -241,14 +234,7 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
                     discount_code if discount_code else None
                 ))
 
-                # Decrement discount usage
-                if discount_code:
-                    await conn.execute("""
-                        UPDATE DISCOUNTS SET usage_count = CASE
-                            WHEN unlimited_usage = 1 THEN usage_count
-                            ELSE MAX(0, COALESCE(usage_count, 1) - 1)
-                        END WHERE code = ?
-                    """, (discount_code,))
+                await decrement_discount_usage(conn, discount_code)
 
                 if creator_user_id:
                     try:
@@ -292,7 +278,29 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
         raise HTTPException(status_code=503, detail="Payment service is not configured")
 
     base_url = str(request.base_url).rstrip('/')
+    discount_claimed = False
+    discount_claim_reference = None
     try:
+        if discount_code:
+            discount_claim_reference = f"discount-claim-{secrets.token_hex(16)}"
+            try:
+                discount = await claim_discount_usage_for_checkout(discount_code, original_price)
+            except DiscountError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+            discount_claimed = True
+            discount_value = discount.discount_value
+            final_amount = discount.final_amount
+            if final_amount == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Discount now fully covers this purchase. Please retry to claim it without Stripe.",
+                )
+            if 0 < final_amount < 0.50:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Final price after discount (${final_amount:.2f}) is below the minimum processing amount ($0.50). The discount must either cover the full price or leave at least $0.50."
+                )
+
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
@@ -317,10 +325,26 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
                 'final_amount': str(final_amount),
                 'discount_code': discount_code,
                 'discount_value': str(discount_value),
+                'discount_claimed': '1' if discount_claimed else '0',
+                'discount_claim_reference': discount_claim_reference or '',
             }
         )
         return JSONResponse({"checkout_url": session.url})
+    except HTTPException:
+        if discount_claimed:
+            await restore_discount_usage_for_checkout(
+                discount_code,
+                reference_id=discount_claim_reference,
+                user_id=current_user.id,
+            )
+        raise
     except Exception as e:
+        if discount_claimed:
+            await restore_discount_usage_for_checkout(
+                discount_code,
+                reference_id=discount_claim_reference,
+                user_id=current_user.id,
+            )
         logger.error(f"Stripe session creation failed for prompt purchase: {e}")
         raise HTTPException(status_code=500, detail="Payment processing error")
 
@@ -387,4 +411,3 @@ async def prompt_purchase_success_page(
         "payment_amount": payment_amount,
     })
     return templates.TemplateResponse("prompt_purchase_success.html", context)
-

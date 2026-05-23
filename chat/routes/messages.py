@@ -1,0 +1,507 @@
+import base64
+import zlib
+from typing import List, Optional
+
+import orjson
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from auth import get_current_user, unauthenticated_response
+from admin_audit import log_admin_action
+from common import (
+    API_KEY_MODE_OWN_ONLY,
+    AVATAR_TOKEN_EXPIRE_HOURS,
+    CLOUDFLARE_BASE_URL,
+    MAX_PDF_SIZE_MB,
+    MAX_RAW_UPLOAD_SIZE_MB,
+    MAX_TEXT_FILE_SIZE_MB,
+    custom_unescape,
+    decrypt_api_key,
+    get_user_api_key_mode,
+)
+from database import get_db_connection
+from integrations.conversations import is_whatsapp_conversation
+from ai_runtime.messages import process_save_message
+from ai_runtime.multi_ai.service import process_multi_ai_message
+from log_config import logger
+from models import User
+from save_images import generate_img_token
+
+from chat.services.attachment_uploads import parse_attachment_refs_value
+from chat.services.file_inputs import is_text_file
+from chat.services.message_rendering import process_message
+from chat.services.message_requests import validate_message_request
+from chat.services.privacy import ensure_conversation_privacy_schema
+
+router = APIRouter()
+
+
+@router.get("/api/conversations/{conversation_id}/messages")
+async def get_messages(
+    conversation_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(25, ge=1, le=100),
+    before_id: Optional[int] = Query(None),
+):
+    if current_user is None:
+        return unauthenticated_response()
+
+    logger.debug("Requested messages for conversation ID: %s", conversation_id)
+    await ensure_conversation_privacy_schema()
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
+        is_user_admin = await current_user.is_admin
+
+        if is_user_admin:
+            await cursor.execute("SELECT id, user_id FROM conversations WHERE id = ?", (conversation_id,))
+            conversation = await cursor.fetchone()
+            if conversation and conversation["user_id"] != current_user.id:
+                await log_admin_action(
+                    admin_id=current_user.id,
+                    action_type="view_conversation",
+                    request=request,
+                    target_user_id=conversation["user_id"],
+                    target_resource_type="conversation",
+                    target_resource_id=conversation_id,
+                    details=f"Admin viewed conversation of user {conversation['user_id']}",
+                )
+        else:
+            await cursor.execute(
+                "SELECT id, user_id FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, current_user.id),
+            )
+            conversation = await cursor.fetchone()
+
+        if not conversation:
+            return JSONResponse(content={"error": "Conversation not found or access denied"}, status_code=404)
+
+        await cursor.execute(
+            """
+            SELECT c.id, c.role_id, c.active_extension_id,
+                   p.name AS prompt_name, p.image AS bot_picture, p.description AS prompt_description,
+                   p.extensions_enabled, p.extensions_free_selection,
+                   l.machine, l.model,
+                   COALESCE(p.is_paid, 0) AS is_paid,
+                   COALESCE(c.is_incognito, 0) AS is_incognito,
+                   COALESCE(c.hidden_from_history, 0) AS hidden_from_history,
+                   COALESCE(c.purge_on_close, 0) AS purge_on_close
+            FROM CONVERSATIONS c
+            LEFT JOIN PROMPTS p ON c.role_id = p.id
+            LEFT JOIN LLM l ON c.llm_id = l.id
+            WHERE c.id = ?
+            """,
+            (conversation_id,),
+        )
+        conv_row = await cursor.fetchone()
+
+        fetch_limit = limit + 1
+        if before_id is not None:
+            await cursor.execute(
+                """
+                SELECT m.id AS message_id, m.conversation_id, m.user_id, u.username,
+                       m.message, m.type, strftime('%Y-%m-%d %H:%M:%S', m.date) as date_utc,
+                       m.is_bookmarked, m.llm_id, l.machine AS llm_machine, l.model AS llm_model,
+                       m.citations_json
+                FROM MESSAGES m
+                LEFT JOIN USERS u ON m.user_id = u.id
+                LEFT JOIN LLM l ON m.llm_id = l.id
+                WHERE m.conversation_id = ? AND m.id < ?
+                ORDER BY m.id DESC
+                LIMIT ?
+                """,
+                (conversation_id, before_id, fetch_limit),
+            )
+        else:
+            await cursor.execute(
+                """
+                SELECT m.id AS message_id, m.conversation_id, m.user_id, u.username,
+                       m.message, m.type, strftime('%Y-%m-%d %H:%M:%S', m.date) as date_utc,
+                       m.is_bookmarked, m.llm_id, l.machine AS llm_machine, l.model AS llm_model,
+                       m.citations_json
+                FROM MESSAGES m
+                LEFT JOIN USERS u ON m.user_id = u.id
+                LEFT JOIN LLM l ON m.llm_id = l.id
+                WHERE m.conversation_id = ?
+                ORDER BY m.id DESC
+                LIMIT ?
+                """,
+                (conversation_id, fetch_limit),
+            )
+
+        rows = await cursor.fetchall()
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+
+        extensions_data = {}
+        if conv_row and conv_row["extensions_enabled"]:
+            prompt_role_id = conv_row["role_id"]
+            active_ext_id = conv_row["active_extension_id"]
+            active_ext_data = None
+            if active_ext_id:
+                await cursor.execute(
+                    "SELECT id, name, slug, description FROM PROMPT_EXTENSIONS WHERE id = ?",
+                    (active_ext_id,),
+                )
+                ext_row = await cursor.fetchone()
+                if ext_row:
+                    active_ext_data = {
+                        "id": ext_row["id"],
+                        "name": ext_row["name"],
+                        "slug": ext_row["slug"],
+                        "description": ext_row["description"] or "",
+                    }
+
+            await cursor.execute(
+                "SELECT id, name, slug, description FROM PROMPT_EXTENSIONS WHERE prompt_id = ? ORDER BY display_order",
+                (prompt_role_id,),
+            )
+            ext_rows = await cursor.fetchall()
+            all_extensions = [
+                {"id": r["id"], "name": r["name"], "slug": r["slug"], "description": r["description"] or ""}
+                for r in ext_rows
+            ]
+
+            extensions_data = {
+                "extensions_enabled": True,
+                "active_extension": active_ext_data,
+                "extensions": all_extensions,
+                "extensions_free_selection": bool(conv_row["extensions_free_selection"]),
+            }
+
+        await conn.close()
+
+    empty_bot_ids = [
+        row["message_id"]
+        for row in rows
+        if row["type"] == "bot" and (not row["message"] or not row["message"].strip())
+    ]
+    if empty_bot_ids:
+        logger.warning(
+            "Auto-repair: removing %s empty bot message(s) from conversation %s: %s",
+            len(empty_bot_ids),
+            conversation_id,
+            empty_bot_ids,
+        )
+        async with get_db_connection(readonly=False) as write_conn:
+            placeholders = ",".join("?" * len(empty_bot_ids))
+            await write_conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                empty_bot_ids,
+            )
+            await write_conn.commit()
+        empty_bot_set = set(empty_bot_ids)
+        rows = [row for row in rows if row["message_id"] not in empty_bot_set]
+
+    empty_user_ids = [
+        row["message_id"]
+        for row in rows
+        if row["type"] == "user" and (not row["message"] or not row["message"].strip())
+    ]
+    if empty_user_ids:
+        logger.warning(
+            "Found %s empty USER message(s) in conversation %s: %s. Not auto-deleting.",
+            len(empty_user_ids),
+            conversation_id,
+            empty_user_ids,
+        )
+
+    from datetime import datetime, timezone, timedelta
+
+    bot_profile_picture = conv_row["bot_picture"] if conv_row else None
+    if bot_profile_picture:
+        current_time = datetime.now(timezone.utc)
+        new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
+        bot_picture_url = f"{bot_profile_picture}_32.webp"
+        token = generate_img_token(bot_picture_url, new_expiration, current_user)
+        bot_profile_picture = f"{CLOUDFLARE_BASE_URL}{bot_picture_url}?token={token}"
+
+    conversation_info = {
+        "id": conv_row["id"],
+        "prompt_name": conv_row["prompt_name"],
+        "machine": conv_row["machine"],
+        "model": conv_row["model"],
+        "bot_profile_picture": bot_profile_picture,
+        "prompt_description": conv_row["prompt_description"],
+        "is_paid": bool(conv_row["is_paid"]),
+        "is_incognito": bool(conv_row["is_incognito"]),
+        "hidden_from_history": bool(conv_row["hidden_from_history"]),
+        "purge_on_close": bool(conv_row["purge_on_close"]),
+        **extensions_data,
+    }
+
+    if is_user_admin:
+        async with get_db_connection(readonly=True) as admin_conn:
+            admin_cursor = await admin_conn.execute(
+                "SELECT locked, locked_reason FROM CONVERSATIONS WHERE id = ?",
+                (conversation_id,),
+            )
+            lock_row = await admin_cursor.fetchone()
+            if lock_row:
+                conversation_info["locked"] = bool(lock_row["locked"]) if lock_row["locked"] is not None else False
+                conversation_info["locked_reason"] = lock_row["locked_reason"]
+            admin_cursor = await admin_conn.execute(
+                "SELECT COUNT(*) as msg_count, COALESCE(SUM(input_tokens_used + output_tokens_used), 0) as total_tokens FROM MESSAGES WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            stats = await admin_cursor.fetchone()
+            conversation_info["message_count"] = stats["msg_count"]
+            conversation_info["total_tokens"] = stats["total_tokens"]
+
+    if not rows:
+        return JSONResponse(content={
+            "conversation_info": conversation_info,
+            "messages": [],
+            "has_more": False,
+        })
+
+    messages_list = []
+    for row in rows:
+        if row["message_id"] is not None:
+            processed_message = await process_message(
+                custom_unescape(row["message"]),
+                request,
+                current_user,
+                media_owner_username=row["username"],
+                conversation_id=conversation_id,
+                message_id=row["message_id"],
+            )
+            msg_data = {
+                "id": row["message_id"],
+                "conversation_id": conversation_id,
+                "user_id": row["user_id"],
+                "username": row["username"],
+                "message": processed_message,
+                "type": row["type"],
+                "date": row["date_utc"],
+                "is_bookmarked": bool(row["is_bookmarked"]),
+                "llm_id": row["llm_id"],
+                "llm_machine": row["llm_machine"],
+                "llm_model": row["llm_model"],
+            }
+            if row["citations_json"]:
+                try:
+                    msg_data["citations"] = orjson.loads(row["citations_json"])
+                except (orjson.JSONDecodeError, Exception):
+                    pass
+            messages_list.append(msg_data)
+
+    messages_list.reverse()
+    return JSONResponse(content={
+        "conversation_info": conversation_info,
+        "messages": messages_list,
+        "has_more": has_more,
+    })
+
+
+@router.post("/api/conversations/{conversation_id}/messages")
+async def save_message(
+    request: Request,
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    text_compressed: Optional[UploadFile] = File(None),
+    text_plain: Optional[str] = Form(None),
+    file: List[Optional[UploadFile]] = File(None),
+    full_response: bool = Form(False),
+    is_whatsapp: bool = Form(False),
+    thinking_budget_tokens: Optional[int] = Form(None),
+    multi_ai_models: Optional[str] = Form(None),
+    pdf_page_start: Optional[int] = Form(None),
+    pdf_page_end: Optional[int] = Form(None),
+    pdf_retry_token: Optional[str] = Form(None),
+    attachment_refs: Optional[str] = Form(None),
+):
+    logger.info("enters in save_message (wrapper)")
+    if current_user is None:
+        return JSONResponse(content={"redirect": "/login"}, status_code=401)
+
+    user_api_keys = None
+    user_keys_header = request.headers.get("X-User-API-Keys")
+    if user_keys_header:
+        try:
+            user_api_keys = orjson.loads(base64.b64decode(user_keys_header))
+            logger.debug("User API keys received from header")
+        except Exception as exc:
+            logger.warning("Failed to parse user API keys from header: %s", exc)
+
+    if not user_api_keys and current_user:
+        try:
+            async with get_db_connection(readonly=True) as conn:
+                cursor = await conn.cursor()
+                await cursor.execute(
+                    "SELECT user_api_keys FROM USER_DETAILS WHERE user_id = ?",
+                    (current_user.id,),
+                )
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    keys_json = decrypt_api_key(result[0])
+                    if keys_json:
+                        user_api_keys = orjson.loads(keys_json)
+                        logger.debug("User API keys loaded from server storage")
+        except Exception as exc:
+            logger.warning("Failed to load user API keys from server: %s", exc)
+
+    api_key_mode = await get_user_api_key_mode(current_user.id)
+    if api_key_mode == API_KEY_MODE_OWN_ONLY and not user_api_keys:
+        return JSONResponse(
+            content={
+                "error": "api_keys_required",
+                "message": "Your account requires you to configure your own API keys to use AI services.",
+                "action": "configure_api_keys",
+                "redirect": "/profile/api-credentials",
+            },
+            status_code=403,
+        )
+
+    guard_response = await validate_message_request(
+        request=request,
+        current_user=current_user,
+        is_whatsapp=is_whatsapp,
+    )
+    if guard_response is not None:
+        return guard_response
+
+    try:
+        parsed_attachment_refs = parse_attachment_refs_value(attachment_refs)
+    except ValueError as exc:
+        return JSONResponse(content={"success": False, "message": str(exc)}, status_code=400)
+
+    if multi_ai_models:
+        async with get_db_connection(readonly=True) as conn_gs_check:
+            gs_row = await conn_gs_check.execute(
+                "SELECT COALESCE(ep.gransabio_enabled, 0) FROM CONVERSATIONS c "
+                "LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id "
+                "LEFT JOIN PROMPTS ep ON ep.id = COALESCE(c.role_id, ud.current_prompt_id) "
+                "WHERE c.id = ?",
+                (conversation_id,),
+            )
+            gs_result = await gs_row.fetchone()
+        if gs_result and bool(gs_result[0]):
+            return JSONResponse(
+                content={"success": False, "message": "This prompt uses GranSabio pipeline and cannot use Multi-AI comparison mode."},
+                status_code=400,
+            )
+
+        try:
+            parsed_model_ids = orjson.loads(multi_ai_models)
+            if not isinstance(parsed_model_ids, list) or len(parsed_model_ids) < 2 or len(parsed_model_ids) > 4:
+                return JSONResponse(content={"error": "Multi-AI requires 2-4 model IDs"}, status_code=400)
+            if not all(isinstance(mid, int) for mid in parsed_model_ids):
+                return JSONResponse(content={"error": "Invalid model IDs"}, status_code=400)
+
+            is_whatsapp_conv = bool(is_whatsapp)
+            if not is_whatsapp_conv:
+                try:
+                    is_whatsapp_conv = await is_whatsapp_conversation(conversation_id)
+                except Exception as exc:
+                    logger.warning("[save_message] Could not verify WhatsApp status for conversation %s: %s", conversation_id, exc)
+                    return JSONResponse(content={"error": "Could not verify conversation channel"}, status_code=503)
+            if is_whatsapp_conv:
+                return JSONResponse(content={"error": "Multi-AI is not available via WhatsApp"}, status_code=400)
+
+            if file and any(f for f in file if f and f.filename):
+                return JSONResponse(content={"error": "File attachments are not supported in Multi-AI mode"}, status_code=400)
+            if parsed_attachment_refs:
+                return JSONResponse(content={"error": "File attachments are not supported in Multi-AI mode"}, status_code=400)
+
+            max_decompressed_size = 10 * 1024 * 1024
+            max_compressed_size = 1 * 1024 * 1024
+            if text_compressed:
+                compressed_bytes = await text_compressed.read()
+                if len(compressed_bytes) > max_compressed_size:
+                    return JSONResponse(content={"error": "Compressed message too large"}, status_code=400)
+                decompressor = zlib.decompressobj()
+                decompressed = decompressor.decompress(compressed_bytes, max_length=max_decompressed_size)
+                if decompressor.unconsumed_tail:
+                    return JSONResponse(content={"error": "Decompressed message exceeds size limit"}, status_code=400)
+                multi_user_message = decompressed.decode("utf-8")
+            elif text_plain:
+                multi_user_message = text_plain
+            else:
+                return JSONResponse(content={"error": "No message provided"}, status_code=400)
+
+            return StreamingResponse(
+                process_multi_ai_message(
+                    request=request,
+                    conversation_id=conversation_id,
+                    current_user=current_user,
+                    user_message=multi_user_message,
+                    model_ids=parsed_model_ids,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    user_api_keys=user_api_keys,
+                ),
+                media_type="text/event-stream",
+            )
+        except orjson.JSONDecodeError:
+            return JSONResponse(content={"error": "Invalid multi_ai_models format"}, status_code=400)
+
+    async with get_db_connection(readonly=True) as conn:
+        lock_cursor = await conn.execute(
+            "SELECT locked FROM CONVERSATIONS WHERE id = ? AND user_id = ?",
+            (conversation_id, current_user.id),
+        )
+        lock_row = await lock_cursor.fetchone()
+        if not lock_row or lock_row[0]:
+            return JSONResponse(content={"success": False, "message": "Conversation is locked."}, status_code=403)
+
+    files = None
+    if file:
+        valid_files = [f for f in file if f]
+        if valid_files and not current_user.can_send_files:
+            return JSONResponse(
+                content={"success": False, "message": "File uploads are not enabled for your account"},
+                status_code=403,
+            )
+
+        max_files_per_message = 16
+        if len(valid_files) > max_files_per_message or len(valid_files) + len(parsed_attachment_refs) > max_files_per_message:
+            return JSONResponse(
+                content={"success": False, "message": f"Maximum {max_files_per_message} files per message."},
+                status_code=400,
+            )
+
+        files = []
+        for uploaded_file in valid_files:
+            if uploaded_file.content_type == "application/pdf":
+                max_bytes = MAX_PDF_SIZE_MB * 1024 * 1024
+            elif is_text_file(uploaded_file.content_type, uploaded_file.filename):
+                max_bytes = MAX_TEXT_FILE_SIZE_MB * 1024 * 1024
+            elif uploaded_file.content_type and uploaded_file.content_type.startswith("image/"):
+                max_bytes = MAX_RAW_UPLOAD_SIZE_MB * 1024 * 1024
+            else:
+                max_bytes = MAX_TEXT_FILE_SIZE_MB * 1024 * 1024
+
+            data = await uploaded_file.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                return JSONResponse(
+                    content={"success": False, "message": f"File '{uploaded_file.filename}' exceeds the {max_bytes // (1024 * 1024)}MB size limit"},
+                    status_code=400,
+                )
+            files.append({
+                "data": data,
+                "content_type": (uploaded_file.content_type or "").lower(),
+                "filename": uploaded_file.filename,
+            })
+
+    text_compressed_bytes = None
+    if text_compressed:
+        text_compressed_bytes = await text_compressed.read()
+
+    return await process_save_message(
+        request=request,
+        conversation_id=conversation_id,
+        current_user=current_user,
+        text_compressed=text_compressed_bytes,
+        text_plain=text_plain,
+        files=files,
+        full_response=full_response,
+        is_whatsapp=is_whatsapp,
+        thinking_budget_tokens=thinking_budget_tokens,
+        user_api_keys=user_api_keys,
+        prevalidated=True,
+        pdf_page_start=pdf_page_start,
+        pdf_page_end=pdf_page_end,
+        pdf_retry_token=pdf_retry_token,
+        attachment_refs=parsed_attachment_refs,
+    )
