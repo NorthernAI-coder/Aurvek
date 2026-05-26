@@ -216,6 +216,17 @@ async def handle_login_request(
 
         user_result = await get_user_by_username(username)
 
+        if user_result and not user_result.is_enabled:
+            record_failure(request, "login", username)
+            await asyncio.sleep(2)
+            return templates.TemplateResponse(
+                "login.html",
+                {
+                    **template_context,
+                    "error": "This account has been disabled. Contact support for assistance.",
+                },
+            )
+
         if user_result and user_result.password and user_result.can_use_password():
             if verify_password(user_result.password, password):
                 user_info = await create_user_info(user_result, False)

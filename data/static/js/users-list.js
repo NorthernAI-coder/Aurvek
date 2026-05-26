@@ -11,6 +11,7 @@ const UsersListState = {
     filters: {
         search: '',
         status: '',
+        account: '',
         prompt: '',
         llm: '',
         balance: '',
@@ -46,6 +47,8 @@ function initializeUsersData() {
             username: row.dataset.username,
             magicLink: row.dataset.magicLink || '',
             role: row.dataset.role || '',
+            enabled: row.dataset.enabled === 'true',
+            account: row.dataset.account || (row.dataset.enabled === 'true' ? 'enabled' : 'disabled'),
             phone: row.dataset.phone || '',
             status: row.dataset.status,
             prompt: row.dataset.prompt,
@@ -90,6 +93,7 @@ function setupEventListeners() {
     // Filter inputs
     const searchInput = document.getElementById('filterSearch');
     const statusSelect = document.getElementById('filterStatus');
+    const accountSelect = document.getElementById('filterAccount');
     const promptSelect = document.getElementById('filterPrompt');
     const llmSelect = document.getElementById('filterLLM');
     const balanceSelect = document.getElementById('filterBalance');
@@ -97,6 +101,7 @@ function setupEventListeners() {
 
     if (searchInput) searchInput.addEventListener('input', debounce(onFilterChange, 200));
     if (statusSelect) statusSelect.addEventListener('change', onFilterChange);
+    if (accountSelect) accountSelect.addEventListener('change', onFilterChange);
     if (promptSelect) promptSelect.addEventListener('change', onFilterChange);
     if (llmSelect) llmSelect.addEventListener('change', onFilterChange);
     if (balanceSelect) balanceSelect.addEventListener('change', onFilterChange);
@@ -155,6 +160,7 @@ function setupEventListeners() {
 function onFilterChange() {
     UsersListState.filters.search = (document.getElementById('filterSearch')?.value || '').toLowerCase();
     UsersListState.filters.status = document.getElementById('filterStatus')?.value || '';
+    UsersListState.filters.account = document.getElementById('filterAccount')?.value || '';
     UsersListState.filters.prompt = document.getElementById('filterPrompt')?.value || '';
     UsersListState.filters.llm = document.getElementById('filterLLM')?.value || '';
     UsersListState.filters.balance = document.getElementById('filterBalance')?.value || '';
@@ -207,6 +213,9 @@ function applyFiltersAndSort() {
 
         // Status filter
         if (filters.status && user.status !== filters.status) return false;
+
+        // Account enabled/disabled filter
+        if (filters.account && user.account !== filters.account) return false;
 
         // Prompt filter
         if (filters.prompt && user.prompt !== filters.prompt) return false;
@@ -278,6 +287,7 @@ function updateStats(filteredCount) {
     const expired = UsersListState.users.filter(u => u.status === 'expired').length;
     const password = UsersListState.users.filter(u => u.status === 'password').length;
     const noLink = UsersListState.users.filter(u => u.status === 'no_link').length;
+    const disabled = UsersListState.users.filter(u => !u.enabled).length;
 
     document.getElementById('statTotal').textContent = total;
     document.getElementById('statActive').textContent = active;
@@ -287,6 +297,8 @@ function updateStats(filteredCount) {
     if (statPassword) statPassword.textContent = password;
     const statNoLink = document.getElementById('statNoLink');
     if (statNoLink) statNoLink.textContent = noLink;
+    const statDisabled = document.getElementById('statDisabled');
+    if (statDisabled) statDisabled.textContent = disabled;
 
     const filteredStat = document.getElementById('statFiltered');
     const filteredContainer = document.getElementById('statFilteredContainer');
@@ -322,9 +334,16 @@ function updateSelectedCount() {
     const checkedCount = document.querySelectorAll('.user-checkbox:checked').length;
     const countSpan = document.getElementById('selectedCount');
     const deleteBtn = document.getElementById('deleteBtn');
+    const disableBtn = document.getElementById('disableBtn');
+    const enableBtn = document.getElementById('enableBtn');
 
     if (countSpan) countSpan.textContent = checkedCount;
+    document.querySelectorAll('.selected-count').forEach(span => {
+        span.textContent = checkedCount;
+    });
     if (deleteBtn) deleteBtn.disabled = checkedCount === 0;
+    if (disableBtn) disableBtn.disabled = checkedCount === 0;
+    if (enableBtn) enableBtn.disabled = checkedCount === 0;
 
     updateSelectAllState();
 }
@@ -490,12 +509,147 @@ async function renewMagicLink(username) {
     }
 }
 
+function getUserStateByUsername(username) {
+    return UsersListState.users.find(user => user.username === username);
+}
+
+function renderAccountStatusHtml(isEnabled) {
+    return isEnabled
+        ? '<span class="status-active" title="Account enabled"><i class="fas fa-user-check"></i></span>'
+        : '<span class="status-disabled" title="Account disabled"><i class="fas fa-user-slash"></i></span>';
+}
+
+function updateActivationButton(button, isEnabled) {
+    if (!button) return;
+
+    button.dataset.enabled = isEnabled ? 'true' : 'false';
+    button.title = isEnabled ? 'Deactivate user' : 'Activate user';
+    button.classList.toggle('btn-outline-warning', isEnabled);
+    button.classList.toggle('btn-outline-success', !isEnabled);
+    button.innerHTML = isEnabled
+        ? '<i class="fas fa-user-slash"></i>'
+        : '<i class="fas fa-user-check"></i>';
+}
+
+function setActivationControlsDisabled(disabled) {
+    document.querySelectorAll('.activation-toggle').forEach(button => {
+        button.disabled = disabled;
+    });
+
+    const disableBtn = document.getElementById('disableBtn');
+    const enableBtn = document.getElementById('enableBtn');
+    if (disableBtn) disableBtn.disabled = disabled;
+    if (enableBtn) enableBtn.disabled = disabled;
+}
+
+function updateUserActivationInUI(username, isEnabled) {
+    const user = getUserStateByUsername(username);
+    const row = user?.element;
+    if (!row) return;
+
+    row.dataset.enabled = isEnabled ? 'true' : 'false';
+    row.dataset.account = isEnabled ? 'enabled' : 'disabled';
+    row.classList.toggle('user-disabled', !isEnabled);
+
+    const accountCell = row.querySelector('.account-cell');
+    if (accountCell) accountCell.innerHTML = renderAccountStatusHtml(isEnabled);
+
+    const activationButton = row.querySelector('.activation-toggle');
+    updateActivationButton(activationButton, isEnabled);
+
+    user.enabled = isEnabled;
+    user.account = isEnabled ? 'enabled' : 'disabled';
+}
+
+async function setUsersActivation(usernames, enabled) {
+    setActivationControlsDisabled(true);
+
+    const actionPast = enabled ? 'enabled' : 'disabled';
+    const errors = [];
+    let updatedCount = 0;
+
+    for (const username of usernames) {
+        try {
+            const response = await secureFetch('/admin/users/' + encodeURIComponent(username) + '/activation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled })
+            });
+            if (!response) {
+                setActivationControlsDisabled(false);
+                updateSelectedCount();
+                return;
+            }
+
+            const data = await response.json();
+            if (response.ok && data.success) {
+                updateUserActivationInUI(data.username || username, Boolean(data.is_enabled));
+                updatedCount++;
+            } else {
+                errors.push(`${username}: ${data.error || data.detail || 'Request failed'}`);
+            }
+        } catch (error) {
+            errors.push(`${username}: Unexpected error`);
+        }
+    }
+
+    setActivationControlsDisabled(false);
+    updateSelectedCount();
+    applyFiltersAndSort();
+
+    if (updatedCount > 0) {
+        NotificationModal.success('Users Updated', `${updatedCount} user(s) ${actionPast}.`);
+    }
+    if (errors.length > 0) {
+        NotificationModal.error('Activation Update Failed', errors.join('<br>'), { allowHtml: true });
+    }
+}
+
+function toggleUserActivation(button) {
+    const username = button?.dataset?.username;
+    if (!username) return;
+
+    const currentlyEnabled = button.dataset.enabled === 'true';
+    const enabled = !currentlyEnabled;
+    const action = enabled ? 'Enable' : 'Disable';
+    const message = enabled
+        ? `Enable ${escapeHtml(username)} and allow login again?`
+        : `Disable ${escapeHtml(username)}? Their chats and data will stay stored, but they will be signed out and blocked from login.`;
+
+    NotificationModal.confirm(
+        `${action} User`,
+        message,
+        () => setUsersActivation([username], enabled),
+        null,
+        { type: enabled ? 'success' : 'warning', confirmText: action }
+    );
+}
+
+function setSelectedUsersActivation(enabled) {
+    const usernames = Array.from(document.querySelectorAll('.user-checkbox:checked')).map(cb => cb.value);
+    if (usernames.length === 0) return;
+
+    const action = enabled ? 'Enable' : 'Disable';
+    const message = enabled
+        ? `Enable ${usernames.length} selected user(s) and allow login again?`
+        : `Disable ${usernames.length} selected user(s)? Their chats and data will stay stored, but they will be signed out and blocked from login.`;
+
+    NotificationModal.confirm(
+        `${action} Users`,
+        message,
+        () => setUsersActivation(usernames, enabled),
+        null,
+        { type: enabled ? 'success' : 'warning', confirmText: action }
+    );
+}
+
 /**
  * Reset all filters
  */
 function resetFilters() {
     document.getElementById('filterSearch').value = '';
     document.getElementById('filterStatus').value = '';
+    document.getElementById('filterAccount').value = '';
     document.getElementById('filterPrompt').value = '';
     document.getElementById('filterLLM').value = '';
     document.getElementById('filterBalance').value = '';
@@ -504,6 +658,7 @@ function resetFilters() {
     UsersListState.filters = {
         search: '',
         status: '',
+        account: '',
         prompt: '',
         llm: '',
         balance: '',

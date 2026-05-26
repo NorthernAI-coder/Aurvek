@@ -94,7 +94,7 @@ from tools import dramatiq_tasks
 from database import get_db_connection, DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, is_lock_error
 from models import User, ConnectionManager
 from tasks import generate_pdf_task, generate_mp3_task
-from rediscfg import broker, redis_client, add_revoked_user, RedisManager, get_metrics, get_active_users_count
+from rediscfg import broker, redis_client, add_revoked_user, remove_revoked_user, RedisManager, get_metrics, get_active_users_count
 from save_images import save_image_locally, generate_img_token, resize_image, get_or_generate_img_token
 from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id
 from auth import get_current_user_from_websocket, get_user_id_from_conversation, get_user_by_token, create_user_info, create_login_response, generate_magic_link
@@ -4358,7 +4358,7 @@ async def edit_user_form(
                        ud.can_change_password, u.email, ud.api_key_mode, ud.user_api_keys,
                        ud.category_access, ud.billing_account_id, ud.billing_limit,
                        ud.billing_limit_action, ur.role_name, ud.billing_auto_refill_amount,
-                       ud.billing_max_limit, ud.authentication_mode, u.auth_provider
+                       ud.billing_max_limit, ud.authentication_mode, u.is_enabled, u.auth_provider
                 FROM USERS u
                 JOIN USER_DETAILS ud ON u.id = ud.user_id
                 JOIN USER_ROLES ur ON u.role_id = ur.id
@@ -4397,7 +4397,8 @@ async def edit_user_form(
                 'billing_auto_refill_amount': user_row[20] or 10.0,
                 'billing_max_limit': user_row[21],
                 'authentication_mode': user_row[22] or 'magic_link_only',
-                'auth_provider': user_row[23]
+                'is_enabled': bool(user_row[23]),
+                'auth_provider': user_row[24]
             }
         else:
             user_data = None
@@ -4688,6 +4689,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             SELECT
                 u.id,
                 u.username,
+                u.is_enabled,
                 ud.tokens_spent,
                 ud.total_cost,
                 m.token AS magic_link,
@@ -4713,13 +4715,14 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             LEFT JOIN PROMPTS p ON ud.current_prompt_id = p.id
             LEFT JOIN LLM ll ON ud.llm_id = ll.id
             JOIN USER_ROLES ur ON u.role_id = ur.id
-            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
+            GROUP BY u.id, u.username, u.is_enabled, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
             ''')
         else:
             await cursor.execute('''
             SELECT
                 u.id,
                 u.username,
+                u.is_enabled,
                 ud.tokens_spent,
                 ud.total_cost,
                 m.token AS magic_link,
@@ -4748,7 +4751,7 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
             JOIN USER_CREATOR_RELATIONSHIPS ucr ON u.id = ucr.user_id
             WHERE ucr.creator_id = ?
               AND ucr.relationship_type = 'assigned_by'
-            GROUP BY u.id, u.username, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
+            GROUP BY u.id, u.username, u.is_enabled, ud.tokens_spent, ud.total_cost, m.token, m.expires_at, p.name, ll.model, ur.role_name, u.auth_provider, ud.authentication_mode
             ''', (current_user.id,))
 
         url_path = 'login?token='
@@ -4757,41 +4760,43 @@ async def users_list(request: Request, current_user: User = Depends(get_current_
         for row in await cursor.fetchall():
             user_id = row[0]
             username = row[1]
-            tokens = row[2]
-            total_cost = row[3]
-            if row[4] and row[5]:
-                magic_link = f'{base_url}/{url_path}{row[4]}'
+            is_enabled = bool(row[2])
+            tokens = row[3]
+            total_cost = row[4]
+            if row[5] and row[6]:
+                magic_link = f'{base_url}/{url_path}{row[5]}'
                 try:
-                    expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S.%f')
+                    expires_at = datetime.strptime(row[6], '%Y-%m-%d %H:%M:%S.%f')
                 except ValueError:
-                    expires_at = datetime.strptime(row[5], '%Y-%m-%d %H:%M:%S')
+                    expires_at = datetime.strptime(row[6], '%Y-%m-%d %H:%M:%S')
                 is_expired = 'Expired' if expires_at < datetime.now() else 'Active'
             else:
                 magic_link = None
                 expires_at = None
-                auth_mode = row[13]
+                auth_mode = row[14]
                 is_expired = 'N/A' if auth_mode == 'password_only' else 'No Link'
-            conversation_count = row[6]
-            balance = row[9]
-            phone = row[10]
-            role_name = row[11]
-            auth_provider = row[12]
+            conversation_count = row[7]
+            balance = row[10]
+            phone = row[11]
+            role_name = row[12]
+            auth_provider = row[13]
             users.append({
                 'user_id': user_id,
                 'username': username,
+                'is_enabled': is_enabled,
                 'tokens': tokens,
                 'total_cost': total_cost,
                 'magic_link': magic_link,
                 'is_expired': is_expired,
                 'expires_at': expires_at,
                 'conversation_count': conversation_count,
-                'prompt_name': row[7],
-                'llm_model': row[8],
+                'prompt_name': row[8],
+                'llm_model': row[9],
                 'balance': balance,
                 'phone': phone,
                 'role': role_name,
                 'auth_provider': auth_provider,
-                'authentication_mode': row[13] or 'magic_link_only',
+                'authentication_mode': row[14] or 'magic_link_only',
                 "is_admin": await current_user.is_admin
             })
         await conn.close()
@@ -4824,10 +4829,12 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
 
-        await cursor.execute("SELECT id FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
+        await cursor.execute("SELECT id, is_enabled FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
         user = await cursor.fetchone()
         if user:
             user_id = user[0]
+            if not bool(user[1]):
+                return JSONResponse(content={"error": "This user is disabled. Activate the account before renewing the token."}, status_code=400)
 
             if not await current_user.is_admin:
                 ucr_check = await cursor.execute(
@@ -4870,6 +4877,92 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
             return JSONResponse(content={"magic_link": full_magic_link, "expires_at": new_expires_at.isoformat()}, status_code=200)
         else:
             return JSONResponse(content={"error": "No user found with that username."}, status_code=404)
+
+@app.post("/admin/users/{username}/activation")
+async def set_user_activation(request: Request, username: str, current_user: User = Depends(get_current_user)):
+    if current_user is None or not await current_user.is_admin:
+        return JSONResponse(content={"error": "Admin access required."}, status_code=403)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    enabled_raw = payload.get("enabled")
+    if isinstance(enabled_raw, bool):
+        enabled = enabled_raw
+    elif isinstance(enabled_raw, str) and enabled_raw.lower() in {"true", "false", "1", "0"}:
+        enabled = enabled_raw.lower() in {"true", "1"}
+    else:
+        return JSONResponse(content={"error": "Invalid enabled value."}, status_code=400)
+
+    username_ci = username.strip().lower()
+    if not username_ci:
+        return JSONResponse(content={"error": "Username is required."}, status_code=400)
+
+    async with get_db_connection() as conn:
+        cursor = await conn.cursor()
+        await cursor.execute(
+            """
+            SELECT u.id, u.username, u.role_id, u.is_enabled, ur.role_name
+            FROM USERS u
+            JOIN USER_ROLES ur ON u.role_id = ur.id
+            WHERE LOWER(u.username) = ?
+            """,
+            (username_ci,),
+        )
+        target = await cursor.fetchone()
+        if not target:
+            return JSONResponse(content={"error": "User not found."}, status_code=404)
+
+        target_user_id = target[0]
+        target_username = target[1]
+        current_enabled = bool(target[3])
+        target_role_name = (target[4] or "").lower()
+
+        if target_user_id == current_user.id and not enabled:
+            return JSONResponse(content={"error": "You cannot deactivate your own account."}, status_code=400)
+
+        if target_role_name == "admin" and target_user_id != current_user.id:
+            forwarded = request.headers.get("X-Forwarded-For")
+            request_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else None)
+            if not await is_elevated(current_user.id, request_ip=request_ip):
+                return JSONResponse(
+                    content={"error": "Ultra Admin+ elevation required to change another admin's activation status."},
+                    status_code=403,
+                )
+
+        if current_enabled != enabled:
+            await cursor.execute(
+                "UPDATE USERS SET is_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, target_user_id),
+            )
+            await conn.commit()
+
+        if enabled:
+            await remove_revoked_user(target_user_id)
+            action_type = "admin_activated_user"
+            message = f"User {target_username} activated."
+        else:
+            await add_revoked_user(target_user_id)
+            action_type = "admin_deactivated_user"
+            message = f"User {target_username} deactivated."
+
+    await log_admin_action(
+        admin_id=current_user.id,
+        action_type=action_type,
+        request=request,
+        target_user_id=target_user_id,
+        details=f"User '{target_username}' activation set to {enabled} by '{current_user.username}'"
+    )
+
+    return JSONResponse(content={
+        "success": True,
+        "message": message,
+        "username": target_username,
+        "user_id": target_user_id,
+        "is_enabled": enabled,
+    })
 
 
 def _get_rate_limit_reset_warning() -> Optional[str]:

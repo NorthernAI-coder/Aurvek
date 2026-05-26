@@ -56,6 +56,12 @@
         <div class="user-badge">
             <i class="fas fa-user-circle fa-lg"></i>
             <span>Editing: <strong>{{ user_data.username }}</strong></span>
+            {% if is_admin %}
+            <span class="badge {% if user_data.is_enabled %}bg-success{% else %}bg-secondary{% endif %}">
+                <i class="fas {% if user_data.is_enabled %}fa-user-check{% else %}fa-user-slash{% endif %} me-1"></i>
+                {% if user_data.is_enabled %}Enabled{% else %}Disabled{% endif %}
+            </span>
+            {% endif %}
         </div>
 
         <form id="editUserForm" action="/edit-user" method="post" data-form-guard>

@@ -89,6 +89,9 @@
     <span class="stat-badge stat-password">
         <i class="fas fa-key"></i> <strong id="statPassword">{{ users|selectattr('is_expired', 'eq', 'N/A')|list|length }}</strong> Password
     </span>
+    <span class="stat-badge stat-disabled">
+        <i class="fas fa-user-slash"></i> <strong id="statDisabled">{{ users|selectattr('is_enabled', 'eq', false)|list|length }}</strong> Disabled
+    </span>
     <span class="stat-badge">
         <i class="fas fa-unlink"></i> <strong id="statNoLink">{{ users|selectattr('is_expired', 'eq', 'No Link')|list|length }}</strong> No Link
     </span>
@@ -118,6 +121,14 @@
                 <option value="expired">Expired</option>
                 <option value="password">Password Only</option>
                 <option value="no_link">No Link</option>
+            </select>
+        </div>
+        <div class="flex-column">
+            <label class="form-label">Account</label>
+            <select class="form-select" id="filterAccount">
+                <option value="">All Accounts</option>
+                <option value="enabled">Enabled</option>
+                <option value="disabled">Disabled</option>
             </select>
         </div>
         <div class="flex-column">
@@ -182,6 +193,14 @@
                 <button type="submit" class="btn btn-outline-danger" id="deleteBtn" disabled>
                     <i class="fas fa-trash me-1"></i> Delete (<span id="selectedCount">0</span>)
                 </button>
+                {% if is_admin %}
+                <button type="button" class="btn btn-outline-warning" id="disableBtn" disabled onclick="setSelectedUsersActivation(false)">
+                    <i class="fas fa-user-slash me-1"></i> Disable (<span class="selected-count">0</span>)
+                </button>
+                <button type="button" class="btn btn-outline-success" id="enableBtn" disabled onclick="setSelectedUsersActivation(true)">
+                    <i class="fas fa-user-check me-1"></i> Enable (<span class="selected-count">0</span>)
+                </button>
+                {% endif %}
             </div>
         </div>
 
@@ -193,6 +212,7 @@
                         <th class="th-checkbox"></th>
                         <th data-sort="username" class="sortable sort-asc">User</th>
                         <th data-sort="role" class="sortable">Role</th>
+                        <th data-sort="account" class="sortable">Account</th>
                         <th data-sort="phone" class="sortable">Phone</th>
                         <th data-sort="status" class="sortable">Auth</th>
                         <th data-sort="prompt" class="sortable">Prompt</th>
@@ -201,13 +221,16 @@
                         <th data-sort="cost" class="sortable">Cost</th>
                         <th data-sort="balance" class="sortable">Balance</th>
                         <th data-sort="chats" class="sortable"><i class="fas fa-comments" title="Chats"></i></th>
-                        <th class="th-actions">Edit</th>
+                        <th class="th-actions">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="usersTableBody">
                     {% for user in users %}
-                    <tr data-username="{{ user.username }}"
+                    <tr class="{% if not user.is_enabled %}user-disabled{% endif %}"
+                        data-username="{{ user.username }}"
                         data-role="{{ user.role }}"
+                        data-enabled="{{ 'true' if user.is_enabled else 'false' }}"
+                        data-account="{{ 'enabled' if user.is_enabled else 'disabled' }}"
                         data-phone="{{ user.phone or '' }}"
                         data-status="{{ 'expired' if user.is_expired == 'Expired' else ('password' if user.is_expired == 'N/A' else ('no_link' if user.is_expired == 'No Link' else 'active')) }}"
                         data-prompt="{{ user.prompt_name }}"
@@ -237,6 +260,13 @@
                             <i class="fas fa-user text-muted"></i>
                             {% endif %}
                         </td>
+                        <td class="account-cell">
+                            {% if user.is_enabled %}
+                            <span class="status-active" title="Account enabled"><i class="fas fa-user-check"></i></span>
+                            {% else %}
+                            <span class="status-disabled" title="Account disabled"><i class="fas fa-user-slash"></i></span>
+                            {% endif %}
+                        </td>
                         <td class="phone-cell">
                             {% if user.phone %}
                             <span class="phone-icon" data-phone="{{ user.phone }}" title="Click to copy" onclick="copyPhone(this)">
@@ -264,6 +294,16 @@
                         <td>${{ "%.2f"|format(user.balance|float) }}</td>
                         <td>{{ user.conversation_count }}</td>
                         <td class="actions-cell">
+                            {% if is_admin %}
+                            <button type="button"
+                                    class="btn btn-sm {% if user.is_enabled %}btn-outline-warning{% else %}btn-outline-success{% endif %} activation-toggle"
+                                    data-username="{{ user.username }}"
+                                    data-enabled="{{ 'true' if user.is_enabled else 'false' }}"
+                                    onclick="toggleUserActivation(this)"
+                                    title="{% if user.is_enabled %}Deactivate user{% else %}Activate user{% endif %}">
+                                <i class="fas {% if user.is_enabled %}fa-user-slash{% else %}fa-user-check{% endif %}"></i>
+                            </button>
+                            {% endif %}
                             <a href="/edit-user/{{ user.username }}" class="btn btn-sm btn-outline-primary" title="Edit user">
                                 <i class="fas fa-edit"></i>
                             </a>

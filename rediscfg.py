@@ -6,6 +6,7 @@
 import os
 import dramatiq
 from datetime import timedelta
+from typing import Optional
 from redis import asyncio as aioredis
 from dramatiq.brokers.redis import RedisBroker
 from log_config import logger
@@ -94,13 +95,24 @@ redis_manager = RedisManager.get_instance()
 redis_client = redis_manager.get_async_client()
 broker = redis_manager.get_broker()
 
-async def add_revoked_user(user_id: int):
+async def add_revoked_user(user_id: int, ttl: Optional[timedelta] = timedelta(hours=4)):
     try:
-        # Add the user ID to Redis with a 4 hour expiration time
-        await redis_client.setex(f"revoked_user:{user_id}", timedelta(hours=4), 1)
+        key = f"revoked_user:{user_id}"
+        if ttl is None:
+            await redis_client.set(key, 1)
+        else:
+            await redis_client.setex(key, ttl, 1)
         return True
     except Exception as e:
         logger.error(f"Error adding revoked user to Redis: {e}")
+        return False
+
+async def remove_revoked_user(user_id: int):
+    try:
+        await redis_client.delete(f"revoked_user:{user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error removing revoked user from Redis: {e}")
         return False
 
 async def is_user_revoked(user_id: int) -> bool:
@@ -283,4 +295,4 @@ async def close_redis_connection():
     await RedisManager.close()
 
 # Export broker and Redis client for use in other files
-__all__ = ['broker', 'redis_client', 'add_revoked_user', 'is_user_revoked', 'close_redis_connection', 'RedisManager', 'check_rate_limit', 'get_rate_limit_status', 'increment_metric', 'get_metrics', 'increment_user_activity', 'get_active_users_count']
+__all__ = ['broker', 'redis_client', 'add_revoked_user', 'remove_revoked_user', 'is_user_revoked', 'close_redis_connection', 'RedisManager', 'check_rate_limit', 'get_rate_limit_status', 'increment_metric', 'get_metrics', 'increment_user_activity', 'get_active_users_count']

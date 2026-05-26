@@ -358,6 +358,22 @@
     font-weight: 500;
 }
 
+.status-disabled {
+    color: var(--text-muted, #6c757d);
+}
+
+.user-disabled {
+    opacity: 0.68;
+}
+
+.user-disabled .username-link {
+    text-decoration: line-through;
+}
+
+.actions-cell .btn + .btn {
+    margin-left: 0.25rem;
+}
+
 .status-public,
 .status-private {
     white-space: nowrap;

@@ -73,6 +73,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+async def is_user_enabled_in_db(user_id: int) -> bool:
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            async with conn.execute(
+                "SELECT is_enabled FROM USERS WHERE id = ?",
+                (user_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return bool(row and row["is_enabled"])
+    except Exception as e:
+        logger.error(f"Error checking enabled state for user {user_id}: {e}")
+        return False
+
 # Dependency to get the current user
 async def get_current_user(request: Request) -> Optional[User]:
     logger.info("enters get_current_user")
@@ -98,6 +111,10 @@ async def get_current_user(request: Request) -> Optional[User]:
         # Check if user is revoked
         if await is_user_revoked(user_info["id"]):
             logger.info("User revoked")
+            return None
+
+        if not await is_user_enabled_in_db(user_info["id"]):
+            logger.info("User disabled")
             return None
 
     except JWTError as e:
@@ -265,6 +282,10 @@ async def get_current_user_from_websocket(websocket: WebSocket) -> Optional[User
         # Check if user is revoked
         if await is_user_revoked(user_info["id"]):
             logger.info("WebSocket: User revoked")
+            return None
+
+        if not await is_user_enabled_in_db(user_info["id"]):
+            logger.info("WebSocket: User disabled")
             return None
 
     except JWTError as e:
