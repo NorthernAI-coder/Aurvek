@@ -1,0 +1,346 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}Mem0 Memory - AURVEK{% endblock %}
+{% block page_title %}Mem0 Memory{% endblock %}
+{% block page_subtitle %}
+<p class="page-subtitle">Configure the self-hosted Mem0 OSS memory provider</p>
+{% endblock %}
+
+{% block styles %}
+<style>
+    .field-note {
+        color: var(--text-muted);
+        font-size: 0.88rem;
+        line-height: 1.4;
+    }
+    .secret-field-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 0.5rem;
+    }
+    .memory-status {
+        display: none;
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-radius: 8px;
+        background: var(--bg-tertiary, #202225);
+        color: var(--text-secondary);
+    }
+    .memory-status.visible {
+        display: block;
+    }
+    .memory-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+    }
+    .memory-summary-item {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 12px;
+        background: var(--bg-tertiary, #202225);
+    }
+    .memory-summary-label {
+        color: var(--text-muted);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        font-weight: 800;
+    }
+    .memory-summary-value {
+        color: var(--text-primary);
+        margin-top: 6px;
+        font-weight: 700;
+        overflow-wrap: anywhere;
+    }
+</style>
+{% endblock %}
+
+{% block alerts %}
+<div id="alertContainer"></div>
+{% endblock %}
+
+{% block content %}
+<div class="section-container">
+    <div class="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-3">
+        <a href="/admin/memory" class="btn btn-outline-secondary">
+            <i class="fas fa-arrow-left me-1"></i> Back to Memory Provider
+        </a>
+    </div>
+    <div class="section-title">
+        <i class="fas fa-server"></i> Self-Hosted OSS Connection
+    </div>
+    <p class="field-note">
+        Configure only a local/private Mem0 OSS REST server. Hosted Mem0 Platform URLs are rejected.
+        Aurvek does not install or start Mem0; this URL must point to an already running REST server.
+    </p>
+
+    <div class="mb-3">
+        <label class="form-label" for="mem0BaseUrl">Local REST Base URL</label>
+        <input class="form-control" type="url" id="mem0BaseUrl"
+               value="{{ memory_config.mem0.base_url or 'http://127.0.0.1:8888' }}"
+               placeholder="http://127.0.0.1:8888">
+        <p class="field-note">Accepted hosts: localhost, host.docker.internal, or private IP addresses.</p>
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label" for="mem0PlatformId">Deployment Namespace</label>
+        <input class="form-control" type="text" id="mem0PlatformId"
+               value="{{ memory_config.mem0.platform_id or 'aurvek-local' }}"
+               maxlength="64" autocomplete="off">
+        <p class="field-note">Keep this unique per Aurvek install when multiple environments share one Mem0 server.</p>
+    </div>
+
+    <div class="row">
+        <div class="col-md-6 mb-3">
+            <label class="form-label" for="mem0Timeout">Timeout Seconds</label>
+            <input class="form-control" type="number" id="mem0Timeout" min="1" step="0.5"
+                   value="{{ memory_config.mem0.timeout_seconds or '30.0' }}">
+        </div>
+        <div class="col-md-6 mb-3">
+            <label class="form-label" for="mem0TopK">Retrieval Limit</label>
+            <input class="form-control" type="number" id="mem0TopK" min="1" max="50" step="1"
+                   value="{{ memory_config.mem0.top_k or '8' }}">
+        </div>
+    </div>
+
+    <div class="mb-3">
+        <div class="secret-field-header">
+            <label class="form-label" for="mem0ApiKey">Self-Hosted API Key</label>
+            <button type="button" class="btn btn-outline-danger btn-sm" id="clearMem0ApiKeyBtn" onclick="toggleClearMem0Key()">
+                <i class="fas fa-eraser me-1"></i> Clear saved key
+            </button>
+        </div>
+        <input class="form-control" type="password" id="mem0ApiKey" autocomplete="new-password"
+               placeholder="{% if memory_config.mem0.has_api_key %}Current key: {{ memory_config.mem0.api_key_masked }}{% else %}Optional if local auth is disabled{% endif %}">
+        <p class="field-note" id="mem0ApiKeyNote">Leave blank to keep the saved key.</p>
+    </div>
+
+    <div class="d-flex gap-2 flex-wrap">
+        <button type="button" class="btn btn-outline-secondary" id="testMem0Btn" onclick="testMem0Connection()">
+            <i class="fas fa-satellite-dish me-1"></i> Test Mem0
+        </button>
+        <button type="button" class="btn btn-primary" id="saveMem0Btn" onclick="saveMem0Config()">
+            <i class="fas fa-save me-1"></i> Save Mem0
+        </button>
+        <button type="button" class="btn btn-outline-warning" id="restoreMem0Btn" onclick="restoreMem0Defaults()">
+            <i class="fas fa-rotate-left me-1"></i> Restore Defaults
+        </button>
+        <button type="button" class="btn btn-warning" id="syncMem0Btn" onclick="startMem0Sync()">
+            <i class="fas fa-database me-1"></i> Sync Pending To Mem0
+        </button>
+    </div>
+    <div class="memory-status" id="mem0Status"></div>
+</div>
+
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-chart-bar"></i> Sync Status
+    </div>
+    <div class="memory-summary-grid">
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Linked</div>
+            <div class="memory-summary-value" id="mem0Linked">-</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Pending</div>
+            <div class="memory-summary-value" id="mem0Pending">-</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Last Run</div>
+            <div class="memory-summary-value" id="mem0LastRun">-</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Status</div>
+            <div class="memory-summary-value" id="mem0RunStatus">-</div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var mem0Secret = {
+        clear: false,
+        hasKey: {{ 'true' if memory_config.mem0.has_api_key else 'false' }},
+        masked: {{ (memory_config.mem0.api_key_masked or '')|tojson }}
+    };
+
+    function mem0Payload() {
+        return {
+            base_url: document.getElementById('mem0BaseUrl').value.trim(),
+            platform_id: document.getElementById('mem0PlatformId').value.trim(),
+            timeout_seconds: document.getElementById('mem0Timeout').value.trim(),
+            top_k: document.getElementById('mem0TopK').value.trim(),
+            api_key: document.getElementById('mem0ApiKey').value.trim(),
+            clear_api_key: mem0Secret.clear
+        };
+    }
+
+    function toggleClearMem0Key() {
+        if (!mem0Secret.hasKey) return;
+        mem0Secret.clear = !mem0Secret.clear;
+        document.getElementById('mem0ApiKey').value = '';
+        updateMem0SecretUi();
+    }
+
+    function updateMem0SecretUi() {
+        var note = document.getElementById('mem0ApiKeyNote');
+        var input = document.getElementById('mem0ApiKey');
+        var button = document.getElementById('clearMem0ApiKeyBtn');
+        if (mem0Secret.clear) {
+            input.placeholder = 'Will be cleared on save';
+            note.textContent = 'This saved key will be cleared when you save.';
+            button.innerHTML = '<i class="fas fa-undo me-1"></i> Undo clear';
+            return;
+        }
+        button.disabled = !mem0Secret.hasKey;
+        button.innerHTML = '<i class="fas fa-eraser me-1"></i> Clear saved key';
+        input.placeholder = mem0Secret.hasKey
+            ? 'Current key: ' + (mem0Secret.masked || '****')
+            : 'Optional if local auth is disabled';
+        note.textContent = mem0Secret.hasKey
+            ? 'Leave blank to keep the saved key.'
+            : 'No saved key. Enter the API key configured on your local Mem0 OSS server.';
+    }
+
+    async function readJsonResponse(response) {
+        var text = await response.text();
+        if (!text) return {};
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            throw new Error('Server returned a non-JSON response (' + response.status + ').');
+        }
+    }
+
+    async function saveMem0Config() {
+        try {
+            var response = await fetch('/admin/memory/mem0', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(mem0Payload())
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Save failed');
+            applyMem0Config(data.config.mem0);
+            showAlert('success', data.message || 'Mem0 configuration saved.');
+        } catch (err) {
+            showAlert('danger', 'Failed to save Mem0: ' + err.message);
+        }
+    }
+
+    async function restoreMem0Defaults() {
+        if (!confirm('Restore Mem0 settings to environment/default values?')) return;
+        try {
+            var response = await fetch('/admin/memory/mem0/defaults', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: '{}'
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Restore failed');
+            applyMem0Config(data.config.mem0);
+            showAlert('success', data.message || 'Mem0 defaults restored.');
+        } catch (err) {
+            showAlert('danger', 'Failed to restore Mem0 defaults: ' + err.message);
+        }
+    }
+
+    async function testMem0Connection() {
+        try {
+            setMem0Status('Testing Mem0 connection...', true);
+            var response = await fetch('/admin/memory/mem0/test-connection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(mem0Payload())
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Connection failed');
+            setMem0Status(data.message || 'Mem0 connection verified.', true);
+        } catch (err) {
+            setMem0Status(err.message, false);
+        }
+    }
+
+    async function loadMem0SyncStatus() {
+        try {
+            var response = await fetch('/admin/memory/mem0/sync-status');
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Could not load sync status');
+            var status = data.status || {};
+            var latest = status.latest_run || {};
+            document.getElementById('mem0Linked').textContent = status.linked_messages ?? '-';
+            document.getElementById('mem0Pending').textContent = status.pending_messages ?? '-';
+            document.getElementById('mem0LastRun').textContent = latest.started_at || '-';
+            document.getElementById('mem0RunStatus').textContent = latest.status || '-';
+        } catch (err) {
+            document.getElementById('mem0RunStatus').textContent = err.message;
+        }
+    }
+
+    async function startMem0Sync() {
+        try {
+            var response = await fetch('/admin/memory/mem0/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ batch_size: 100 })
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Sync could not start');
+            showAlert('success', data.message || 'Mem0 sync started.');
+            await loadMem0SyncStatus();
+        } catch (err) {
+            showAlert('danger', 'Failed to start Mem0 sync: ' + err.message);
+        }
+    }
+
+    function applyMem0Config(config) {
+        document.getElementById('mem0BaseUrl').value = config.base_url || 'http://127.0.0.1:8888';
+        document.getElementById('mem0PlatformId').value = config.platform_id || 'aurvek-local';
+        document.getElementById('mem0Timeout').value = config.timeout_seconds || '30.0';
+        document.getElementById('mem0TopK').value = config.top_k || '8';
+        document.getElementById('mem0ApiKey').value = '';
+        mem0Secret = {
+            clear: false,
+            hasKey: Boolean(config.has_api_key),
+            masked: config.api_key_masked || ''
+        };
+        updateMem0SecretUi();
+    }
+
+    function setMem0Status(message, success) {
+        var box = document.getElementById('mem0Status');
+        box.textContent = message;
+        box.style.border = success ? '1px solid rgba(67,181,129,.35)' : '1px solid rgba(237,66,69,.35)';
+        box.classList.add('visible');
+    }
+
+    function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, function(ch) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+        });
+    }
+
+    function showAlert(type, message) {
+        var container = document.getElementById('alertContainer');
+        var cls = type === 'success' ? 'alert-success' : 'alert-danger';
+        container.innerHTML =
+            '<div class="alert ' + cls + ' alert-dismissible fade show" role="alert">' +
+            escapeHtml(message) +
+            '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>' +
+            '</div>';
+    }
+
+    document.getElementById('mem0ApiKey').addEventListener('input', function() {
+        if (this.value.trim()) {
+            mem0Secret.clear = false;
+            updateMem0SecretUi();
+        }
+    });
+    updateMem0SecretUi();
+    loadMem0SyncStatus();
+</script>
+{% endblock %}

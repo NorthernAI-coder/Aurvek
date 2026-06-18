@@ -480,7 +480,7 @@ def format_pdf_for_provider(machine: str, pdf_url_base: str, pdf_data_b64: str,
                 "file_data": f"data:application/pdf;base64,{pdf_data_b64}"
             }
         }
-    elif machine == "O1":
+    elif machine in ("O1", "MiniMax", "Kimi"):
         content_to_send = {
             "type": "text",
             "text": f"[Content of uploaded PDF: {filename} ({page_count} pages)]\n\n{extracted_text}"
@@ -557,7 +557,7 @@ async def hydrate_pdf_for_context(
                         "file_data": f"data:application/pdf;base64,{pdf_b64}"
                     }
                 }
-            elif machine == "O1":
+            elif machine in ("O1", "MiniMax", "Kimi"):
                 extracted_text = extract_pdf_text_local(pdf_data)
                 return {
                     "type": "text",
@@ -605,7 +605,7 @@ async def hydrate_pdf_for_context(
                 "file_data": f"data:application/pdf;base64,{pdf_b64}"
             }
         }
-    elif machine == "O1":
+    elif machine in ("O1", "MiniMax", "Kimi"):
         extracted_text = extract_pdf_text_local(pdf_data)
         return {
             "type": "text",

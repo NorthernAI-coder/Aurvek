@@ -54,6 +54,14 @@
     .source-badge {
         font-size: 0.75rem;
     }
+    .provider-MiniMax {
+        background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+        color: #fff;
+    }
+    .provider-Kimi {
+        background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+        color: #fff;
+    }
     .sync-spinner {
         display: none;
     }
@@ -488,6 +496,7 @@
             isSelected && !wasSelected ? 'pending' :
             !isSelected && wasSelected ? 'to-disable' : ''
         );
+        const providerClass = 'provider-' + String(model.provider_label || '').replace(/[^A-Za-z0-9_-]/g, '-');
         const disabledHint = model.remote_available ? '' : ' title="Remote model was not returned by the provider"';
         return `
             <tr class="model-row ${rowClass}" data-model-id="${escapeAttr(model.id)}">
@@ -497,7 +506,7 @@
                            ${isSelected ? 'checked' : ''}
                            onchange="toggleModel('${escapeJs(model.id)}')">
                 </td>
-                <td><span class="badge provider-badge provider-OpenRouter">${escapeHtml(model.provider_label)}</span></td>
+                <td><span class="badge provider-badge ${escapeAttr(providerClass)}">${escapeHtml(model.provider_label)}</span></td>
                 <td>
                     <strong>${escapeHtml(model.display_name)}</strong>
                     ${model.needs_review ? '<span class="badge bg-warning text-dark ms-1">Review</span>' : ''}

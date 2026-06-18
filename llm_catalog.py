@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 import aiosqlite
 
-from common import claude_key, gemini_key, openai_key, openrouter_key, xai_key
+from common import claude_key, gemini_key, minimax_key, moonshot_key, openai_key, openrouter_key, xai_key
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,8 @@ PROVIDER_KEY_BY_MACHINE = {
     "Gemini": "google",
     "xAI": "xai",
     "OpenRouter": "openrouter",
+    "MiniMax": "minimax",
+    "Kimi": "kimi",
     "GranSabio": "gransabio",
 }
 
@@ -29,15 +31,22 @@ MACHINE_BY_PROVIDER_KEY = {
     "google": "Gemini",
     "xai": "xAI",
     "openrouter": "OpenRouter",
+    "minimax": "MiniMax",
+    "kimi": "Kimi",
+    "moonshot": "Kimi",
     "ollama": "Ollama",
     "gransabio": "GranSabio",
     "manual": "Manual",
 }
 
-FULL_SYNC_PROVIDERS = {"openrouter", "xai", "google"}
+PROVIDER_KEY_ALIASES = {
+    "moonshot": "kimi",
+}
+
+FULL_SYNC_PROVIDERS = {"openrouter", "xai", "google", "minimax", "kimi"}
 DISCOVERY_ASSISTED_PROVIDERS = {"openai", "anthropic"}
 SYNC_PROVIDERS = FULL_SYNC_PROVIDERS | DISCOVERY_ASSISTED_PROVIDERS
-SYNC_PROVIDER_ORDER = ("openrouter", "openai", "anthropic", "google", "xai")
+SYNC_PROVIDER_ORDER = ("openrouter", "openai", "anthropic", "google", "xai", "minimax", "kimi")
 
 OPENROUTER_PROVIDER_PREFIX = {
     "openai": "openai",
@@ -68,6 +77,7 @@ def normalize_provider_key(machine_or_provider: str | None) -> str:
     if value in PROVIDER_KEY_BY_MACHINE:
         return PROVIDER_KEY_BY_MACHINE[value]
     lowered = value.lower()
+    lowered = PROVIDER_KEY_ALIASES.get(lowered, lowered)
     if lowered in MACHINE_BY_PROVIDER_KEY:
         return lowered
     return lowered or "manual"
@@ -329,6 +339,10 @@ async def fetch_remote_models(provider_key: str) -> list[dict[str, Any]]:
         return await _fetch_google_models()
     if provider == "xai":
         return await _fetch_xai_models()
+    if provider == "minimax":
+        return await _fetch_minimax_models()
+    if provider == "kimi":
+        return await _fetch_kimi_models()
     if provider == "openai":
         return await _fetch_openai_models()
     if provider == "anthropic":
@@ -545,6 +559,28 @@ async def _fetch_xai_models() -> list[dict[str, Any]]:
     return [_normalize_xai_model(item) for item in models]
 
 
+async def _fetch_minimax_models() -> list[dict[str, Any]]:
+    if not minimax_key:
+        raise LlmCatalogError("MiniMax API key not configured")
+    data = await _request_json(
+        "https://api.minimax.io/v1/models",
+        headers={"Authorization": f"Bearer {minimax_key}"},
+    )
+    models = data.get("data") or data.get("models") or []
+    return [_normalize_minimax_model(item) for item in models]
+
+
+async def _fetch_kimi_models() -> list[dict[str, Any]]:
+    if not moonshot_key:
+        raise LlmCatalogError("Kimi API key not configured")
+    data = await _request_json(
+        "https://api.moonshot.ai/v1/models",
+        headers={"Authorization": f"Bearer {moonshot_key}"},
+    )
+    models = data.get("data") or data.get("models") or []
+    return [_normalize_kimi_model(item) for item in models]
+
+
 async def _fetch_openai_models() -> list[dict[str, Any]]:
     if not openai_key:
         raise LlmCatalogError("OpenAI API key not configured")
@@ -664,6 +700,124 @@ def _normalize_xai_model(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pricing_cost_per_million(item: dict[str, Any], *names: str) -> float:
+    pricing = item.get("pricing") or {}
+    for name in names:
+        direct = _as_float(item.get(name))
+        if direct:
+            return direct
+    for name in names:
+        nested = pricing.get(name)
+        if nested is not None:
+            if name in {"prompt", "completion", "input", "output"}:
+                nested_price = _price_per_million(nested)
+            else:
+                nested_price = _as_float(nested)
+            if nested_price:
+                return nested_price
+    return 0.0
+
+
+def _normalize_minimax_model(item: dict[str, Any]) -> dict[str, Any]:
+    model_id = item.get("id") or item.get("model") or item.get("name") or ""
+    model_lower = model_id.lower()
+    is_m3 = "minimax-m3" in model_lower or model_lower == "m3"
+    context_window = _as_int(
+        item.get("context_window")
+        or item.get("context_length")
+        or item.get("max_context_tokens")
+        or item.get("input_tokens")
+    ) or (1_000_000 if is_m3 else None)
+    max_output = _as_int(
+        item.get("output_tokens")
+        or item.get("max_output_tokens")
+        or item.get("max_completion_tokens")
+    ) or (131_072 if is_m3 else None)
+    input_cost = _pricing_cost_per_million(item, "input_token_cost", "input_price", "prompt", "prompt_price")
+    output_cost = _pricing_cost_per_million(item, "output_token_cost", "output_price", "completion", "completion_price")
+    if is_m3 and not input_cost:
+        input_cost = 0.30
+    if is_m3 and not output_cost:
+        output_cost = 1.20
+    vision = bool(item.get("vision") or item.get("supports_vision") or is_m3)
+    return {
+        "provider_key": "minimax",
+        "machine": "MiniMax",
+        "provider_model_id": model_id,
+        "model": model_id,
+        "display_name": item.get("display_name") or item.get("displayName") or item.get("name") or model_id,
+        "description": item.get("description"),
+        "context_window_tokens": context_window,
+        "max_input_tokens": context_window,
+        "max_output_tokens": max_output,
+        "input_token_cost": input_cost,
+        "output_token_cost": output_cost,
+        "vision": vision,
+        "capabilities": build_capabilities(
+            vision,
+            {
+                "thinking": is_m3,
+                "reasoning_split": is_m3,
+                "metadata_source": "provider_api",
+            },
+        ),
+        "raw_metadata": item,
+        "metadata_source": "provider_api",
+        "sync_status": "synced" if context_window and max_output and input_cost and output_cost else "needs_review",
+    }
+
+
+def _normalize_kimi_model(item: dict[str, Any]) -> dict[str, Any]:
+    model_id = item.get("id") or item.get("model") or item.get("name") or ""
+    model_lower = model_id.lower().replace("_", "-")
+    is_k2 = model_lower.startswith("kimi-k2") or "kimi-k2" in model_lower
+    is_k27 = "kimi-k2.7" in model_lower or "kimi-k2-7" in model_lower
+    context_window = _as_int(
+        item.get("context_window")
+        or item.get("context_length")
+        or item.get("max_context_tokens")
+        or item.get("input_tokens")
+    ) or (256_000 if is_k2 else None)
+    max_output = _as_int(
+        item.get("output_tokens")
+        or item.get("max_output_tokens")
+        or item.get("max_completion_tokens")
+    ) or (32_768 if is_k2 else None)
+    input_cost = _pricing_cost_per_million(item, "input_token_cost", "input_price", "prompt", "prompt_price")
+    output_cost = _pricing_cost_per_million(item, "output_token_cost", "output_price", "completion", "completion_price")
+    if is_k27 and not input_cost:
+        input_cost = 0.95
+    if is_k27 and not output_cost:
+        output_cost = 4.00
+    vision = bool(item.get("vision") or item.get("supports_vision") or is_k27)
+    return {
+        "provider_key": "kimi",
+        "machine": "Kimi",
+        "provider_model_id": model_id,
+        "model": model_id,
+        "display_name": item.get("display_name") or item.get("displayName") or item.get("name") or model_id,
+        "description": item.get("description"),
+        "context_window_tokens": context_window,
+        "max_input_tokens": context_window,
+        "max_output_tokens": max_output,
+        "input_token_cost": input_cost,
+        "output_token_cost": output_cost,
+        "vision": vision,
+        "capabilities": build_capabilities(
+            vision,
+            {
+                "thinking": is_k2,
+                "preserve_thinking": is_k27,
+                "fixed_temperature": is_k2,
+                "metadata_source": "provider_api",
+            },
+        ),
+        "raw_metadata": item,
+        "metadata_source": "provider_api",
+        "sync_status": "synced" if context_window and max_output and input_cost and output_cost else "needs_review",
+    }
+
+
 def _normalize_anthropic_model(item: dict[str, Any]) -> dict[str, Any]:
     model_id = item.get("id") or item.get("model") or ""
     capabilities = item.get("capabilities") or {}
@@ -746,6 +900,10 @@ def _normalize_remote_model(provider: str, item: dict[str, Any]) -> dict[str, An
         return _normalize_google_model(item)
     if provider == "xai":
         return _normalize_xai_model(item)
+    if provider == "minimax":
+        return _normalize_minimax_model(item)
+    if provider == "kimi":
+        return _normalize_kimi_model(item)
     if provider in DISCOVERY_ASSISTED_PROVIDERS:
         return _normalize_discovery_model(provider, item)
     raise LlmCatalogError(f"Cannot normalize provider '{provider}'")

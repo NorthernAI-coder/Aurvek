@@ -35,8 +35,13 @@ from chat.services.file_inputs import (
 )
 
 
-ATTACHMENT_UPLOAD_CHUNK_SIZE_MB = max(1, int(os.getenv("ATTACHMENT_UPLOAD_CHUNK_SIZE_MB", "4")))
+ATTACHMENT_UPLOAD_CHUNK_SIZE_MB = max(1, int(os.getenv("ATTACHMENT_UPLOAD_CHUNK_SIZE_MB", "2")))
 ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES = ATTACHMENT_UPLOAD_CHUNK_SIZE_MB * 1024 * 1024
+ATTACHMENT_UPLOAD_LEGACY_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
+# Fixed (NOT env-overridable) chunk-size bounds; must stay in lockstep with the
+# frontend's UPLOAD_MIN_CHUNK / UPLOAD_MAX_CHUNK to avoid server/client desync.
+ATTACHMENT_UPLOAD_MIN_CHUNK_SIZE_BYTES = 256 * 1024
+ATTACHMENT_UPLOAD_MAX_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 ATTACHMENT_UPLOAD_MAX_CHUNKS = max(1, int(os.getenv("ATTACHMENT_UPLOAD_MAX_CHUNKS", "128")))
 ATTACHMENT_UPLOAD_TTL_SECONDS = max(60, int(os.getenv("ATTACHMENT_UPLOAD_TTL_SECONDS", str(2 * 60 * 60))))
 ATTACHMENT_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
@@ -45,6 +50,27 @@ ATTACHMENT_UPLOAD_CHUNK_ROOT = (
     _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW
     if _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW.is_absolute()
     else Path(__file__).resolve().parents[2] / _ATTACHMENT_UPLOAD_CHUNK_ROOT_RAW
+)
+
+
+def _assert_chunk_bounds_consistent(max_type_cap_bytes: int, min_chunk_bytes: int, max_chunks: int) -> None:
+    """Fail fast at import if the smallest allowed chunk size cannot cover the
+    largest allowed upload within ATTACHMENT_UPLOAD_MAX_CHUNKS. Integer ceil, no math import."""
+    needed = (max_type_cap_bytes + min_chunk_bytes - 1) // min_chunk_bytes
+    if needed > max_chunks:
+        raise RuntimeError(
+            "Attachment upload bounds are inconsistent: a "
+            f"{max_type_cap_bytes // (1024 * 1024)}MB upload at the minimum "
+            f"{min_chunk_bytes // 1024}KB chunk size needs {needed} chunks, "
+            f"exceeding ATTACHMENT_UPLOAD_MAX_CHUNKS={max_chunks}. "
+            "Raise ATTACHMENT_UPLOAD_MAX_CHUNKS or lower the per-type size caps."
+        )
+
+
+_assert_chunk_bounds_consistent(
+    max(MAX_PDF_SIZE_MB, MAX_RAW_UPLOAD_SIZE_MB, MAX_TEXT_FILE_SIZE_MB) * 1024 * 1024,
+    ATTACHMENT_UPLOAD_MIN_CHUNK_SIZE_BYTES,
+    ATTACHMENT_UPLOAD_MAX_CHUNKS,
 )
 
 
@@ -107,6 +133,7 @@ def validate_chunk_upload_metadata(
     filename: str,
     content_type: str,
     total_size: int,
+    chunk_size: int,
 ) -> tuple[str, int]:
     if not ATTACHMENT_UPLOAD_ID_RE.match(upload_id or ""):
         raise ValueError("Invalid upload id")
@@ -120,11 +147,13 @@ def validate_chunk_upload_metadata(
         raise ValueError("Chunk index exceeds chunk count")
     if total_size < 0:
         raise ValueError("Invalid file size")
+    if not (ATTACHMENT_UPLOAD_MIN_CHUNK_SIZE_BYTES <= chunk_size <= ATTACHMENT_UPLOAD_MAX_CHUNK_SIZE_BYTES):
+        raise ValueError("Invalid chunk size")
     normalized_type = normalize_upload_content_type(content_type, filename)
     max_bytes = max_upload_bytes_for_attachment(normalized_type, filename)
     if total_size > max_bytes:
         raise ValueError(f"File '{filename}' exceeds the {max_bytes // (1024 * 1024)}MB size limit")
-    expected_chunks = max(1, (total_size + ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES - 1) // ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES)
+    expected_chunks = max(1, (total_size + chunk_size - 1) // chunk_size)
     if total_chunks != expected_chunks:
         raise ValueError("Chunk metadata does not match file size")
     return normalized_type, max_bytes
@@ -178,7 +207,11 @@ async def ensure_attachment_upload_allowed(conversation_id: int, current_user: U
         try:
             cursor = await conn.execute(
                 """
-                SELECT c.locked, c.user_id, COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled
+                SELECT
+                    c.locked,
+                    c.user_id,
+                    COALESCE(ud.allow_file_upload, 0) AS allow_file_upload,
+                    COALESCE(ep.gransabio_enabled, 0) AS gransabio_enabled
                 FROM CONVERSATIONS c
                 LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
                 LEFT JOIN PROMPTS ep ON ep.id = COALESCE(c.role_id, ud.current_prompt_id)
@@ -187,15 +220,40 @@ async def ensure_attachment_upload_allowed(conversation_id: int, current_user: U
                 (conversation_id,),
             )
         except sqlite3.OperationalError:
-            cursor = await conn.execute(
-                "SELECT c.locked, c.user_id, 0 AS gransabio_enabled FROM CONVERSATIONS c WHERE c.id = ?",
-                (conversation_id,),
-            )
+            try:
+                cursor = await conn.execute(
+                    """
+                    SELECT
+                        c.locked,
+                        c.user_id,
+                        COALESCE(ud.allow_file_upload, 0) AS allow_file_upload,
+                        0 AS gransabio_enabled
+                    FROM CONVERSATIONS c
+                    LEFT JOIN USER_DETAILS ud ON ud.user_id = c.user_id
+                    WHERE c.id = ?
+                    """,
+                    (conversation_id,),
+                )
+            except sqlite3.OperationalError:
+                cursor = await conn.execute(
+                    """
+                    SELECT
+                        c.locked,
+                        c.user_id,
+                        1 AS allow_file_upload,
+                        0 AS gransabio_enabled
+                    FROM CONVERSATIONS c
+                    WHERE c.id = ?
+                    """,
+                    (conversation_id,),
+                )
         row = await cursor.fetchone()
     if not row or int(row["user_id"]) != int(current_user.id):
         return json_error("Conversation not found.", status_code=404)
     if row["locked"]:
         return json_error("Conversation is locked.", status_code=403)
+    if not bool(row["allow_file_upload"]):
+        return json_error("File uploads are not enabled for your account", status_code=403)
     if bool(row["gransabio_enabled"]):
         return json_error("File attachments are not supported with GranSabio mode. Send text only.", status_code=400)
     return None

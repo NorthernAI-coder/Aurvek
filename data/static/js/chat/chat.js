@@ -20,6 +20,8 @@ let currentThinkingBudget = 0;
 let isCurrentConversationLocked = false;
 let currentConversationIncognito = false;
 let userStopped = false;
+let currentProviderHealth = null;
+let currentMemoryHealth = null;
 
 // Auto-scroll state management
 let isUserScrolledUp = false;
@@ -40,6 +42,110 @@ function scrollToBottomIfNeeded() {
 let webSearchEnabled = true;   // User preference (default ON)
 let webSearchAllowed = true;   // Prompt allows web search
 let webSearchForced = false;   // Prompt forces web search always on
+
+function providerHealthShouldSurface(health) {
+    return !!(health && ['suspected', 'degraded', 'recovering'].includes(health.status));
+}
+
+function providerHealthFallbackMessage(health) {
+    if (!health) return '';
+    const providerName = health.provider_name || 'the selected AI provider';
+    if (health.source === 'official_status') {
+        return `${providerName} reports an API incident. This model may fail temporarily or respond more slowly.`;
+    }
+    return `We are detecting recent connection errors with ${providerName}. This model may fail temporarily or take longer than usual.`;
+}
+
+function setCurrentProviderHealth(health) {
+    currentProviderHealth = health || null;
+    renderProviderHealthBanner();
+}
+
+function renderProviderHealthBanner() {
+    const banner = document.getElementById('provider-health-banner');
+    const textEl = document.getElementById('provider-health-banner-text');
+    if (!banner || !textEl) return;
+
+    if (!providerHealthShouldSurface(currentProviderHealth)) {
+        banner.style.display = 'none';
+        textEl.textContent = '';
+        return;
+    }
+
+    textEl.textContent = currentProviderHealth.message || providerHealthFallbackMessage(currentProviderHealth);
+    banner.style.display = 'flex';
+}
+
+function escapeProviderHealthHtml(value) {
+    if (typeof escapeHtml === 'function') {
+        return escapeHtml(value);
+    }
+    return String(value || '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    }[char]));
+}
+
+function showProviderAwareError(title, message, source = null) {
+    const health = source?.provider_health || source || currentProviderHealth;
+    if (!providerHealthShouldSurface(health)) {
+        NotificationModal.error(title, String(message || ''));
+        return;
+    }
+
+    setCurrentProviderHealth(health);
+    const note = health.message || providerHealthFallbackMessage(health);
+    const html = `${escapeProviderHealthHtml(message || '')}<span class="provider-health-modal-note">${escapeProviderHealthHtml(note)}</span>`;
+    NotificationModal.error(title, html, { allowHtml: true });
+}
+
+function memoryHealthShouldSurface(health) {
+    if (!health || health.enabled === false) return false;
+    if (health.should_surface === false) return false;
+    return ['suspected', 'degraded', 'unavailable'].includes(health.status);
+}
+
+function memoryHealthFallbackMessage(health) {
+    if (!health) return '';
+    if (health.status === 'unavailable') {
+        return 'Memory is temporarily unavailable. Replies may not use saved long-term memory.';
+    }
+    return 'Memory is temporarily degraded. Replies may not use saved long-term memory.';
+}
+
+function setCurrentMemoryHealth(health) {
+    currentMemoryHealth = health || null;
+    renderMemoryHealthBanner();
+}
+
+function renderMemoryHealthBanner() {
+    const banner = document.getElementById('memory-health-banner');
+    const textEl = document.getElementById('memory-health-banner-text');
+    if (!banner || !textEl) return;
+
+    if (!memoryHealthShouldSurface(currentMemoryHealth)) {
+        banner.style.display = 'none';
+        textEl.textContent = '';
+        return;
+    }
+
+    textEl.textContent = currentMemoryHealth.message || memoryHealthFallbackMessage(currentMemoryHealth);
+    banner.style.display = 'flex';
+}
+
+async function refreshMemoryHealthBanner() {
+    try {
+        const response = await secureFetch('/api/user/memory-status', { method: 'GET' });
+        if (!response || !response.ok) return;
+        const data = await response.json();
+        setCurrentMemoryHealth(data.memory_health || data.health || null);
+    } catch (error) {
+        console.debug('Memory health check failed:', error);
+    }
+}
 
 // =============================================
 // API Key Mode Manager
@@ -1170,6 +1276,48 @@ function sendMessage(messageText, options = {}) {
     let uploadedAttachmentRefs = [];
     userStopped = false;
 
+    const chatPerfTraceEnabled = (() => {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            return localStorage.getItem('chatPerfTrace') === '1' || params.get('chatPerfTrace') === '1';
+        } catch (error) {
+            return false;
+        }
+    })();
+    const chatPerfTrace = chatPerfTraceEnabled ? {
+        traceId: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        startedAt: performance.now(),
+        marks: [],
+        firstStreamByteSeen: false,
+        firstContentSeen: false,
+        finished: false,
+    } : null;
+
+    function markChatPerf(name, details = {}) {
+        if (!chatPerfTrace) return;
+        const mark = {
+            name,
+            client_elapsed_ms: Math.round((performance.now() - chatPerfTrace.startedAt) * 10) / 10,
+            ...details,
+        };
+        chatPerfTrace.marks.push(mark);
+        console.debug('[chat-perf]', chatPerfTrace.traceId, mark);
+    }
+
+    function finishChatPerf(finalName = 'client_stream_done') {
+        if (!chatPerfTrace || chatPerfTrace.finished) return;
+        chatPerfTrace.finished = true;
+        markChatPerf(finalName);
+        console.table(chatPerfTrace.marks);
+    }
+
+    markChatPerf('client_send_start', {
+        conversation_id: sendConversationId,
+        message_chars: messageText_raw.length,
+        attachment_count: outgoingFiles ? outgoingFiles.length : 0,
+        multi_ai: isMultiAiRequest,
+    });
+
     function discardUploadedRefs() {
         if (uploadedAttachmentRefs.length === 0) return;
         if (typeof discardUploadedAttachmentRefs === 'function') {
@@ -1436,13 +1584,23 @@ function sendMessage(messageText, options = {}) {
         if (!options.filesOverride) {
             attachedFiles = [];
         }
+        markChatPerf('client_fetch_start');
+        const fetchHeaders = chatPerfTrace ? {
+            'X-Chat-Trace': '1',
+            'X-Chat-Trace-Id': chatPerfTrace.traceId,
+            'X-Chat-Client-Sent-At': String(Date.now()),
+        } : undefined;
         return secureFetch(`/api/conversations/${sendConversationId}/messages`, {
-        method: 'POST',
-        body: formData,
-        signal: signal,
+            method: 'POST',
+            body: formData,
+            signal: signal,
+            headers: fetchHeaders,
         });
     })
     .then(response => {
+        if (response) {
+            markChatPerf('client_headers_received', { status: response.status });
+        }
 
         const extractServerError = (resp) => {
             if (!resp) return Promise.resolve('Request failed');
@@ -1523,14 +1681,14 @@ function sendMessage(messageText, options = {}) {
                     discardUploadedRefs();
                     cleanupFailedStream(userMessageElement, botMessageElement, true);
                     const msg = body?.error || body?.message || body?.detail || `Request failed (${response.status})`;
-                    NotificationModal.error('Send failed', String(msg));
+                    showProviderAwareError('Send failed', String(msg), body);
                     return null;
                 })
                 .catch(() => {
                     discardUploadedRefs();
                     cleanupFailedStream(userMessageElement, botMessageElement, true);
                     return extractServerError(response).then((msg) => {
-                        NotificationModal.error('Send failed', String(msg));
+                        showProviderAwareError('Send failed', String(msg));
                         return null;
                     });
                 });
@@ -1539,7 +1697,7 @@ function sendMessage(messageText, options = {}) {
         if (!response.body) {
             discardUploadedRefs();
             cleanupFailedStream(userMessageElement, botMessageElement, true);
-            NotificationModal.error('Send failed', 'No response stream received from server.');
+            showProviderAwareError('Send failed', 'No response stream received from server.');
             return null;
         }
 
@@ -1746,6 +1904,8 @@ function sendMessage(messageText, options = {}) {
                     return abandonStreamRender();
                 }
 					if (done) {
+                        finishChatPerf();
+                        refreshMemoryHealthBanner();
 						if (userStopped && !streamContentReceived) {
 							if (botMessageElement?.parentNode) botMessageElement.remove();
 							toggleSendButton('Send');
@@ -1779,6 +1939,10 @@ function sendMessage(messageText, options = {}) {
 					}
 					return;
 				}
+                if (chatPerfTrace && !chatPerfTrace.firstStreamByteSeen) {
+                    chatPerfTrace.firstStreamByteSeen = true;
+                    markChatPerf('client_first_stream_byte', { bytes: value ? value.byteLength : 0 });
+                }
                 const lines = parseSseLines(value);
         
                 for (const line of lines) {
@@ -1786,6 +1950,8 @@ function sendMessage(messageText, options = {}) {
                         const data = line.slice(6).trim();
 						
 	                        if (data === '[DONE]') {
+                                finishChatPerf();
+                                refreshMemoryHealthBanner();
 	                            if (userStopped && !streamContentReceived) {
 	                                if (botMessageElement?.parentNode) botMessageElement.remove();
 	                                toggleSendButton('Send');
@@ -1818,6 +1984,23 @@ function sendMessage(messageText, options = {}) {
                         }
                         try {
                             const parsedData = JSON.parse(data);
+
+                            if (parsedData.type === 'perf_trace') {
+                                markChatPerf(`server:${parsedData.name}`, {
+                                    server_elapsed_ms: parsedData.elapsed_ms,
+                                    trace_id: parsedData.trace_id,
+                                    machine: parsedData.machine,
+                                    model: parsedData.model,
+                                    input_tokens: parsedData.input_tokens,
+                                    output_tokens: parsedData.output_tokens,
+                                    provider_tool_count: parsedData.provider_tool_count,
+                                });
+                                continue;
+                            }
+                            if (parsedData.type === 'memory_health') {
+                                setCurrentMemoryHealth(parsedData.memory_health || null);
+                                continue;
+                            }
 
                             // Handle actions from AI welfare system
                             if (parsedData.action === 'end_conversation') {
@@ -1892,6 +2075,9 @@ function sendMessage(messageText, options = {}) {
                             } else if (parsedData.multi_ai_done && multiAiCarousel?._multiAiApi) {
                                 multiAiCarousel._multiAiApi.markSlideDone(parsedData.llm_id);
 	                            } else if (parsedData.multi_ai_error && multiAiCarousel?._multiAiApi) {
+                                    if (parsedData.provider_health) {
+                                        setCurrentProviderHealth(parsedData.provider_health);
+                                    }
 	                                multiAiCarousel._multiAiApi.setSlideError(parsedData.llm_id, parsedData.error || 'Unknown error');
 	                                scrollToBottomIfNeeded();
 	                            } else if (parsedData.error && !parsedData.multi_ai_error) {
@@ -1904,7 +2090,10 @@ function sendMessage(messageText, options = {}) {
 	                                    }
 	                                    continue;
 	                                }
-	                                NotificationModal.error('AI Error', parsedData.error);
+                                    if (parsedData.provider_health) {
+                                        setCurrentProviderHealth(parsedData.provider_health);
+                                    }
+	                                showProviderAwareError('AI Error', parsedData.error, parsedData);
 	                                if (multiAiCarousel?._multiAiApi) {
                                     multiAiCarousel._multiAiApi.setGlobalError(parsedData.error);
                                 } else if (botMessageParagraph) {
@@ -1963,6 +2152,10 @@ function sendMessage(messageText, options = {}) {
                                 finalizeGranSabioStatus(botMessageParagraph, parsedData.gransabio_complete);
                                 scrollToBottomIfNeeded();
                             } else if (parsedData.content && !parsedData.multi_ai && botMessageParagraph) {
+                                if (chatPerfTrace && !chatPerfTrace.firstContentSeen) {
+                                    chatPerfTrace.firstContentSeen = true;
+                                    markChatPerf('client_first_content');
+                                }
                                 streamContentReceived = true;
                                 // Handle replace_last for progress updates
                                 if (parsedData.replace_last) {
@@ -2091,6 +2284,8 @@ function sendMessage(messageText, options = {}) {
         });
     })
     .catch(error => {
+        markChatPerf('client_error', { error: error && error.message ? error.message : String(error) });
+        finishChatPerf('client_stream_error');
         if (error.uploadFailed) {
             if (error.renderedAttachmentElements) {
                 renderedAttachmentElements = error.renderedAttachmentElements;
@@ -2099,6 +2294,19 @@ function sendMessage(messageText, options = {}) {
                     : uploadedAttachmentRefs;
             }
             discardUploadedRefs();
+            // Remove the failed attachment echoes and revoke their blob object URLs
+            // so a re-send does not stack "Failed" echoes or leak blob URLs.
+            if (error.renderedAttachmentElements) {
+                error.renderedAttachmentElements.forEach((el) => {
+                    if (!el) return;
+                    el.querySelectorAll('img[src^="blob:"]').forEach((img) => {
+                        URL.revokeObjectURL(img.src);
+                    });
+                    if (el.parentNode) {
+                        el.remove();
+                    }
+                });
+            }
             if (botMessageElement && botMessageElement.parentNode) {
                 botMessageElement.remove();
             }
@@ -2119,6 +2327,19 @@ function sendMessage(messageText, options = {}) {
 
         if (error.name === 'AbortError') {
             discardUploadedRefs();
+            // Clean up in-progress attachment echoes (and revoke their blob URLs)
+            // from the cancelled upload, mirroring the uploadFailed branch.
+            if (error.renderedAttachmentElements) {
+                error.renderedAttachmentElements.forEach((el) => {
+                    if (!el) return;
+                    el.querySelectorAll('img[src^="blob:"]').forEach((img) => {
+                        URL.revokeObjectURL(img.src);
+                    });
+                    if (el.parentNode) {
+                        el.remove();
+                    }
+                });
+            }
             removeLoadingIndicator();
             toggleSendButton('Send');
             document.getElementById('message-text').disabled = false;
@@ -2145,10 +2366,10 @@ function sendMessage(messageText, options = {}) {
             cleanupFailedStream(userMessageElement, botMessageElement, true);
             const hadAttachments = hadOutgoingAttachments;
             if (hadAttachments) {
-                NotificationModal.error('Message failed',
+                showProviderAwareError('Message failed',
                     attachmentTimeoutMessage);
             } else {
-                NotificationModal.error('Message failed',
+                showProviderAwareError('Message failed',
                     'The message could not be sent. Your text has been restored. Please try again.');
             }
         }
@@ -2953,6 +3174,7 @@ function deactivateChat() {
 
     // Update global state
     currentConversationId = null;
+    setCurrentProviderHealth(null);
 }
 
 function removeOverlay() {
@@ -3561,6 +3783,7 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
         const messages = data.messages;
         const conversationInfo = data.conversation_info;
         setIncognitoUiState(isConversationIncognitoData(conversationInfo));
+        setCurrentProviderHealth(conversationInfo.provider_health || null);
 
         allMessagesLoaded = !data.has_more;
 
@@ -4975,6 +5198,7 @@ document.addEventListener('DOMContentLoaded', function() {
     window.modelSelector = new ModelSelector();
     window.extensionSelector = new ExtensionSelector();
     window.multiAiManager = new MultiAiManager();
+    refreshMemoryHealthBanner();
 });
 
 // Platform Mode Management Functions (generalized for WhatsApp and Telegram)
@@ -5206,7 +5430,8 @@ function initializeThinkingTokensControl() {
     function isAdaptiveModel() {
         const model = (document.getElementById('chat-model')?.textContent || '').toLowerCase();
         return model.includes('4-6') || model.includes('4.6')
-            || model.includes('4-7') || model.includes('4.7');
+            || model.includes('4-7') || model.includes('4.7')
+            || model.includes('4-8') || model.includes('4.8');
     }
 
     function updateThinkingTokensVisibility() {
@@ -5247,9 +5472,10 @@ function initializeThinkingTokensControl() {
                     }
                 }
             }
-            // Opus 4.7 rejects manual thinking budget: lock UI to Off / Auto only
-            const isOpus47 = modelLower.includes('opus-4-7') || modelLower.includes('opus-4.7');
-            if (isOpus47) {
+            // Opus 4.7+ rejects manual thinking budget: lock UI to Off / Auto only
+            const isOpusAdaptiveOnly = modelLower.includes('opus-4-7') || modelLower.includes('opus-4.7')
+                || modelLower.includes('opus-4-8') || modelLower.includes('opus-4.8');
+            if (isOpusAdaptiveOnly) {
                 slider.disabled = true;
                 input.disabled = true;
                 presetBtns.forEach(btn => {

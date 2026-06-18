@@ -2,6 +2,7 @@ from ai_runtime.dependencies import *
 from ai_runtime.config import _is_gpt5_model, _log_truncated_response
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
+from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
 
 def _convert_messages_for_responses_api(messages: list) -> list:
     """Convert Chat Completions message content blocks to Responses API format.
@@ -96,7 +97,8 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                                   pdf_error_metadata=None,
                                   prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                                   llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
-                                  pending_attachment_refs: Optional[list[str]] = None):
+                                  pending_attachment_refs: Optional[list[str]] = None,
+                                  perf_trace=None):
     """
     OpenAI Responses API call function. Replaces call_gpt_api for all OpenAI calls.
     Uses /v1/responses endpoint with semantic SSE events instead of Chat Completions.
@@ -163,6 +165,17 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
     truncated = False
 
     logger.info(f"call_gpt_responses_api -> model: {model}, tools: {len(tools) if tools else 0}")
+    if perf_trace:
+        event = perf_trace.sse(
+            "openai_request_start",
+            model=model,
+            input_items=len(messages or []),
+            instructions_chars=len(prompt or ""),
+            max_output_tokens=max_tokens,
+            tool_count=len(tools or []),
+        )
+        if event:
+            yield event
 
     # GPT-5+ are reasoning models and may need more time
     timeout_seconds = 300 if _is_gpt5_model(model) else 120
@@ -171,9 +184,15 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             async with session.post(api_url, headers=headers, json=data) as response:
+                if perf_trace:
+                    event = perf_trace.sse("openai_headers_received", status=response.status)
+                    if event:
+                        yield event
                 if response.status == 200:
                     buffer = ""
                     raw_remainder = b""  # Holds incomplete UTF-8 bytes across chunks
+                    first_event_marked = False
+                    first_text_marked = False
 
                     async for chunk in response.content.iter_any():
                         if stop_signals.get(conversation_id):
@@ -217,6 +236,12 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                             if not data_str or data_str == "[DONE]":
                                 continue
 
+                            if not first_event_marked and perf_trace:
+                                event = perf_trace.sse("openai_first_event")
+                                if event:
+                                    yield event
+                                first_event_marked = True
+
                             try:
                                 event_data = orjson.loads(data_str)
                             except orjson.JSONDecodeError as e:
@@ -231,6 +256,11 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                             if etype == "response.output_text.delta":
                                 delta = event_data.get("delta", "")
                                 if delta:
+                                    if not first_text_marked and perf_trace:
+                                        event = perf_trace.sse("openai_first_text_delta")
+                                        if event:
+                                            yield event
+                                        first_text_marked = True
                                     content += delta
                                     yield f"data: {orjson.dumps({'content': delta}).decode()}\n\n"
 
@@ -291,6 +321,15 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                                 input_tokens = usage.get("input_tokens", 0)
                                 output_tokens = usage.get("output_tokens", 0)
                                 total_tokens = input_tokens + output_tokens
+                                if perf_trace:
+                                    event = perf_trace.sse(
+                                        "openai_completed_event",
+                                        input_tokens=input_tokens,
+                                        output_tokens=output_tokens,
+                                        total_tokens=total_tokens,
+                                    )
+                                    if event:
+                                        yield event
 
                                 # Extract any remaining citations from completed response
                                 for output_item in resp.get("output", []):
@@ -316,6 +355,12 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                                 if isinstance(error_code, str) and error_code.strip() and error_code.strip() not in error_msg:
                                     error_msg = f"{error_code.strip()}: {error_msg}"
                                 logger.error(f"[call_gpt_responses_api] Response failed: {error_msg}")
+                                await record_provider_error_for_label(
+                                    "OpenAI (GPT)",
+                                    message=error_msg,
+                                    model=model,
+                                    byok=byok,
+                                )
                                 yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', error_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                                 error_yielded = True
 
@@ -338,6 +383,13 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                     raw_log = f"[call_gpt_responses_api] Error: status {response.status}. Body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (GPT)")
+                    await record_provider_error_for_label(
+                        "OpenAI (GPT)",
+                        message=human_msg,
+                        status_code=response.status,
+                        model=model,
+                        byok=byok,
+                    )
                     yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
@@ -345,21 +397,24 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
             error_message = f"[call_gpt_responses_api] Request timed out after {timeout_seconds}s for model {model}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "OpenAI (GPT)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (GPT)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except aiohttp.ClientError as exc:
             error_message = f"[call_gpt_responses_api] Network error: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "OpenAI (GPT)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (GPT)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except Exception as exc:
             error_message = f"[call_gpt_responses_api] Unexpected error: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "OpenAI (GPT)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (GPT)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
     # Emit citations if any were collected (native web search)
@@ -377,6 +432,7 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
         logger.info(f"[call_gpt_responses_api] Tool call detected: {function_name}")
         logger.debug(f"[call_gpt_responses_api] Tool call args: {parsed_args}")
 
+        await record_provider_success_for_label("OpenAI (GPT)", model=model, byok=byok)
         yield f"data: {orjson.dumps({'tool_call': {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return
@@ -391,18 +447,45 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {current_user.id}. "
                                f"Provider: gpt_responses. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label("OpenAI (GPT)", message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
+            await record_provider_success_for_label("OpenAI (GPT)", model=model, byok=byok)
             citations_data = orjson.dumps(citations).decode() if citations else None
+            if perf_trace:
+                event = perf_trace.sse("db_save_start")
+                if event:
+                    yield event
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
                                                                         llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
+            if perf_trace:
+                event = perf_trace.sse(
+                    "db_save_done",
+                    user_message_id=user_message_id,
+                    bot_message_id=bot_message_id,
+                )
+                if event:
+                    yield event
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
+        if perf_trace:
+            event = perf_trace.sse("openai_stream_done")
+            if event:
+                yield event
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label("OpenAI (GPT)", model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label("OpenAI (GPT)", message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (GPT)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"

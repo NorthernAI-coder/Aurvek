@@ -3,6 +3,7 @@ from ai_runtime.config import safe_log_headers, _log_truncated_response
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.tooling.citations import build_citation_event
+from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
 
 async def call_claude_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, thinking_budget_tokens=None, user_api_key=None, tools=None,
                           input_token_fallback=None,
@@ -31,9 +32,12 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
     if model_max_tokens < 1:
         model_max_tokens = 1
 
-    is_opus_4_7 = ("opus-4-7" in model_lower) or ("opus-4.7" in model_lower)
+    is_opus_adaptive_only = any(m in model_lower for m in (
+        "opus-4-8", "opus-4.8", "opus-4-7", "opus-4.7"
+    ))
     is_adaptive_capable = any(m in model_lower for m in (
-        "opus-4-7", "opus-4.7", "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"
+        "opus-4-8", "opus-4.8", "opus-4-7", "opus-4.7",
+        "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6"
     ))
     # Claude 4.6+ rejects/deprecates the temperature parameter; Anthropic recommends omitting it.
     is_temperature_deprecated = is_adaptive_capable
@@ -74,15 +78,15 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         ]
 
         if any(model_part in model_lower for model_part in thinking_models):
-            if is_opus_4_7:
-                # Opus 4.7 only supports adaptive; manual budget_tokens is rejected.
+            if is_opus_adaptive_only:
+                # Opus 4.7+ only supports adaptive; manual budget_tokens is rejected.
                 if thinking_budget_tokens > 0:
                     logger.info(
-                        "Opus 4.7 does not accept manual thinking budget; "
+                        "Opus 4.7+ does not accept manual thinking budget; "
                         "ignoring budget_tokens=%d and using adaptive.",
                         thinking_budget_tokens,
                     )
-                # display defaults to "omitted" on Opus 4.7, which would strip thinking text from
+                # display defaults to "omitted" on Opus 4.7+, which would strip thinking text from
                 # the stream and break the UI render. Force "summarized" to keep reasoning visible.
                 data["thinking"] = {"type": "adaptive", "display": "summarized"}
             elif is_adaptive_capable and thinking_budget_tokens == -1:
@@ -342,6 +346,13 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
                                      f"messages={len(data.get('messages', []))}, "
                                      f"conversation_id={conversation_id}")
                         human_msg = _extract_human_error_message(error_body, response.status, "Claude")
+                        await record_provider_error_for_label(
+                            "Claude",
+                            message=human_msg,
+                            status_code=response.status,
+                            model=model,
+                            byok=byok,
+                        )
                         yield f"data: {orjson.dumps(_provider_error_payload('Claude', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                         error_yielded = True
                         break  # Don't continue on error
@@ -349,21 +360,24 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
                 error_msg = f"[call_claude_api] - Request timed out for conversation {conversation_id}"
                 logger.error(error_msg)
                 human_msg = _human_exception_error(exc, "Claude")
-                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                await record_provider_error_for_label("Claude", message=human_msg, exception=exc, model=model, byok=byok)
+                yield f"data: {orjson.dumps(_provider_error_payload('Claude', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                 error_yielded = True
                 break
             except aiohttp.ClientError as exc:
                 error_msg = f"[call_claude_api] - Connection error: {str(exc)}"
                 logger.error(error_msg)
                 human_msg = _human_exception_error(exc, "Claude")
-                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                await record_provider_error_for_label("Claude", message=human_msg, exception=exc, model=model, byok=byok)
+                yield f"data: {orjson.dumps(_provider_error_payload('Claude', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                 error_yielded = True
                 break
             except Exception as exc:
                 error_msg = f"[call_claude_api] - Unexpected error: {str(exc)}"
                 logger.error(error_msg)
                 human_msg = _human_exception_error(exc, "Claude")
-                yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+                await record_provider_error_for_label("Claude", message=human_msg, exception=exc, model=model, byok=byok)
+                yield f"data: {orjson.dumps(_provider_error_payload('Claude', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                 error_yielded = True
                 break
 
@@ -407,6 +421,7 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
         logger.info(f"[call_claude_api] - Tool use detected: {tool_use_name}, pre_tool_content length: {len(content)}")
 
         # Include any text Claude generated before calling the tool
+        await record_provider_success_for_label("Claude", model=model, byok=byok)
         yield f"data: {orjson.dumps({'tool_call': {'name': tool_use_name, 'arguments': parsed_args, 'id': tool_use_id}, 'pre_tool_content': content}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return  # Don't save to DB - handler will do it
@@ -435,9 +450,12 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {user_id}. "
                                f"Provider: claude. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label("Claude", message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload('Claude', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
+            await record_provider_success_for_label("Claude", model=model, byok=byok)
             citations_data = orjson.dumps(all_citations).decode() if all_citations else None
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
@@ -448,5 +466,13 @@ async def call_claude_api(messages, model, temperature, max_tokens, prompt, conv
 
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label("Claude", model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label("Claude", message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload('Claude', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"

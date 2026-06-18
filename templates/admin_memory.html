@@ -1,0 +1,580 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}System Memory - AURVEK{% endblock %}
+{% block page_title %}System Memory{% endblock %}
+{% block page_subtitle %}
+<p class="page-subtitle">Select the active memory provider and configure the local fallback context</p>
+{% endblock %}
+
+{% block styles %}
+<style>
+    .memory-provider-grid,
+    .memory-scope-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+    }
+    .memory-provider-option,
+    .memory-scope-option {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary, #202225);
+        padding: 14px;
+        cursor: pointer;
+        min-height: 120px;
+    }
+    .memory-provider-option.active,
+    .memory-scope-option.active {
+        border-color: rgba(88, 101, 242, 0.65);
+        box-shadow: 0 0 0 1px rgba(88, 101, 242, 0.25);
+    }
+    .memory-provider-option input,
+    .memory-scope-option input {
+        margin-right: 8px;
+    }
+    .memory-option-title {
+        color: var(--text-primary);
+        font-weight: 800;
+        margin-bottom: 6px;
+    }
+    .memory-option-copy,
+    .field-note {
+        color: var(--text-muted);
+        font-size: 0.88rem;
+        line-height: 1.4;
+    }
+    .memory-provider-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+    }
+    .memory-health-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 8px;
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        background: rgba(148, 163, 184, 0.14);
+        color: var(--text-muted);
+    }
+    .memory-health-badge.operational {
+        background: rgba(16, 185, 129, 0.14);
+        color: #10b981;
+    }
+    .memory-health-badge.degraded,
+    .memory-health-badge.suspected {
+        background: rgba(245, 158, 11, 0.14);
+        color: #f59e0b;
+    }
+    .memory-health-badge.unavailable {
+        background: rgba(239, 68, 68, 0.14);
+        color: #ef4444;
+    }
+    .memory-health-panel {
+        display: none;
+        margin: 0 0 18px;
+        padding: 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-tertiary, #202225);
+        color: var(--text-primary);
+    }
+    .memory-health-panel.visible {
+        display: block;
+    }
+    .memory-health-panel.danger {
+        border-color: rgba(239, 68, 68, 0.35);
+    }
+    .memory-health-panel.warning {
+        border-color: rgba(245, 158, 11, 0.35);
+    }
+    .memory-health-title {
+        font-weight: 800;
+        margin-bottom: 4px;
+    }
+    .memory-health-detail {
+        color: var(--text-muted);
+        font-size: 0.88rem;
+        overflow-wrap: anywhere;
+    }
+    .memory-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+    }
+    .memory-summary-item {
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 12px;
+        background: var(--bg-tertiary, #202225);
+    }
+    .memory-summary-label {
+        color: var(--text-muted);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        font-weight: 800;
+    }
+    .memory-summary-value {
+        color: var(--text-primary);
+        margin-top: 6px;
+        font-weight: 700;
+        overflow-wrap: anywhere;
+    }
+    .context-exception-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(120px, auto) auto;
+        gap: 12px;
+        align-items: center;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--border-color);
+    }
+    .context-exception-row:last-child {
+        border-bottom: 0;
+    }
+    .context-exception-label {
+        color: var(--text-primary);
+        font-weight: 700;
+        overflow-wrap: anywhere;
+    }
+    .context-exception-meta {
+        color: var(--text-muted);
+        font-size: 0.82rem;
+        margin-top: 2px;
+    }
+    .provider-panel {
+        display: none;
+    }
+    .provider-panel.visible {
+        display: block;
+    }
+    @media (max-width: 720px) {
+        .context-exception-row {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block alerts %}
+<div id="alertContainer"></div>
+{% endblock %}
+
+{% block content %}
+<div class="section-container">
+    <div class="section-title">
+        <i class="fas fa-toggle-on"></i> Active Provider
+    </div>
+    <div class="memory-provider-grid" id="providerOptions">
+        <label class="memory-provider-option" data-provider-option="none">
+            <input type="radio" name="activeProvider" value="none" {% if memory_config.active_provider == 'none' %}checked{% endif %}>
+            <div class="memory-provider-heading">
+                <div class="memory-option-title">None</div>
+                <span class="memory-health-badge" data-memory-health-badge="none">Local</span>
+            </div>
+            <div class="memory-option-copy">Disable durable memory providers and use only Aurvek's recent local chat context.</div>
+        </label>
+        <label class="memory-provider-option" data-provider-option="atagia">
+            <input type="radio" name="activeProvider" value="atagia" {% if memory_config.active_provider == 'atagia' %}checked{% endif %}>
+            <div class="memory-provider-heading">
+                <div class="memory-option-title">Atagia</div>
+                <span class="memory-health-badge" data-memory-health-badge="atagia">Checking</span>
+            </div>
+            <div class="memory-option-copy">Use the Atagia sidecar for memory extraction, sync, review, and worker controls.</div>
+        </label>
+        <label class="memory-provider-option" data-provider-option="mem0">
+            <input type="radio" name="activeProvider" value="mem0" {% if memory_config.active_provider == 'mem0' %}checked{% endif %}>
+            <div class="memory-provider-heading">
+                <div class="memory-option-title">Mem0 OSS Local</div>
+                <span class="memory-health-badge" data-memory-health-badge="mem0">Checking</span>
+            </div>
+            <div class="memory-option-copy">Use a self-hosted Mem0 OSS REST server on this machine or a trusted private host.</div>
+        </label>
+    </div>
+
+    <div class="memory-health-panel" id="memoryHealthPanel">
+        <div class="memory-health-title" id="memoryHealthTitle">Memory status</div>
+        <div class="memory-health-detail" id="memoryHealthDetail"></div>
+    </div>
+
+    <div id="durableScopeSection">
+        <div class="section-title">
+            <i class="fas fa-layer-group"></i> Default Scope
+            <i class="fas fa-circle-question ms-1" title="Global shares memory across a user account. By prompt/persona isolates memories for specialized assistants."></i>
+        </div>
+        <div class="memory-scope-grid" id="scopeOptions">
+            <label class="memory-scope-option" data-scope-option="global">
+                <input type="radio" name="defaultScope" value="global" {% if memory_config.default_scope == 'global' %}checked{% endif %}>
+                <div class="memory-option-title">Global by user</div>
+                <div class="memory-option-copy">Best for work, personal assistant use, long-running projects, writing style, and account-wide preferences.</div>
+            </label>
+            <label class="memory-scope-option" data-scope-option="prompt">
+                <input type="radio" name="defaultScope" value="prompt" {% if memory_config.default_scope == 'prompt' %}checked{% endif %}>
+                <div class="memory-option-title">By prompt/persona</div>
+                <div class="memory-option-copy">Best for roleplay, character prompts, specialized workflows, and avoiding memory bleed between assistants.</div>
+            </label>
+        </div>
+    </div>
+
+    <button type="button" class="btn btn-primary" id="saveProviderBtn" onclick="saveProviderConfig()">
+        <i class="fas fa-save me-1"></i> Save Provider
+    </button>
+</div>
+
+<div class="section-container provider-panel" id="noneProviderPanel">
+    <div class="section-title">
+        <i class="fas fa-clock-rotate-left"></i> Local Context When Memory Is Off
+    </div>
+    <p class="field-note">
+        Aurvek still starts from the recent local chat history, currently the last 60 days, then fills from the newest messages backward until this token budget is reached. The effective budget is also capped by the selected model's input window after the system prompt and current user message.
+    </p>
+    <div class="mb-3">
+        <label class="form-label" for="noneContextMaxTokens">Global history context max tokens</label>
+        <input class="form-control" type="number" id="noneContextMaxTokens" min="0" max="2000000" step="1000"
+               value="{{ memory_config.none_context.max_tokens }}">
+        <p class="field-note">Use 0 to send no historical chat context when durable memory is off.</p>
+    </div>
+
+    <div class="section-title">
+        <i class="fas fa-list-check"></i> Exceptions
+    </div>
+    <p class="field-note">
+        Prompt exceptions override model exceptions when both match. Each exception can raise or lower the global budget, subject to the model's maximum input window.
+    </p>
+    <div class="row align-items-end">
+        <div class="col-md-3 mb-3">
+            <label class="form-label" for="exceptionType">Condition</label>
+            <select class="form-select" id="exceptionType" onchange="updateExceptionTargetSelects()">
+                <option value="prompt">Prompt</option>
+                <option value="llm">Model</option>
+            </select>
+        </div>
+        <div class="col-md-5 mb-3" id="promptExceptionTargetWrap">
+            <label class="form-label" for="promptExceptionTarget">Prompt</label>
+            <select class="form-select" id="promptExceptionTarget">
+                {% for prompt in prompt_options %}
+                <option value="{{ prompt.id }}">{{ prompt.label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="col-md-5 mb-3" id="llmExceptionTargetWrap">
+            <label class="form-label" for="llmExceptionTarget">Model</label>
+            <select class="form-select" id="llmExceptionTarget">
+                {% for llm in llm_options %}
+                <option value="{{ llm.id }}">{{ llm.label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="col-md-3 mb-3">
+            <label class="form-label" for="exceptionMaxTokens">Max tokens</label>
+            <input class="form-control" type="number" id="exceptionMaxTokens" min="0" max="2000000" step="1000">
+        </div>
+        <div class="col-md-1 mb-3">
+            <button type="button" class="btn btn-outline-secondary w-100" onclick="addContextException()" title="Add exception">
+                <i class="fas fa-plus"></i>
+            </button>
+        </div>
+    </div>
+    <div id="contextExceptionList"></div>
+    <div class="mt-3">
+        <button type="button" class="btn btn-primary" onclick="saveNoMemoryContextConfig()">
+            <i class="fas fa-save me-1"></i> Save Local Context
+        </button>
+    </div>
+</div>
+
+<div class="section-container provider-panel" id="mem0ProviderPanel">
+    <div class="section-title">
+        <i class="fas fa-server"></i> Mem0
+    </div>
+    <p class="field-note">Mem0 configuration lives on its own page and is shown only when Mem0 is the active provider.</p>
+    <div class="memory-summary-grid mb-3">
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">REST URL</div>
+            <div class="memory-summary-value">{{ memory_config.mem0.base_url or '-' }}</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Namespace</div>
+            <div class="memory-summary-value">{{ memory_config.mem0.platform_id or '-' }}</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Retrieval Limit</div>
+            <div class="memory-summary-value">{{ memory_config.mem0.top_k or '-' }}</div>
+        </div>
+    </div>
+    <a href="/admin/mem0" class="btn btn-outline-secondary">
+        <i class="fas fa-sliders-h me-1"></i> Open Mem0 Configuration
+    </a>
+</div>
+
+<div class="section-container provider-panel" id="atagiaProviderPanel">
+    <div class="section-title">
+        <i class="fas fa-database"></i> Atagia
+    </div>
+    <p class="field-note">Atagia configuration lives on its own page and is shown only when Atagia is the active provider.</p>
+    <div class="memory-summary-grid mb-3">
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Saved Enabled Flag</div>
+            <div class="memory-summary-value">{{ 'Enabled' if atagia_config.enabled else 'Disabled' }}</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Transport</div>
+            <div class="memory-summary-value">{{ atagia_config.transport or 'auto' }}</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">Local DB</div>
+            <div class="memory-summary-value">{{ atagia_config.db_path or 'db/atagia.db' }}</div>
+        </div>
+        <div class="memory-summary-item">
+            <div class="memory-summary-label">HTTP URL</div>
+            <div class="memory-summary-value">{{ atagia_config.base_url or '-' }}</div>
+        </div>
+    </div>
+    <a href="/admin/atagia" class="btn btn-outline-secondary">
+        <i class="fas fa-sliders-h me-1"></i> Open Atagia Configuration
+    </a>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    var contextExceptions = {{ memory_config.none_context.exceptions|tojson }};
+    var llmOptions = {{ llm_options|tojson }};
+    var promptOptions = {{ prompt_options|tojson }};
+    var memoryHealthState = null;
+
+    function selectedValue(name) {
+        var input = document.querySelector('input[name="' + name + '"]:checked');
+        return input ? input.value : '';
+    }
+
+    function selectedOptionText(selectId) {
+        var select = document.getElementById(selectId);
+        return select && select.selectedOptions.length ? select.selectedOptions[0].textContent : '';
+    }
+
+    function updateOptionCards() {
+        document.querySelectorAll('[data-provider-option]').forEach(function(card) {
+            card.classList.toggle('active', card.querySelector('input').checked);
+        });
+        document.querySelectorAll('[data-scope-option]').forEach(function(card) {
+            card.classList.toggle('active', card.querySelector('input').checked);
+        });
+    }
+
+    function updateProviderPanels() {
+        var provider = selectedValue('activeProvider') || 'none';
+        document.getElementById('durableScopeSection').style.display = provider === 'none' ? 'none' : 'block';
+        document.getElementById('noneProviderPanel').classList.toggle('visible', provider === 'none');
+        document.getElementById('mem0ProviderPanel').classList.toggle('visible', provider === 'mem0');
+        document.getElementById('atagiaProviderPanel').classList.toggle('visible', provider === 'atagia');
+        updateOptionCards();
+        renderMemoryHealth();
+    }
+
+    function healthLabel(status) {
+        var labels = {
+            operational: 'Operational',
+            recovering: 'Recovering',
+            suspected: 'Suspected',
+            degraded: 'Degraded',
+            unavailable: 'Unavailable',
+            disabled: 'Disabled'
+        };
+        return labels[status] || 'Unknown';
+    }
+
+    function renderMemoryHealth() {
+        var selectedProvider = selectedValue('activeProvider') || 'none';
+        var panel = document.getElementById('memoryHealthPanel');
+        var title = document.getElementById('memoryHealthTitle');
+        var detail = document.getElementById('memoryHealthDetail');
+        var activeHealth = null;
+
+        document.querySelectorAll('[data-memory-health-badge]').forEach(function(badge) {
+            var provider = badge.getAttribute('data-memory-health-badge');
+            var providerHealth = memoryHealthState && memoryHealthState.providers
+                ? memoryHealthState.providers[provider]
+                : null;
+            var status = providerHealth && providerHealth.status ? providerHealth.status : (provider === 'none' ? 'disabled' : 'unknown');
+            badge.className = 'memory-health-badge ' + status;
+            badge.textContent = provider === 'none' ? 'Local' : healthLabel(status);
+            if (provider === selectedProvider) {
+                activeHealth = providerHealth;
+            }
+        });
+
+        panel.className = 'memory-health-panel';
+        if (!activeHealth || selectedProvider === 'none' || activeHealth.should_surface !== true) {
+            panel.classList.remove('visible');
+            return;
+        }
+
+        var status = activeHealth.status || 'unknown';
+        panel.classList.add('visible');
+        if (status === 'unavailable') {
+            panel.classList.add('danger');
+        } else {
+            panel.classList.add('warning');
+        }
+        title.textContent = 'Active memory provider is ' + healthLabel(status).toLowerCase();
+        detail.textContent = activeHealth.message || activeHealth.last_error || 'Memory is not fully available.';
+    }
+
+    async function loadMemoryHealthStatus() {
+        try {
+            var response = await fetch('/admin/memory/status', { credentials: 'same-origin' });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Status check failed');
+            memoryHealthState = data;
+            renderMemoryHealth();
+        } catch (err) {
+            memoryHealthState = null;
+            renderMemoryHealth();
+        }
+    }
+
+    function updateExceptionTargetSelects() {
+        var type = document.getElementById('exceptionType').value;
+        document.getElementById('promptExceptionTargetWrap').style.display = type === 'prompt' ? 'block' : 'none';
+        document.getElementById('llmExceptionTargetWrap').style.display = type === 'llm' ? 'block' : 'none';
+    }
+
+    function renderContextExceptions() {
+        var container = document.getElementById('contextExceptionList');
+        if (!contextExceptions.length) {
+            container.innerHTML = '<p class="field-note">No exceptions configured.</p>';
+            return;
+        }
+        container.innerHTML = contextExceptions.map(function(item, index) {
+            var typeLabel = item.type === 'prompt' ? 'Prompt' : 'Model';
+            return '<div class="context-exception-row">' +
+                '<div>' +
+                    '<div class="context-exception-label">' + escapeHtml(item.label || typeLabel + ' ' + item.id) + '</div>' +
+                    '<div class="context-exception-meta">' + typeLabel + ' #' + item.id + '</div>' +
+                '</div>' +
+                '<div class="context-exception-label">' + Number(item.max_tokens || 0).toLocaleString() + ' tokens</div>' +
+                '<button type="button" class="btn btn-outline-danger btn-sm" onclick="removeContextException(' + index + ')">' +
+                    '<i class="fas fa-trash"></i>' +
+                '</button>' +
+            '</div>';
+        }).join('');
+    }
+
+    function addContextException() {
+        var type = document.getElementById('exceptionType').value;
+        var targetId = type === 'prompt'
+            ? document.getElementById('promptExceptionTarget').value
+            : document.getElementById('llmExceptionTarget').value;
+        var label = type === 'prompt'
+            ? selectedOptionText('promptExceptionTarget')
+            : selectedOptionText('llmExceptionTarget');
+        var maxTokens = Number(document.getElementById('exceptionMaxTokens').value);
+        if (!targetId) {
+            showAlert('danger', 'Select a prompt or model for the exception.');
+            return;
+        }
+        if (!Number.isInteger(maxTokens) || maxTokens < 0 || maxTokens > 2000000) {
+            showAlert('danger', 'Exception max tokens must be a whole number from 0 to 2000000.');
+            return;
+        }
+        contextExceptions = contextExceptions.filter(function(item) {
+            return !(item.type === type && Number(item.id) === Number(targetId));
+        });
+        contextExceptions.push({
+            type: type,
+            id: Number(targetId),
+            label: label,
+            max_tokens: maxTokens
+        });
+        document.getElementById('exceptionMaxTokens').value = '';
+        renderContextExceptions();
+    }
+
+    function removeContextException(index) {
+        contextExceptions.splice(index, 1);
+        renderContextExceptions();
+    }
+
+    async function readJsonResponse(response) {
+        var text = await response.text();
+        if (!text) return {};
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            throw new Error('Server returned a non-JSON response (' + response.status + ').');
+        }
+    }
+
+    async function saveProviderConfig() {
+        try {
+            var response = await fetch('/admin/memory/provider', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    active_provider: selectedValue('activeProvider'),
+                    default_scope: selectedValue('defaultScope')
+                })
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Save failed');
+            await loadMemoryHealthStatus();
+            updateProviderPanels();
+            showAlert('success', data.message || 'Memory provider saved.');
+        } catch (err) {
+            await loadMemoryHealthStatus();
+            showAlert('danger', 'Failed to save provider: ' + err.message);
+        }
+    }
+
+    async function saveNoMemoryContextConfig() {
+        try {
+            var maxTokens = Number(document.getElementById('noneContextMaxTokens').value);
+            if (!Number.isInteger(maxTokens) || maxTokens < 0 || maxTokens > 2000000) {
+                throw new Error('Global max tokens must be a whole number from 0 to 2000000.');
+            }
+            var response = await fetch('/admin/memory/no-memory-context', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    max_tokens: maxTokens,
+                    exceptions: contextExceptions
+                })
+            });
+            var data = await readJsonResponse(response);
+            if (!response.ok || !data.success) throw new Error(data.message || 'Save failed');
+            showAlert('success', data.message || 'Local context settings saved.');
+        } catch (err) {
+            showAlert('danger', 'Failed to save local context: ' + err.message);
+        }
+    }
+
+    function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, function(ch) {
+            return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+        });
+    }
+
+    function showAlert(type, message) {
+        var container = document.getElementById('alertContainer');
+        var cls = type === 'success' ? 'alert-success' : 'alert-danger';
+        container.innerHTML =
+            '<div class="alert ' + cls + ' alert-dismissible fade show" role="alert">' +
+            escapeHtml(message) +
+            '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>' +
+            '</div>';
+    }
+
+    document.querySelectorAll('input[name="activeProvider"], input[name="defaultScope"]').forEach(function(input) {
+        input.addEventListener('change', updateProviderPanels);
+    });
+    updateExceptionTargetSelects();
+    updateProviderPanels();
+    renderContextExceptions();
+    loadMemoryHealthStatus();
+</script>
+{% endblock %}

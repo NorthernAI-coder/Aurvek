@@ -4,7 +4,7 @@ import jwt
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse
 
-from auth import get_current_user
+from auth import get_current_user, unauthenticated_response
 from common import SECRET_KEY, decode_jwt_cached, verify_token_expiration
 from log_config import logger
 from models import User
@@ -35,18 +35,18 @@ async def warmup_conversation_context(
     payload: Any = Body(default={}),
 ):
     if current_user is None:
-        return JSONResponse(content={"redirect": "/login"}, status_code=401)
+        return unauthenticated_response()
 
     token = request.cookies.get("session")
     if not token:
-        return JSONResponse(content={"redirect": "/login"}, status_code=401)
+        return unauthenticated_response()
 
     try:
         jwt_payload = decode_jwt_cached(token, SECRET_KEY)
         if not verify_token_expiration(jwt_payload):
-            return JSONResponse(content={"redirect": "/login"}, status_code=401)
+            return unauthenticated_response()
     except jwt.PyJWTError:
-        return JSONResponse(content={"redirect": "/login"}, status_code=401)
+        return unauthenticated_response()
 
     activity_payload, payload_error = _sanitize_warmup_payload(payload)
     if payload_error:

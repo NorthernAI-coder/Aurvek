@@ -61,6 +61,8 @@ from common import (
     claude_key,
     gemini_key,
     openrouter_key,
+    minimax_key,
+    moonshot_key,
     elevenlabs_key,
     tts_engine,
     decode_jwt_cached,

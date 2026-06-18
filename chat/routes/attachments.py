@@ -1,4 +1,6 @@
 import asyncio
+import os
+import uuid
 
 import orjson
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -17,6 +19,7 @@ from models import User
 from chat.services.attachment_uploads import (
     ATTACHMENT_UPLOAD_CHUNK_ROOT,
     ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES,
+    ATTACHMENT_UPLOAD_LEGACY_CHUNK_SIZE_BYTES,
     ATTACHMENT_UPLOAD_TTL_SECONDS,
     attachment_upload_dir,
     create_pending_attachment_from_upload,
@@ -33,6 +36,80 @@ from chat.services.attachment_uploads import (
 router = APIRouter()
 
 
+COMPARABLE_UPLOAD_METADATA_KEYS = (
+    "filename",
+    "content_type",
+    "total_size",
+    "total_chunks",
+    "chunk_size",
+    "user_id",
+    "conversation_id",
+)
+
+
+def _ensure_upload_dir(upload_dir):
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _read_upload_metadata(meta_path):
+    metadata = orjson.loads(meta_path.read_bytes())
+    if not isinstance(metadata, dict):
+        raise ValueError("Upload metadata is corrupted")
+    return metadata
+
+
+def _write_upload_metadata_once(meta_path, metadata):
+    try:
+        with meta_path.open("xb") as handle:
+            handle.write(orjson.dumps(metadata))
+        return True
+    except FileExistsError:
+        return False
+
+
+def _upload_metadata_matches(existing, metadata):
+    return all(existing.get(key) == metadata.get(key) for key in COMPARABLE_UPLOAD_METADATA_KEYS)
+
+
+def _store_chunk_part_idempotent(part_path, data):
+    if part_path.exists():
+        if part_path.read_bytes() == data:
+            return
+        raise ValueError("Upload chunk already exists with different content")
+
+    tmp_path = part_path.with_name(f"{part_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_bytes(data)
+        try:
+            os.link(tmp_path, part_path)
+        except FileExistsError:
+            if part_path.read_bytes() == data:
+                return
+            raise ValueError("Upload chunk already exists with different content")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove temporary upload chunk %s", tmp_path, exc_info=True)
+
+
+def _legacy_chunk_size_candidates() -> tuple[int, ...]:
+    candidates = (
+        ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES,
+        ATTACHMENT_UPLOAD_LEGACY_CHUNK_SIZE_BYTES,
+    )
+    return tuple(dict.fromkeys(candidates))
+
+
+def _expected_chunk_size(total_size: int, chunk_index: int, chunk_size: int) -> int:
+    start = chunk_index * chunk_size
+    return min(chunk_size, max(0, total_size - start))
+
+
 @router.post("/api/conversations/{conversation_id}/attachments/chunk")
 async def upload_attachment_chunk(
     conversation_id: int,
@@ -43,41 +120,72 @@ async def upload_attachment_chunk(
     filename: str = Form(...),
     content_type: str = Form(""),
     total_size: int = Form(...),
+    chunk_size: int | None = Form(None),
     chunk: UploadFile = File(...),
 ):
     guard_response = await ensure_attachment_upload_allowed(conversation_id, current_user)
     if guard_response is not None:
         return guard_response
 
-    try:
-        normalized_type, _max_bytes = validate_chunk_upload_metadata(
-            upload_id=upload_id,
-            chunk_index=chunk_index,
-            total_chunks=total_chunks,
-            filename=filename,
-            content_type=content_type,
-            total_size=total_size,
-        )
-        upload_dir = attachment_upload_dir(current_user.id, conversation_id, upload_id)
-    except ValueError as exc:
-        return json_error(str(exc), status_code=400)
-
-    start = chunk_index * ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES
-    expected_size = min(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES, max(0, total_size - start))
-    data = await chunk.read(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES + 1)
-    if len(data) > ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES:
-        return json_error("Chunk exceeds upload size limit", status_code=400)
-    if len(data) != expected_size:
-        return json_error("Chunk size does not match metadata", status_code=400)
-
-    try:
-        if chunk_index == 0:
-            await asyncio.to_thread(
-                prune_stale_attachment_upload_dirs,
-                ATTACHMENT_UPLOAD_CHUNK_ROOT,
-                ATTACHMENT_UPLOAD_TTL_SECONDS,
+    if isinstance(chunk_size, int):
+        effective_chunk_size = chunk_size
+        try:
+            normalized_type, _max_bytes = validate_chunk_upload_metadata(
+                upload_id=upload_id,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                filename=filename,
+                content_type=content_type,
+                total_size=total_size,
+                chunk_size=effective_chunk_size,
             )
-        await asyncio.to_thread(upload_dir.mkdir, parents=True, exist_ok=True)
+            upload_dir = attachment_upload_dir(current_user.id, conversation_id, upload_id)
+        except ValueError as exc:
+            return json_error(str(exc), status_code=400)
+
+        expected_size = _expected_chunk_size(total_size, chunk_index, effective_chunk_size)
+        data = await chunk.read(effective_chunk_size + 1)
+        if len(data) > effective_chunk_size:
+            return json_error("Chunk exceeds upload size limit", status_code=400)
+        if len(data) != expected_size:
+            return json_error("Chunk size does not match metadata", status_code=400)
+    else:
+        candidates = _legacy_chunk_size_candidates()
+        data = await chunk.read(max(candidates) + 1)
+        if len(data) > max(candidates):
+            return json_error("Chunk exceeds upload size limit", status_code=400)
+
+        candidate_errors: list[str] = []
+        for candidate in candidates:
+            try:
+                candidate_type, _max_bytes = validate_chunk_upload_metadata(
+                    upload_id=upload_id,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    filename=filename,
+                    content_type=content_type,
+                    total_size=total_size,
+                    chunk_size=candidate,
+                )
+            except ValueError as exc:
+                candidate_errors.append(str(exc))
+                continue
+
+            expected_size = _expected_chunk_size(total_size, chunk_index, candidate)
+            if len(data) == expected_size:
+                effective_chunk_size = candidate
+                normalized_type = candidate_type
+                try:
+                    upload_dir = attachment_upload_dir(current_user.id, conversation_id, upload_id)
+                except ValueError as exc:
+                    return json_error(str(exc), status_code=400)
+                break
+        else:
+            message = candidate_errors[0] if candidate_errors else "Chunk size does not match metadata"
+            return json_error(message, status_code=400)
+
+    try:
+        upload_dir_created = await asyncio.to_thread(_ensure_upload_dir, upload_dir)
         meta_path = upload_dir / "meta.json"
         metadata = {
             "upload_id": upload_id,
@@ -85,19 +193,34 @@ async def upload_attachment_chunk(
             "content_type": normalized_type,
             "total_size": int(total_size),
             "total_chunks": int(total_chunks),
+            "chunk_size": int(effective_chunk_size),
             "user_id": int(current_user.id),
             "conversation_id": int(conversation_id),
         }
-        if meta_path.exists():
-            existing = orjson.loads(await asyncio.to_thread(meta_path.read_bytes))
-            comparable_keys = ("filename", "content_type", "total_size", "total_chunks", "user_id", "conversation_id")
-            if any(existing.get(key) != metadata.get(key) for key in comparable_keys):
+        if upload_dir_created:
+            # The first arriving chunk creates the upload dir; prune here so
+            # resume sessions that skip index 0 still trigger opportunistic cleanup.
+            await asyncio.to_thread(
+                prune_stale_attachment_upload_dirs,
+                ATTACHMENT_UPLOAD_CHUNK_ROOT,
+                ATTACHMENT_UPLOAD_TTL_SECONDS,
+            )
+
+        metadata_created = await asyncio.to_thread(_write_upload_metadata_once, meta_path, metadata)
+        if not metadata_created:
+            try:
+                existing = await asyncio.to_thread(_read_upload_metadata, meta_path)
+            except Exception:
+                await delete_attachment_upload_dir(upload_dir)
+                return json_error("Upload metadata is corrupted. Please attach the file again.", status_code=400)
+            if not _upload_metadata_matches(existing, metadata):
                 await delete_attachment_upload_dir(upload_dir)
                 return json_error("Upload metadata changed during transfer", status_code=400)
-        else:
-            await asyncio.to_thread(meta_path.write_bytes, orjson.dumps(metadata))
+
         part_path = upload_dir / f"{chunk_index:06d}.part"
-        await asyncio.to_thread(part_path.write_bytes, data)
+        await asyncio.to_thread(_store_chunk_part_idempotent, part_path, data)
+    except ValueError as exc:
+        return json_error(str(exc), status_code=400)
     except Exception as exc:
         logger.error("[upload_attachment_chunk] Could not persist chunk: %s", exc)
         return json_error("Failed to store upload chunk", status_code=500)
@@ -127,14 +250,6 @@ async def complete_attachment_upload(
         return guard_response
 
     try:
-        normalized_type, _max_bytes = validate_chunk_upload_metadata(
-            upload_id=upload_id,
-            chunk_index=0,
-            total_chunks=total_chunks,
-            filename=filename,
-            content_type=content_type,
-            total_size=total_size,
-        )
         upload_dir = attachment_upload_dir(current_user.id, conversation_id, upload_id)
     except ValueError as exc:
         return json_error(str(exc), status_code=400)
@@ -145,9 +260,23 @@ async def complete_attachment_upload(
 
     try:
         metadata = orjson.loads(await asyncio.to_thread(meta_path.read_bytes))
+        chunk_size = int(metadata["chunk_size"])
     except Exception:
         await delete_attachment_upload_dir(upload_dir)
         return json_error("Upload metadata is corrupted. Please attach the file again.", status_code=400)
+
+    try:
+        normalized_type, _max_bytes = validate_chunk_upload_metadata(
+            upload_id=upload_id,
+            chunk_index=0,
+            total_chunks=total_chunks,
+            filename=filename,
+            content_type=content_type,
+            total_size=total_size,
+            chunk_size=chunk_size,
+        )
+    except ValueError as exc:
+        return json_error(str(exc), status_code=400)
 
     expected_metadata = {
         "filename": filename,
@@ -167,8 +296,8 @@ async def complete_attachment_upload(
         if not part_path.exists():
             return json_error("Upload is incomplete. Please retry the file upload.", status_code=400)
         part_data = await asyncio.to_thread(part_path.read_bytes)
-        start = index * ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES
-        expected_size = min(ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES, max(0, total_size - start))
+        start = index * chunk_size
+        expected_size = min(chunk_size, max(0, total_size - start))
         if len(part_data) != expected_size:
             await delete_attachment_upload_dir(upload_dir)
             return json_error("Upload chunk size mismatch. Please attach the file again.", status_code=400)
@@ -197,6 +326,50 @@ async def complete_attachment_upload(
 
     await delete_attachment_upload_dir(upload_dir)
     return JSONResponse(content=pending_attachment_upload_payload(pending))
+
+
+@router.get("/api/conversations/{conversation_id}/attachments/status")
+async def attachment_upload_status(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    upload_id: str = "",
+):
+    guard_response = await ensure_attachment_upload_allowed(conversation_id, current_user)
+    if guard_response is not None:
+        return guard_response
+
+    try:
+        upload_dir = attachment_upload_dir(current_user.id, conversation_id, upload_id)
+    except ValueError as exc:
+        return json_error(str(exc), status_code=400)
+
+    meta_path = upload_dir / "meta.json"
+    if not meta_path.exists():
+        return JSONResponse(content={"exists": False, "received_chunks": []})
+
+    try:
+        metadata = orjson.loads(await asyncio.to_thread(meta_path.read_bytes))
+    except Exception:
+        return JSONResponse(content={"exists": False, "received_chunks": []})
+    if not isinstance(metadata, dict):
+        return JSONResponse(content={"exists": False, "received_chunks": []})
+
+    received_chunks = sorted(
+        int(part_path.stem)
+        for part_path in upload_dir.glob("*.part")
+        if len(part_path.stem) == 6 and part_path.stem.isdigit()
+    )
+    return JSONResponse(
+        content={
+            "exists": True,
+            "chunk_size": metadata.get("chunk_size"),
+            "total_chunks": metadata.get("total_chunks"),
+            "total_size": metadata.get("total_size"),
+            "filename": metadata.get("filename"),
+            "content_type": metadata.get("content_type"),
+            "received_chunks": received_chunks,
+        }
+    )
 
 
 @router.post("/api/conversations/{conversation_id}/attachments/discard")

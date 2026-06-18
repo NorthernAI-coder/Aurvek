@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -40,6 +41,7 @@ EXPECTED_ROUTE_MODULES = {
     ("POST", "/api/conversations/{conversation_id}/branch"): "chat.routes.branching",
     ("POST", "/api/conversations/{conversation_id}/attachments/chunk"): "chat.routes.attachments",
     ("POST", "/api/conversations/{conversation_id}/attachments/complete"): "chat.routes.attachments",
+    ("GET", "/api/conversations/{conversation_id}/attachments/status"): "chat.routes.attachments",
     ("POST", "/api/conversations/{conversation_id}/attachments/discard"): "chat.routes.attachments",
     ("GET", "/api/attachments/{public_id}/content"): "chat.routes.attachments",
     ("GET", "/api/attachments/{public_id}/download"): "chat.routes.attachments",
@@ -176,11 +178,16 @@ def test_ai_runtime_boundary_has_no_ai_calls_imports():
         re.MULTILINE,
     )
 
-    for path in repo_root.rglob("*.py"):
-        if any(
-            part in {".git", "__pycache__"} or part.startswith(".venv")
-            for part in path.parts
-        ):
-            continue
-        text = path.read_text(encoding="utf-8")
-        assert not stale_ai_runtime_imports.search(text), path.relative_to(repo_root)
+    excluded_dirs = {".git", "__pycache__", ".venv"}
+    for root, dirs, files in os.walk(repo_root):
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in excluded_dirs and not name.startswith(".venv")
+        ]
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+            path = Path(root) / filename
+            text = path.read_text(encoding="utf-8")
+            assert not stale_ai_runtime_imports.search(text), path.relative_to(repo_root)

@@ -7,7 +7,7 @@ class UserCredentialsManager {
     constructor() {
         this.STORAGE_KEY = 'aurvek_user_api_keys';
         this.storageMode = 'session'; // 'session' | 'persistent' | 'server'
-        this.providers = ['openai', 'anthropic', 'google', 'xai', 'elevenlabs'];
+        this.providers = ['openai', 'anthropic', 'google', 'xai', 'minimax', 'kimi', 'elevenlabs'];
         this.init();
     }
 

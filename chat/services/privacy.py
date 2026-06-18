@@ -107,6 +107,7 @@ async def purge_conversation_local_records(
     *,
     conversation_id: int,
     user_id: int,
+    memory_link_providers_to_delete: set[str] | None = None,
 ) -> bool:
     """Delete local records for an incognito conversation after close."""
     await ensure_conversation_privacy_schema()
@@ -130,7 +131,12 @@ async def purge_conversation_local_records(
             await conn.commit()
             raise ValueError("Conversation is not incognito")
 
-        await delete_conversation_rows(conn, conversation_id=conversation_id, user_id=user_id)
+        await delete_conversation_rows(
+            conn,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            memory_link_providers_to_delete=memory_link_providers_to_delete,
+        )
         await conn.commit()
         return True
 
@@ -140,6 +146,7 @@ async def delete_conversation_rows(
     *,
     conversation_id: int,
     user_id: int | None = None,
+    memory_link_providers_to_delete: set[str] | None = None,
 ) -> None:
     """Delete local rows owned by one conversation, preserving caller transaction."""
     message_ids: list[int] = []
@@ -150,12 +157,57 @@ async def delete_conversation_rows(
     rows = await cursor.fetchall()
     message_ids = [int(row[0]) for row in rows]
 
-    if message_ids and await _table_exists(conn, "ATAGIA_MESSAGE_LINKS"):
+    delete_atagia_links = (
+        memory_link_providers_to_delete is None
+        or "atagia" in memory_link_providers_to_delete
+    )
+    if delete_atagia_links and message_ids and await _table_exists(conn, "ATAGIA_MESSAGE_LINKS"):
         placeholders = ",".join("?" for _ in message_ids)
         await conn.execute(
             f"DELETE FROM ATAGIA_MESSAGE_LINKS WHERE message_id IN ({placeholders})",
             message_ids,
         )
+    if message_ids and await _table_exists(conn, "MEMORY_PROVIDER_MESSAGE_LINKS"):
+        providers = memory_link_providers_to_delete
+        if providers is None:
+            placeholders = ",".join("?" for _ in message_ids)
+            await conn.execute(
+                f"DELETE FROM MEMORY_PROVIDER_MESSAGE_LINKS WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
+        else:
+            generic_providers = sorted(provider for provider in providers if provider != "atagia")
+            if generic_providers:
+                message_placeholders = ",".join("?" for _ in message_ids)
+                provider_placeholders = ",".join("?" for _ in generic_providers)
+                await conn.execute(
+                    f"""
+                    DELETE FROM MEMORY_PROVIDER_MESSAGE_LINKS
+                    WHERE message_id IN ({message_placeholders})
+                      AND provider IN ({provider_placeholders})
+                    """,
+                    [*message_ids, *generic_providers],
+                )
+
+    if await _table_exists(conn, "MEMORY_PROVIDER_CONVERSATION_LINKS"):
+        providers = memory_link_providers_to_delete
+        if providers is None:
+            await conn.execute(
+                "DELETE FROM MEMORY_PROVIDER_CONVERSATION_LINKS WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+        else:
+            provider_names = sorted(providers)
+            if provider_names:
+                provider_placeholders = ",".join("?" for _ in provider_names)
+                await conn.execute(
+                    f"""
+                    DELETE FROM MEMORY_PROVIDER_CONVERSATION_LINKS
+                    WHERE conversation_id = ?
+                      AND provider IN ({provider_placeholders})
+                    """,
+                    [conversation_id, *provider_names],
+                )
 
     try:
         from file_storage import delete_attachments_for_conversation

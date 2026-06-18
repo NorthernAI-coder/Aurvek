@@ -5,6 +5,8 @@ from ai_runtime.context.formatting import _format_messages_for_provider
 from ai_runtime.context.system import assemble_system_prompt, get_effective_blocks
 from ai_runtime.providers.claude import call_claude_api
 from ai_runtime.providers.gemini import call_gemini_api
+from ai_runtime.providers.kimi import call_kimi_api
+from ai_runtime.providers.minimax import call_minimax_api
 from ai_runtime.providers.openai_chat import call_o1_api
 from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
@@ -150,6 +152,10 @@ async def watchdog_takeover_response(
         api_func = call_xai_responses_api
     elif wd_machine == "OpenRouter":
         api_func = call_openrouter_api
+    elif wd_machine == "MiniMax":
+        api_func = call_minimax_api
+    elif wd_machine == "Kimi":
+        api_func = call_kimi_api
     else:
         logger.error("watchdog takeover: unknown machine %s", wd_machine)
         yield f"data: {orjson.dumps({'error': f'Unknown LLM provider: {wd_machine}'}).decode()}\n\n"
@@ -343,6 +349,10 @@ async def watchdog_takeover_response_requestfree(
         api_func = call_xai_responses_api
     elif wd_machine == "OpenRouter":
         api_func = call_openrouter_api
+    elif wd_machine == "MiniMax":
+        api_func = call_minimax_api
+    elif wd_machine == "Kimi":
+        api_func = call_kimi_api
     else:
         logger.error("watchdog takeover requestfree: unknown machine %s", wd_machine)
         yield f"data: {orjson.dumps({'error': f'Unknown LLM provider: {wd_machine}'}).decode()}\n\n"

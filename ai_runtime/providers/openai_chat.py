@@ -2,6 +2,7 @@ from ai_runtime.dependencies import *
 from ai_runtime.config import _is_gpt5_model, safe_log_headers, _log_truncated_response
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
+from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
 
 async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None,
                       input_token_fallback=None,
@@ -72,32 +73,44 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
 
                     else:
                         logger.error("[call_o1_api] - OpenAI (o1) response had no choices array")
-                        yield f"data: {orjson.dumps({'error': 'OpenAI (o1) returned an empty response. Please try again.'}).decode()}\n\n"
+                        empty_msg = "OpenAI (o1) returned an empty response. Please try again."
+                        await record_provider_error_for_label("OpenAI (o1)", message="empty response", model=model, byok=byok)
+                        yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                         error_yielded = True
                 else:
                     error_body = await response.text()
                     raw_log = f"[call_o1_api] - Error: Received status code {response.status}. Response body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "OpenAI (o1)")
+                    await record_provider_error_for_label(
+                        "OpenAI (o1)",
+                        message=human_msg,
+                        status_code=response.status,
+                        model=model,
+                        byok=byok,
+                    )
                     yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
         except asyncio.TimeoutError as exc:
             error_msg = f"[call_o1_api] - Request timed out for conversation {conversation_id}"
             logger.error(error_msg)
             human_msg = _human_exception_error(exc, "OpenAI (o1)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (o1)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
         except aiohttp.ClientError as exc:
             error_msg = f"[call_o1_api] - Connection error: {str(exc)}"
             logger.error(error_msg)
             human_msg = _human_exception_error(exc, "OpenAI (o1)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (o1)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
         except Exception as exc:
             error_msg = f"[call_o1_api] - Unexpected error: {str(exc)}"
             logger.error(error_msg)
             human_msg = _human_exception_error(exc, "OpenAI (o1)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("OpenAI (o1)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
     # Include reasoning_tokens in output_tokens and total_tokens
@@ -114,9 +127,12 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {user_id}. "
                                f"Provider: o1. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label("OpenAI (o1)", message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
+            await record_provider_success_for_label("OpenAI (o1)", model=model, byok=byok)
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
@@ -126,6 +142,14 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
 
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label("OpenAI (o1)", model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label("OpenAI (o1)", message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -135,6 +159,10 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                        pdf_error_metadata=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                        llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None,
+                       extra_body: dict | None = None,
+                       omit_temperature: bool = False,
+                       use_max_completion_tokens: bool = False,
+                       include_stream_usage: bool = True,
                        pending_attachment_refs: Optional[list[str]] = None):
     """
     Generic LLM API call function for OpenAI-compatible APIs.
@@ -163,25 +191,22 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
     if extra_headers:
         headers.update(extra_headers)
 
-    # GPT-5+ models require max_completion_tokens instead of max_tokens
-    # and don't support custom temperature values (only default 1.0)
-    if _is_gpt5_model(model):
-        data = {
-            "model": api_model or model,
-            "max_completion_tokens": max_tokens,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
+    data = {
+        "model": api_model or model,
+        "messages": messages,
+        "stream": True,
+    }
+    if _is_gpt5_model(model) or use_max_completion_tokens:
+        data["max_completion_tokens"] = max_tokens
     else:
-        data = {
-            "model": api_model or model,
-            "max_tokens": max_tokens,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
+        data["max_tokens"] = max_tokens
+    # GPT-5+ and a few OpenAI-compatible providers reject custom temperature.
+    if not _is_gpt5_model(model) and not omit_temperature:
+        data["temperature"] = temperature
+    if include_stream_usage:
+        data["stream_options"] = {"include_usage": True}
+    if extra_body:
+        data.update(extra_body)
 
     # Shallow copy to avoid mutating the caller's list if server tools are appended later
     if tools:
@@ -192,6 +217,38 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
     tool_call_id = ""  # For tracking tool_calls
     input_tokens = output_tokens = total_tokens = 0
     truncated = False
+    thinking_open = False
+    reasoning_content_for_message = ""
+    reasoning_detail_buffers: dict[str, str] = {}
+
+    def _reasoning_chunks_from_delta(delta: dict) -> list[str]:
+        chunks = []
+        reasoning_details = delta.get("reasoning_details")
+        if isinstance(reasoning_details, list):
+            for index, detail in enumerate(reasoning_details):
+                if not isinstance(detail, dict):
+                    continue
+                text = detail.get("text") or detail.get("content")
+                if not text:
+                    continue
+                text = str(text)
+                key = str(detail.get("index", index))
+                previous = reasoning_detail_buffers.get(key, "")
+                if previous and text.startswith(previous):
+                    new_text = text[len(previous):]
+                elif text == previous:
+                    new_text = ""
+                else:
+                    new_text = text
+                reasoning_detail_buffers[key] = text
+                if new_text:
+                    chunks.append(new_text)
+            return chunks
+
+        reasoning_content = delta.get("reasoning_content")
+        if reasoning_content:
+            chunks.append(str(reasoning_content))
+        return chunks
 
     logger.debug(f"call_llm_api -> messages: {messages}")
 
@@ -244,6 +301,13 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                                                     if 'delta' in choice and choice['delta'] is not None:
                                                         delta = choice['delta']
 
+                                                        for reasoning_chunk in _reasoning_chunks_from_delta(delta):
+                                                            reasoning_content_for_message += reasoning_chunk
+                                                            if not thinking_open:
+                                                                thinking_open = True
+                                                                yield f"data: {orjson.dumps({'type': 'thinking_start'}).decode()}\n\n"
+                                                            yield f"data: {orjson.dumps({'thinking': reasoning_chunk, 'type': 'thinking'}).decode()}\n\n"
+
                                                         # Handle tool_calls (new OpenAI format)
                                                         if 'tool_calls' in delta:
                                                             for tc in delta['tool_calls']:
@@ -268,9 +332,12 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                                                                     function_arguments += function_chunk['arguments']
 
                                                         # Handle content
-                                                        elif 'content' in delta:
+                                                        if 'content' in delta:
                                                             content_chunk = delta['content']
                                                             if content_chunk is not None:
+                                                                if thinking_open:
+                                                                    thinking_open = False
+                                                                    yield f"data: {orjson.dumps({'type': 'thinking_end'}).decode()}\n\n"
                                                                 content += content_chunk
                                                                 yield f"data: {orjson.dumps({'content': content_chunk}).decode()}\n\n"
 
@@ -310,6 +377,13 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                     raw_log = f"[call_llm_api] - Error: Received status code {response.status}. Response body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, provider_label)
+                    await record_provider_error_for_label(
+                        provider_label,
+                        message=human_msg,
+                        status_code=response.status,
+                        model=model,
+                        byok=byok,
+                    )
                     yield f"data: {orjson.dumps(_provider_error_payload(provider_label, human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
@@ -328,22 +402,28 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
             error_message = f"[call_llm_api] - Request timed out after {timeout_seconds} seconds for model {model}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, provider_label)
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label(provider_label, message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload(provider_label, human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except aiohttp.ClientError as exc:
             error_message = f"[call_llm_api] - Network error occurred: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, provider_label)
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label(provider_label, message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload(provider_label, human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except Exception as exc:
             error_message = f"[call_llm_api] - Unexpected error: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, provider_label)
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label(provider_label, message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload(provider_label, human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
+
+    if thinking_open:
+        yield f"data: {orjson.dumps({'type': 'thinking_end'}).decode()}\n\n"
 
     # If a tool call was detected, emit it and return without saving to DB
     # The caller (get_ai_response) will handle the tool call and save the result
@@ -359,7 +439,11 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
         logger.info(f"[call_llm_api] - Tool call detected: {function_name}")
         logger.debug(f"[call_llm_api] - Tool call args: {parsed_args}")
 
-        yield f"data: {orjson.dumps({'tool_call': {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}}).decode()}\n\n"
+        await record_provider_success_for_label(provider_label, model=model, byok=byok)
+        tool_call_payload = {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}
+        if reasoning_content_for_message:
+            tool_call_payload["reasoning_content"] = reasoning_content_for_message
+        yield f"data: {orjson.dumps({'tool_call': tool_call_payload}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return  # Don't save to DB - handler will do it
 
@@ -373,9 +457,12 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {current_user.id}. "
                                f"Provider: llm_api. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label(provider_label, message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload(provider_label, empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
+            await record_provider_success_for_label(provider_label, model=model, byok=byok)
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
@@ -385,6 +472,14 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
 
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label(provider_label, model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label(provider_label, message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload(provider_label, empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"
 

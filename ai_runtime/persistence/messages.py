@@ -1,10 +1,5 @@
 from ai_runtime.dependencies import *
-from ai_runtime.atagia.recording import (
-    _aurvek_atagia_message_id,
-    _link_atagia_message_best_effort,
-    _record_atagia_assistant_response,
-)
-from ai_runtime.atagia.state import _current_atagia_user_message_id
+from ai_runtime.memory.recording import _record_memory_turn_best_effort
 from ai_runtime.config import model_token_cost_cache
 from ai_runtime.multi_ai.errors import MultiAiBillingError
 
@@ -154,15 +149,6 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
 
                     await conn.commit()
 
-                    if user_message_id is not None:
-                        await _link_atagia_message_best_effort(
-                            message_id=user_message_id,
-                            atagia_message_id=_current_atagia_user_message_id.get(),
-                            conversation_id=conversation_id,
-                            user_id=user_id,
-                            role="user",
-                        )
-
                     # --- Hint consumption: post-commit, best-effort, fail-open ---
                     if watchdog_hint_active and watchdog_hint_eval_id is not None:
                         try:
@@ -192,23 +178,17 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                             )
 
                     if message_id is not None:
-                        atagia_recorded = await _record_atagia_assistant_response(
+                        await _record_memory_turn_best_effort(
                             user_id=user_id,
                             conversation_id=conversation_id,
-                            content=content,
+                            user_content=user_message,
+                            assistant_content=content,
                             prompt_id=prompt_id,
-                            message_id=message_id,
-                            source_seq=message_id,
+                            user_message_id=user_message_id,
+                            assistant_message_id=message_id,
+                            occurred_at=current_time,
                             incognito=conversation_incognito,
                         )
-                        if atagia_recorded:
-                            await _link_atagia_message_best_effort(
-                                message_id=message_id,
-                                atagia_message_id=_aurvek_atagia_message_id(message_id),
-                                conversation_id=conversation_id,
-                                user_id=user_id,
-                                role="assistant",
-                            )
 
                     try:
                         await record_chat_turn(
@@ -373,15 +353,6 @@ async def save_multi_ai_to_db(
 
                     await conn.commit()
 
-                    if user_msg_id is not None:
-                        await _link_atagia_message_best_effort(
-                            message_id=user_msg_id,
-                            atagia_message_id=_current_atagia_user_message_id.get(),
-                            conversation_id=conversation_id,
-                            user_id=user_id,
-                            role="user",
-                        )
-
                     # Keep watchdog state transitions aligned with single-model save flow.
                     if watchdog_hint_active and watchdog_hint_eval_id is not None:
                         try:
@@ -414,23 +385,17 @@ async def save_multi_ai_to_db(
                             )
 
                     if bot_msg_id is not None:
-                        atagia_recorded = await _record_atagia_assistant_response(
+                        await _record_memory_turn_best_effort(
                             user_id=user_id,
                             conversation_id=conversation_id,
-                            content=combined_json,
+                            user_content=user_message,
+                            assistant_content=combined_json,
                             prompt_id=prompt_id,
-                            message_id=bot_msg_id,
-                            source_seq=bot_msg_id,
+                            user_message_id=user_msg_id,
+                            assistant_message_id=bot_msg_id,
+                            occurred_at=current_time,
                             incognito=incognito,
                         )
-                        if atagia_recorded:
-                            await _link_atagia_message_best_effort(
-                                message_id=bot_msg_id,
-                                atagia_message_id=_aurvek_atagia_message_id(bot_msg_id),
-                                conversation_id=conversation_id,
-                                user_id=user_id,
-                                role="assistant",
-                            )
 
                     try:
                         await record_chat_turn(

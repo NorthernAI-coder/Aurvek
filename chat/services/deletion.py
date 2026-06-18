@@ -17,29 +17,100 @@ from chat.services.privacy import (
 )
 
 
-async def purge_atagia_conversation_best_effort(
+async def memory_link_providers_for_conversation(conversation_id: int) -> set[str]:
+    providers: set[str] = set()
+    async with get_db_connection(readonly=True) as conn:
+        if await _table_exists(conn, "ATAGIA_MESSAGE_LINKS"):
+            cursor = await conn.execute(
+                "SELECT 1 FROM ATAGIA_MESSAGE_LINKS WHERE conversation_id = ? LIMIT 1",
+                (conversation_id,),
+            )
+            if await cursor.fetchone():
+                providers.add("atagia")
+        if await _table_exists(conn, "MEMORY_PROVIDER_MESSAGE_LINKS"):
+            cursor = await conn.execute(
+                """
+                SELECT DISTINCT provider
+                FROM MEMORY_PROVIDER_MESSAGE_LINKS
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            )
+            providers.update(str(row[0]) for row in await cursor.fetchall() if row[0])
+        if await _table_exists(conn, "MEMORY_PROVIDER_CONVERSATION_LINKS"):
+            cursor = await conn.execute(
+                """
+                SELECT DISTINCT provider
+                FROM MEMORY_PROVIDER_CONVERSATION_LINKS
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            )
+            providers.update(str(row[0]) for row in await cursor.fetchall() if row[0])
+    return providers
+
+
+async def _table_exists(conn: aiosqlite.Connection, table_name: str) -> bool:
+    cursor = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    )
+    return await cursor.fetchone() is not None
+
+
+async def purge_memory_conversation_best_effort(
     *,
     user_id: int,
     conversation_id: int,
     prompt_id: int | None = None,
     incognito: bool = False,
+    provider: str | None = None,
 ) -> bool:
     try:
-        from atagia_bridge import get_atagia_bridge
+        from ai_runtime.memory.recording import _purge_memory_conversation_best_effort
 
-        return await get_atagia_bridge().purge_conversation(
+        return await _purge_memory_conversation_best_effort(
             user_id=user_id,
             conversation_id=conversation_id,
             prompt_id=prompt_id,
             incognito=incognito,
+            provider=provider,
         )
     except Exception:
         logger.warning(
-            "Failed to purge Atagia conversation data for conversation_id=%s",
+            "Failed to purge memory provider data for conversation_id=%s",
             conversation_id,
             exc_info=True,
         )
         return False
+
+
+async def purge_linked_memory_providers_best_effort(
+    *,
+    user_id: int,
+    conversation_id: int,
+    prompt_id: int | None = None,
+    incognito: bool = False,
+) -> set[str]:
+    providers = await memory_link_providers_for_conversation(conversation_id)
+    if not providers:
+        from memory.config import get_active_memory_provider
+
+        active_provider = await get_active_memory_provider()
+        if active_provider != "none":
+            providers.add(active_provider)
+
+    purged: set[str] = set()
+    for provider in sorted(providers):
+        if await purge_memory_conversation_best_effort(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            prompt_id=prompt_id,
+            incognito=incognito,
+            provider=provider,
+        ):
+            purged.add(provider)
+    return purged
 
 
 async def delete_conversation_files_for_user(
@@ -92,7 +163,7 @@ async def purge_stale_incognito_conversations_for_user(current_user: User) -> No
 
     for row in rows:
         conversation_id = int(row["id"])
-        await purge_atagia_conversation_best_effort(
+        purged_memory_providers = await purge_linked_memory_providers_best_effort(
             user_id=current_user.id,
             conversation_id=conversation_id,
             prompt_id=row["role_id"],
@@ -102,6 +173,7 @@ async def purge_stale_incognito_conversations_for_user(current_user: User) -> No
             purged = await purge_conversation_local_records(
                 conversation_id=conversation_id,
                 user_id=current_user.id,
+                memory_link_providers_to_delete=purged_memory_providers,
             )
             if purged:
                 await delete_conversation_files_for_user(current_user, conversation_id)
@@ -137,31 +209,35 @@ async def delete_owned_conversation(current_user: User, conversation_id: int) ->
 
         prompt_id = result[1]
         is_incognito = bool(result[2])
-        atagia_purged = False
-        if is_incognito:
-            atagia_purged = await purge_atagia_conversation_best_effort(
-                user_id=current_user.id,
-                conversation_id=conversation_id,
-                prompt_id=prompt_id,
-                incognito=True,
-            )
+        purged_memory_providers = await purge_linked_memory_providers_best_effort(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            prompt_id=prompt_id,
+            incognito=is_incognito,
+        )
 
         await delete_conversation_rows(
             conn,
             conversation_id=conversation_id,
             user_id=current_user.id,
+            memory_link_providers_to_delete=purged_memory_providers,
         )
         await conn.commit()
 
     await prune_unreferenced_blobs()
     await delete_conversation_files_for_user(current_user, conversation_id)
-    return {"success": True, "atagia_purged": atagia_purged}
+    return {
+        "success": True,
+        "atagia_purged": "atagia" in purged_memory_providers,
+        "memory_purged": bool(purged_memory_providers),
+        "memory_purged_providers": sorted(purged_memory_providers),
+    }
 
 
 async def close_incognito_conversation_for_user(current_user: User, privacy: dict) -> dict:
     conversation_id = int(privacy["id"])
     async with conversation_write_lock(conversation_id):
-        atagia_purged = await purge_atagia_conversation_best_effort(
+        purged_memory_providers = await purge_linked_memory_providers_best_effort(
             user_id=current_user.id,
             conversation_id=conversation_id,
             prompt_id=privacy.get("role_id"),
@@ -170,6 +246,7 @@ async def close_incognito_conversation_for_user(current_user: User, privacy: dic
         purged = await purge_conversation_local_records(
             conversation_id=conversation_id,
             user_id=current_user.id,
+            memory_link_providers_to_delete=purged_memory_providers,
         )
 
     if purged:
@@ -179,7 +256,9 @@ async def close_incognito_conversation_for_user(current_user: User, privacy: dic
     return {
         "success": True,
         "purged": bool(purged),
-        "atagia_purged": bool(atagia_purged),
+        "atagia_purged": "atagia" in purged_memory_providers,
+        "memory_purged": bool(purged_memory_providers),
+        "memory_purged_providers": sorted(purged_memory_providers),
     }
 
 
@@ -187,11 +266,28 @@ async def delete_conversation_recursively(conversation_id):
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
         await ensure_conversation_privacy_schema(conn)
-        await cursor.execute("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
+        await cursor.execute(
+            """
+            SELECT user_id, role_id, COALESCE(is_incognito, 0) AS is_incognito
+            FROM conversations
+            WHERE id = ?
+            """,
+            (conversation_id,),
+        )
         result = await cursor.fetchone()
         if result:
             user_id = result[0]
-            await delete_conversation_rows(conn, conversation_id=conversation_id)
+            purged_memory_providers = await purge_linked_memory_providers_best_effort(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                prompt_id=result[1],
+                incognito=bool(result[2]),
+            )
+            await delete_conversation_rows(
+                conn,
+                conversation_id=conversation_id,
+                memory_link_providers_to_delete=purged_memory_providers,
+            )
             await conn.commit()
             await prune_unreferenced_blobs()
             return user_id

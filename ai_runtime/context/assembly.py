@@ -1,5 +1,5 @@
 from ai_runtime.dependencies import *
-from ai_runtime.atagia.context import _context_messages_for_provider, _resolve_atagia_context
+from ai_runtime.memory.context import _context_messages_for_memory_provider, _resolve_memory_context
 from ai_runtime.context.formatting import flatten_multi_ai_context, parse_stored_message
 from ai_runtime.context.system import assemble_system_prompt, get_effective_blocks
 from ai_runtime.watchdog.prompting import _build_escalated_hint_block, _sanitize_watchdog_directive
@@ -560,22 +560,25 @@ async def build_full_prompt_context(
             full_prompt = assemble_system_prompt(
                 blocks, variables, prompt_base, watchdog_enabled, watchdog_hint_block
             )
-            atagia_decision = await _resolve_atagia_context(
+            memory_decision = await _resolve_memory_context(
                 full_prompt,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 message=user_message,
                 prompt_id=effective_role_id,
             )
-            full_prompt = atagia_decision.full_prompt
-            context_messages = _context_messages_for_provider(
+            full_prompt = memory_decision.full_prompt
+            context_messages = _context_messages_for_memory_provider(
                 context_messages,
-                atagia_decision,
+                memory_decision,
             )
 
     result["full_prompt"] = full_prompt
-    result["atagia_context_active"] = atagia_decision.active
-    result["atagia_context_reason"] = atagia_decision.reason
+    result["atagia_context_active"] = memory_decision.active and memory_decision.provider == "atagia"
+    result["atagia_context_reason"] = memory_decision.reason
+    result["memory_context_active"] = memory_decision.active
+    result["memory_context_reason"] = memory_decision.reason
+    result["memory_provider"] = memory_decision.provider
     result["watchdog_config"] = watchdog_config
     result["watchdog_hint_active"] = watchdog_hint_active
     result["watchdog_hint_eval_id"] = watchdog_hint_eval_id

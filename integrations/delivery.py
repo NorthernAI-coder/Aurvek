@@ -99,6 +99,30 @@ async def deliver_to_platform(platform: str, ctx: dict, text: str):
 async def send_platform_error(platform: str, ctx: dict, error_msg: str):
     """Best-effort error delivery to an external channel."""
     try:
+        try:
+            from ai_runtime.provider_health import append_external_error_note, provider_from_machine
+            from database import get_db_connection
+
+            conversation_id = ctx.get("conversation_id")
+            if conversation_id:
+                async with get_db_connection(readonly=True) as conn:
+                    cursor = await conn.execute(
+                        """
+                        SELECT l.machine, l.model
+                        FROM CONVERSATIONS c
+                        LEFT JOIN LLM l ON c.llm_id = l.id
+                        WHERE c.id = ?
+                        """,
+                        (conversation_id,),
+                    )
+                    row = await cursor.fetchone()
+                if row:
+                    error_msg = append_external_error_note(
+                        error_msg,
+                        provider_from_machine(row["machine"], row["model"]),
+                    )
+        except Exception as note_exc:
+            logger.warning("send_platform_error: provider-health note skipped: %s", note_exc)
         await deliver_to_platform(platform, ctx, error_msg)
     except Exception as exc:
         logger.warning(

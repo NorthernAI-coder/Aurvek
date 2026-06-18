@@ -282,6 +282,24 @@
         border-radius: 8px;
         background: var(--bg-tertiary);
     }
+    .memory-health-alert {
+        display: none;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        border-radius: 8px;
+        background: rgba(245, 158, 11, 0.12);
+        color: var(--text-primary);
+    }
+    .memory-health-alert.visible {
+        display: flex;
+    }
+    .memory-health-alert i {
+        margin-top: 2px;
+        color: #f59e0b;
+    }
     .memory-settings-row {
         display: flex;
         align-items: center;
@@ -781,10 +799,16 @@
             </div>
 
             <div class="memory-settings-card">
+                <div class="memory-health-alert" id="memoryHealthAlert">
+                    <i class="fas fa-triangle-exclamation"></i>
+                    <div id="memoryHealthAlertText"></div>
+                </div>
+
                 <div class="memory-settings-row">
                     <div class="memory-settings-copy">
                         <h5>Cross-chat memory</h5>
-                        <p>Allow Atagia to use memories from your other chats when building context for a normal conversation.</p>
+                        <p>Allow the active memory provider to use durable memories when building context for normal conversations.</p>
+                        <small id="memoryProviderStatus" class="text-muted d-block">Provider: loading...</small>
                         <small id="memoryPrefsStatus" class="text-muted">Loading memory settings...</small>
                     </div>
                     <div class="form-check form-switch memory-settings-switch">
@@ -794,6 +818,29 @@
                 </div>
 
                 <div class="memory-privacy-mode">
+                    <div class="memory-privacy-title">
+                        Memory scope
+                        <i class="fas fa-circle-question ms-1" title="Global is best for general work and stable preferences. By prompt/persona is best for roleplay, specialized assistants, and avoiding memory bleed between prompts."></i>
+                    </div>
+                    <div class="memory-mode-options">
+                        <label class="memory-mode-option" for="memoryScopeGlobal">
+                            <input type="radio" name="memoryScope" id="memoryScopeGlobal" value="global">
+                            <div>
+                                <strong>Global by user</strong>
+                                <span>Share memories across prompts for general work, projects, and personal assistant continuity.</span>
+                            </div>
+                        </label>
+                        <label class="memory-mode-option" for="memoryScopePrompt">
+                            <input type="radio" name="memoryScope" id="memoryScopePrompt" value="prompt" checked>
+                            <div>
+                                <strong>By prompt/persona</strong>
+                                <span>Isolate memories for roleplay, characters, specialized agents, and marketplace prompts.</span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="memory-privacy-mode" id="memoryPrivacySection">
                     <div class="memory-privacy-title">Privacy mode</div>
                     <div class="memory-mode-options">
                         <label class="memory-mode-option" for="memoryPrivacyBalanced">
@@ -1117,6 +1164,44 @@
                     <a href="https://console.x.ai/" target="_blank" class="provider-link" title="Get API Key"><i class="fas fa-external-link-alt"></i></a>
                 </div>
 
+                <!-- MiniMax -->
+                <div class="api-key-row">
+                    <div class="provider-icon" style="background: linear-gradient(135deg, #0f766e, #115e59);">M</div>
+                    <div class="provider-info">
+                        <div class="provider-name">MiniMax</div>
+                        <div class="provider-desc">MiniMax-M3</div>
+                    </div>
+                    <div class="api-key-input-group">
+                        <input type="password" class="form-control" id="key-minimax" placeholder="sk-..." autocomplete="off">
+                        <button type="button" class="btn btn-outline-secondary btn-sm toggle-visibility" data-target="key-minimax" title="Toggle visibility">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                    </div>
+                    <span class="status-indicator" id="status-minimax"></span>
+                    <button type="button" class="btn btn-outline-primary btn-sm test-btn" data-provider="minimax">Test</button>
+                    <button type="button" class="btn btn-outline-danger btn-sm clear-btn" data-provider="minimax" title="Clear"><i class="fas fa-times"></i></button>
+                    <a href="https://platform.minimax.io/" target="_blank" class="provider-link" title="Get API Key"><i class="fas fa-external-link-alt"></i></a>
+                </div>
+
+                <!-- Kimi -->
+                <div class="api-key-row">
+                    <div class="provider-icon" style="background: linear-gradient(135deg, #4f46e5, #3730a3);">K</div>
+                    <div class="provider-info">
+                        <div class="provider-name">Kimi</div>
+                        <div class="provider-desc">Kimi K2.7 Code</div>
+                    </div>
+                    <div class="api-key-input-group">
+                        <input type="password" class="form-control" id="key-kimi" placeholder="sk-..." autocomplete="off">
+                        <button type="button" class="btn btn-outline-secondary btn-sm toggle-visibility" data-target="key-kimi" title="Toggle visibility">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                    </div>
+                    <span class="status-indicator" id="status-kimi"></span>
+                    <button type="button" class="btn btn-outline-primary btn-sm test-btn" data-provider="kimi">Test</button>
+                    <button type="button" class="btn btn-outline-danger btn-sm clear-btn" data-provider="kimi" title="Clear"><i class="fas fa-times"></i></button>
+                    <a href="https://platform.kimi.ai/" target="_blank" class="provider-link" title="Get API Key"><i class="fas fa-external-link-alt"></i></a>
+                </div>
+
                 <!-- ElevenLabs -->
                 <div class="api-key-row">
                     <div class="provider-icon" style="background: linear-gradient(135deg, #6a4fc9, #5235a8);">E</div>
@@ -1338,17 +1423,40 @@
     (async function initMemorySettings() {
         const toggle = document.getElementById('memoryCrossChatToggle');
         const status = document.getElementById('memoryPrefsStatus');
+        const providerStatus = document.getElementById('memoryProviderStatus');
+        const healthAlert = document.getElementById('memoryHealthAlert');
+        const healthAlertText = document.getElementById('memoryHealthAlertText');
+        const privacySection = document.getElementById('memoryPrivacySection');
         const privacyInputs = Array.from(document.querySelectorAll('input[name="memoryPrivacyMode"]'));
+        const scopeInputs = Array.from(document.querySelectorAll('input[name="memoryScope"]'));
         if (!toggle || !status) return;
+
+        let activeProvider = 'none';
 
         const setStatus = (text, muted = true) => {
             status.textContent = text;
             status.classList.toggle('text-muted', muted);
             status.classList.toggle('text-danger', !muted);
         };
+        const setMemoryHealth = (health) => {
+            const shouldShow = Boolean(
+                health &&
+                health.enabled !== false &&
+                health.should_surface !== false &&
+                ['suspected', 'degraded', 'unavailable'].includes(health.status)
+            );
+            if (!healthAlert || !healthAlertText || !shouldShow) {
+                if (healthAlert) healthAlert.classList.remove('visible');
+                if (healthAlertText) healthAlertText.textContent = '';
+                return;
+            }
+            healthAlertText.textContent = health.message || 'Memory is temporarily degraded. Replies may not use saved long-term memory.';
+            healthAlert.classList.add('visible');
+        };
         const setControlsDisabled = (disabled) => {
             toggle.disabled = disabled;
             privacyInputs.forEach(input => { input.disabled = disabled; });
+            scopeInputs.forEach(input => { input.disabled = disabled; });
         };
         const setPrivacyMode = (mode) => {
             const normalized = mode === 'trusted_private' ? 'trusted_private' : 'balanced';
@@ -1356,17 +1464,32 @@
                 input.checked = input.value === normalized;
             });
         };
+        const setScope = (scope) => {
+            const normalized = scope === 'global' ? 'global' : 'prompt';
+            scopeInputs.forEach(input => {
+                input.checked = input.value === normalized;
+            });
+        };
+        const setProvider = (provider) => {
+            activeProvider = provider || 'none';
+            const labels = { none: 'Disabled', atagia: 'Atagia', mem0: 'Mem0 OSS local' };
+            if (providerStatus) providerStatus.textContent = `Provider: ${labels[activeProvider] || activeProvider}`;
+            if (privacySection) privacySection.style.display = activeProvider === 'atagia' ? '' : 'none';
+        };
 
         try {
             const response = await fetch('/api/user/memory-preferences');
             const data = await response.json();
+            setProvider(data.provider);
             toggle.checked = data.remember_across_chats !== false;
             setPrivacyMode(data.memory_privacy_mode);
+            setScope(data.memory_scope);
+            setMemoryHealth(data.memory_health);
             setControlsDisabled(data.available === false);
             setStatus(
                 data.available === false
-                    ? (data.message || 'Atagia memory is not available right now.')
-                    : 'Saved in Atagia.',
+                    ? (data.message || 'Memory is not available right now.')
+                    : `Saved for ${activeProvider === 'mem0' ? 'Mem0' : 'Atagia'}.`,
                 data.available !== false
             );
         } catch (error) {
@@ -1386,11 +1509,15 @@
                 });
                 const data = await response.json();
                 if (!response.ok || data.available === false) {
-                    throw new Error(data.message || 'Atagia memory is not available.');
+                    setMemoryHealth(data.memory_health);
+                    throw new Error(data.message || 'Memory is not available.');
                 }
+                setProvider(data.provider);
                 toggle.checked = data.remember_across_chats !== false;
                 setPrivacyMode(data.memory_privacy_mode);
-                setStatus('Saved in Atagia.', true);
+                setScope(data.memory_scope);
+                setMemoryHealth(data.memory_health);
+                setStatus(`Saved for ${activeProvider === 'mem0' ? 'Mem0' : 'Atagia'}.`, true);
             } catch (error) {
                 console.error('Failed to save memory preferences', error);
                 restore();
@@ -1410,11 +1537,22 @@
 
         privacyInputs.forEach(input => {
             input.addEventListener('change', function() {
-                if (!this.checked) return;
+                if (!this.checked || activeProvider !== 'atagia') return;
                 const previous = this.value === 'trusted_private' ? 'balanced' : 'trusted_private';
                 savePreferences(
                     { memory_privacy_mode: this.value },
                     () => setPrivacyMode(previous)
+                );
+            });
+        });
+
+        scopeInputs.forEach(input => {
+            input.addEventListener('change', function() {
+                if (!this.checked) return;
+                const previous = this.value === 'global' ? 'prompt' : 'global';
+                savePreferences(
+                    { memory_scope: this.value },
+                    () => setScope(previous)
                 );
             });
         });

@@ -508,6 +508,20 @@
             </div>
         </div>
 
+        <div id="provider-health-banner" class="api-keys-banner provider-health-banner" style="display: none;">
+            <div class="api-keys-banner-content">
+                <i class="fas fa-triangle-exclamation"></i>
+                <span id="provider-health-banner-text"></span>
+            </div>
+        </div>
+
+        <div id="memory-health-banner" class="api-keys-banner memory-health-banner" style="display: none;">
+            <div class="api-keys-banner-content">
+                <i class="fas fa-brain"></i>
+                <span id="memory-health-banner-text"></span>
+            </div>
+        </div>
+
         <div class="message-input" id="message-input-container" {% if not can_send_messages %}data-disabled="true"{% endif %}>
             <form id="form-message" class="input-group" enctype="multipart/form-data">
                 <div class="input-container">

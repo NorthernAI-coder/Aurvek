@@ -3,6 +3,7 @@ from ai_runtime.config import _log_truncated_response
 from ai_runtime.errors import _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.tooling.citations import build_citation_event
+from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
 
 async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
                           input_token_fallback=None,
@@ -151,6 +152,7 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
 
     except Exception as e:
         logger.error(f"[call_gemini_api] - Error calling Gemini API: {e}")
+        await record_provider_error_for_label("Gemini", message=str(e), exception=e, model=model, byok=byok)
         yield f"data: {orjson.dumps(_provider_error_payload('Gemini', str(e), user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
         error_yielded = True
         return
@@ -159,6 +161,7 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
     if function_call_detected and save_to_db:
         logger.info(f"[call_gemini_api] - Tool call: {function_call_detected['name']}")
         logger.debug(f"[call_gemini_api] - Tool call args: {function_call_detected['arguments']}")
+        await record_provider_success_for_label("Gemini", model=model, byok=byok)
         yield f"data: {orjson.dumps({'tool_call': {'name': function_call_detected['name'], 'arguments': function_call_detected['arguments'], 'id': ''}}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return
@@ -172,10 +175,13 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {user_id}. "
                                f"Provider: gemini. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label("Gemini", message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload('Gemini', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
             try:
+                await record_provider_success_for_label("Gemini", model=model, byok=byok)
                 citations_data = orjson.dumps(citations).decode() if citations else None
                 user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
                                                                             input_token_fallback=input_token_fallback,
@@ -189,5 +195,13 @@ async def call_gemini_api(messages, model, temperature, max_tokens, prompt, conv
 
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label("Gemini", model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label("Gemini", message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload('Gemini', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"

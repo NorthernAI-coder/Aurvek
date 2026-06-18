@@ -1,9 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from auth import get_current_user
-from captcha_service import get_captcha_config
-from common import GOOGLE_CLIENT_ID, custom_unescape, templates
+from auth import get_current_user, unauthenticated_response
+from common import custom_unescape
 from database import get_db_connection
 from models import User
 
@@ -19,7 +18,7 @@ async def bookmark_message(
     current_user: User = Depends(get_current_user),
 ):
     if not current_user:
-        raise HTTPException(status_code=401, detail="User not authenticated")
+        return unauthenticated_response()
 
     data = await request.json()
     message_id = data.get("message_id")
@@ -48,14 +47,7 @@ async def get_bookmarked_messages(
     current_user: User = Depends(get_current_user),
 ):
     if current_user is None:
-        return templates.TemplateResponse(
-            "login.html",
-            {
-                "request": request,
-                "captcha": get_captcha_config(),
-                "google_oauth_available": bool(GOOGLE_CLIENT_ID),
-            },
-        )
+        return unauthenticated_response()
 
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()

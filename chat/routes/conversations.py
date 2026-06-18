@@ -3,11 +3,9 @@ from typing import Optional
 
 import orjson
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 
 from auth import get_current_user, unauthenticated_response
-from captcha_service import get_captcha_config
-from common import GOOGLE_CLIENT_ID, templates
 from database import get_db_connection
 from log_config import logger
 from models import User
@@ -60,14 +58,7 @@ async def get_conversations(
         return JSONResponse(content={"error": "before_activity and before_id must both be provided or both omitted"}, status_code=400)
 
     if current_user is None:
-        return templates.TemplateResponse(
-            "login.html",
-            {
-                "request": request,
-                "captcha": get_captcha_config(),
-                "google_oauth_available": bool(GOOGLE_CLIENT_ID),
-            },
-        )
+        return unauthenticated_response()
 
     if user_id is None:
         return JSONResponse(content={"error": "user_id is required"}, status_code=400)
@@ -189,7 +180,7 @@ async def start_new_conversation(
     current_user: User = Depends(get_current_user),
 ):
     if current_user is None:
-        return templates.TemplateResponse("login.html", {"request": request})
+        return unauthenticated_response()
 
     logger.info(
         "[NEW] CREATING NEW CONVERSATION - User: %s, folder_id: %s, prompt_id: %s, incognito: %s",

@@ -45,6 +45,8 @@ claude_key = os.getenv('ANTHROPIC_API_KEY')
 gemini_key = os.getenv('GEMINI_KEY')
 xai_key =  os.getenv('XAI_KEY')
 openrouter_key = os.getenv('OPENROUTER_API_KEY')
+minimax_key = os.getenv('MINIMAX_API_KEY')
+moonshot_key = os.getenv('MOONSHOT_API_KEY') or os.getenv('KIMI_API_KEY')
 
 # Security: cookie secure flag (requires HTTPS in production)
 SECURE_COOKIES = os.getenv("SECURE_COOKIES", "false").lower() == "true"
@@ -1261,7 +1263,7 @@ async def user_has_valid_api_keys(user_id: int, provider: str = None) -> bool:
 
     Args:
         user_id: The user's ID
-        provider: Optional specific provider to check (openai, anthropic, google, xai)
+        provider: Optional specific provider to check (openai, anthropic, google, xai, minimax, kimi)
 
     Returns:
         True if user has at least one API key configured (or specific provider if specified)
@@ -1304,7 +1306,7 @@ def resolve_api_key_for_provider(
     Args:
         user_api_keys: Dict of user's configured API keys
         api_key_mode: The user's api_key_mode setting
-        provider: The provider name (openai, anthropic, google, xai, openrouter)
+        provider: The provider name (openai, anthropic, google, xai, openrouter, minimax, kimi)
 
     Returns:
         Tuple of (api_key_to_use or None, should_use_system_key)
@@ -1319,7 +1321,10 @@ def resolve_api_key_for_provider(
         "Claude": "anthropic",
         "Gemini": "google",
         "xAI": "xai",
-        "OpenRouter": "openrouter"
+        "OpenRouter": "openrouter",
+        "MiniMax": "minimax",
+        "Kimi": "kimi",
+        "Moonshot": "kimi",
     }
 
     provider_key = provider_map.get(provider, provider.lower())
@@ -1860,7 +1865,7 @@ async def get_llm_info(llm_id: int) -> dict | None:
         cursor = await conn.execute(
             """
             SELECT id, machine, model, provider_key, provider_model_id,
-                   enabled, max_output_tokens,
+                   enabled, max_output_tokens, context_window_tokens, max_input_tokens,
                    COALESCE(input_token_cost, 0), COALESCE(output_token_cost, 0)
             FROM LLM
             WHERE id = ?
@@ -1878,8 +1883,10 @@ async def get_llm_info(llm_id: int) -> dict | None:
             "provider_model_id": row[4] if len(row) > 4 else None,
             "enabled": bool(row[5]) if len(row) > 5 else True,
             "max_output_tokens": int(row[6] or 0) if len(row) > 6 else 0,
-            "input_token_cost": float(row[7] or 0.0) if len(row) > 7 else 0.0,
-            "output_token_cost": float(row[8] or 0.0) if len(row) > 8 else 0.0,
+            "context_window_tokens": int(row[7] or 0) if len(row) > 7 else 0,
+            "max_input_tokens": int(row[8] or 0) if len(row) > 8 else 0,
+            "input_token_cost": float(row[9] or 0.0) if len(row) > 9 else 0.0,
+            "output_token_cost": float(row[10] or 0.0) if len(row) > 10 else 0.0,
         }
 
 

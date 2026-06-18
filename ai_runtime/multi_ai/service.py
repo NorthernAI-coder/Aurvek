@@ -5,21 +5,25 @@ from ai_runtime.attachments.pdf import (
     _messages_have_saved_pdfs,
     _pdf_upload_too_large_payload,
 )
-from ai_runtime.atagia.context import _context_messages_for_provider, _resolve_atagia_context
+from ai_runtime.memory.context import _context_messages_for_memory_provider, _resolve_memory_context
 from ai_runtime.billing import assert_billable_claude_system_key
 from ai_runtime.config import _model_output_cap
 from ai_runtime.context.formatting import _format_messages_for_provider, flatten_multi_ai_context, parse_stored_message
+from ai_runtime.context.history import apply_no_memory_context_budget
 from ai_runtime.context.system import assemble_system_prompt, get_effective_blocks
 from ai_runtime.context.warmup import _build_warmup_cache_key_from_state, _copy_warmup_context_messages
 from ai_runtime.multi_ai.errors import MultiAiBillingError
 from ai_runtime.persistence.messages import save_multi_ai_to_db
 from ai_runtime.providers.claude import call_claude_api
 from ai_runtime.providers.gemini import call_gemini_api
+from ai_runtime.providers.kimi import call_kimi_api
+from ai_runtime.providers.minimax import call_minimax_api
 from ai_runtime.providers.openai_chat import call_o1_api
 from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
 from ai_runtime.providers.xai import call_xai_responses_api
 from ai_runtime.watchdog.prompting import _build_escalated_hint_block, _sanitize_watchdog_directive
+from memory.health import get_user_memory_health_snapshot, should_surface_memory_health
 
 def build_multi_ai_message(results: dict, model_ids: list) -> str:
     """Build the JSON string for a Multi-AI bot message.
@@ -72,6 +76,7 @@ async def _run_single_ai(
     temperature: float = 0.7,
     input_token_fallback: int = 0,
     pdf_error_metadata: dict | None = None,
+    apply_no_memory_limit: bool = False,
 ):
     """Run a single AI model and put results into the shared queue.
 
@@ -88,6 +93,15 @@ async def _run_single_ai(
     content_collected = ""
 
     try:
+        if apply_no_memory_limit:
+            context_messages = await apply_no_memory_context_budget(
+                context_messages,
+                llm_id=llm_id,
+                prompt_id=prompt_id,
+                full_prompt=system_prompt,
+                current_message=user_message,
+            )
+
         if machine in ("GPT", "xAI") and _messages_have_saved_pdfs(context_messages):
             pdf_redirect_active = True
             provider_machine = "OpenRouter"
@@ -121,6 +135,10 @@ async def _run_single_ai(
             api_func = call_xai_responses_api
         elif provider_machine == "OpenRouter":
             api_func = call_openrouter_api
+        elif provider_machine == "MiniMax":
+            api_func = call_minimax_api
+        elif provider_machine == "Kimi":
+            api_func = call_kimi_api
         else:
             raise ValueError(f"Unknown machine type: {provider_machine}")
 
@@ -199,6 +217,9 @@ async def _run_single_ai(
                                 "pdf_too_large",
                                 "provider",
                                 "provider_message",
+                                "provider_health",
+                                "provider_status",
+                                "provider_health_message",
                                 "filename",
                                 "pages",
                                 "pdf_count",
@@ -585,7 +606,7 @@ async def process_multi_ai_message(
             yield f"data: {orjson.dumps({'error': 'Moderation check failed'}).decode()}\n\n"
             return
 
-    atagia_decision = await _resolve_atagia_context(
+    memory_decision = await _resolve_memory_context(
         system_prompt,
         user_id=current_user.id,
         conversation_id=conversation_id,
@@ -593,11 +614,21 @@ async def process_multi_ai_message(
         prompt_id=prompt_id,
         incognito=conversation_incognito,
     )
-    system_prompt = atagia_decision.full_prompt
-    context_messages_dicts = _context_messages_for_provider(
+    system_prompt = memory_decision.full_prompt
+    context_messages_dicts = _context_messages_for_memory_provider(
         context_messages_dicts,
-        atagia_decision,
+        memory_decision,
     )
+    memory_health = get_user_memory_health_snapshot(
+        memory_decision.provider,
+        enabled=(
+            memory_decision.provider != "none"
+            and memory_decision.reason != "disabled_by_user"
+        ),
+    )
+    if should_surface_memory_health(memory_health):
+        yield f"data: {orjson.dumps({'type': 'memory_health', 'memory_health': memory_health}).decode()}\n\n"
+    apply_no_memory_limit = memory_decision.provider == "none"
     context_pdf_error_metadata = _extract_pdf_metadata_from_context_messages(context_messages_dicts)
     context_pdf_pages = int((context_pdf_error_metadata or {}).get("pages") or 0)
     context_pdf_count = int((context_pdf_error_metadata or {}).get("pdf_count") or 0)
@@ -849,6 +880,7 @@ async def process_multi_ai_message(
                 temperature=0.7,
                 input_token_fallback=input_tokens_est_by_model.get(mid, input_tokens_est_base),
                 pdf_error_metadata=context_pdf_error_metadata,
+                apply_no_memory_limit=apply_no_memory_limit,
             )
         )
         tasks[mid] = task
@@ -893,6 +925,9 @@ async def process_multi_ai_message(
                             "pdf_too_large",
                             "provider",
                             "provider_message",
+                            "provider_health",
+                            "provider_status",
+                            "provider_health_message",
                             "filename",
                             "pages",
                             "pdf_count",
@@ -910,7 +945,16 @@ async def process_multi_ai_message(
                 results[item_llm_id]["content"] = item.get("error", "Unknown error")
                 results[item_llm_id]["error"] = True
                 done_count += 1
-                yield f"data: {orjson.dumps({'multi_ai_error': True, 'llm_id': item_llm_id, 'model': item['model'], 'error': item['error']}).decode()}\n\n"
+                error_payload = {
+                    "multi_ai_error": True,
+                    "llm_id": item_llm_id,
+                    "model": item["model"],
+                    "error": item["error"],
+                }
+                for key in ("provider_health", "provider", "provider_status", "provider_health_message"):
+                    if key in item:
+                        error_payload[key] = item[key]
+                yield f"data: {orjson.dumps(error_payload).decode()}\n\n"
 
     except (asyncio.CancelledError, Exception):
         stop_signals[conversation_id] = True

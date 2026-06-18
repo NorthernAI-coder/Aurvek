@@ -23,6 +23,7 @@ from database import get_db_connection
 from integrations.conversations import is_whatsapp_conversation
 from ai_runtime.messages import process_save_message
 from ai_runtime.multi_ai.service import process_multi_ai_message
+from ai_runtime.provider_health import provider_from_machine, touch_provider_activity
 from log_config import logger
 from models import User
 from save_images import generate_img_token
@@ -222,6 +223,7 @@ async def get_messages(
         "prompt_name": conv_row["prompt_name"],
         "machine": conv_row["machine"],
         "model": conv_row["model"],
+        "provider_health": touch_provider_activity(provider_from_machine(conv_row["machine"], conv_row["model"])),
         "bot_profile_picture": bot_profile_picture,
         "prompt_description": conv_row["prompt_description"],
         "is_paid": bool(conv_row["is_paid"]),
@@ -295,6 +297,45 @@ async def get_messages(
     })
 
 
+@router.get("/api/conversations/{conversation_id}/provider-health")
+async def get_conversation_provider_health(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+
+    async with get_db_connection(readonly=True) as conn:
+        is_user_admin = await current_user.is_admin
+        if is_user_admin:
+            cursor = await conn.execute(
+                """
+                SELECT l.machine, l.model
+                FROM CONVERSATIONS c
+                LEFT JOIN LLM l ON c.llm_id = l.id
+                WHERE c.id = ?
+                """,
+                (conversation_id,),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT l.machine, l.model
+                FROM CONVERSATIONS c
+                LEFT JOIN LLM l ON c.llm_id = l.id
+                WHERE c.id = ? AND c.user_id = ?
+                """,
+                (conversation_id, current_user.id),
+            )
+        row = await cursor.fetchone()
+
+    if not row:
+        return JSONResponse(content={"error": "Conversation not found or access denied"}, status_code=404)
+
+    provider = provider_from_machine(row["machine"], row["model"])
+    return JSONResponse(content={"provider_health": touch_provider_activity(provider)})
+
+
 @router.post("/api/conversations/{conversation_id}/messages")
 async def save_message(
     request: Request,
@@ -314,7 +355,7 @@ async def save_message(
 ):
     logger.info("enters in save_message (wrapper)")
     if current_user is None:
-        return JSONResponse(content={"redirect": "/login"}, status_code=401)
+        return unauthenticated_response()
 
     user_api_keys = None
     user_keys_header = request.headers.get("X-User-API-Keys")

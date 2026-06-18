@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
+import respx
 
+import atagia_bridge
 from atagia_bridge import AtagiaBridge, AtagiaBridgeConfig
 
 pytest.importorskip("atagia.integrations")
@@ -302,6 +305,30 @@ async def test_disabled_bridge_does_not_initialize_client() -> None:
     assert await bridge.ensure_user_and_conversation(129, 1892) is None
     assert await bridge.get_context_for_turn(129, 1892, "hello") is None
     assert await bridge.record_assistant_response(129, 1892, "response") is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_purge_conversation_treats_404_as_idempotent_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(atagia_bridge, "_atagia_path_segment", lambda value: value)
+    respx.post("http://127.0.0.1:8100/v1/conversations/aurvek:conv:missing/close").mock(
+        return_value=httpx.Response(404)
+    )
+
+    await atagia_bridge._http_purge_conversation(
+        AtagiaBridgeConfig(
+            enabled=True,
+            transport="http",
+            base_url="http://127.0.0.1:8100",
+            api_key="service-key",
+        ),
+        user_id="aurvek:user:7",
+        conversation_id="aurvek:conv:missing",
+        character_id=None,
+        incognito=False,
+    )
 
 
 @pytest.mark.asyncio

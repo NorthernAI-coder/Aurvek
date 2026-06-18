@@ -1,5 +1,72 @@
 import sqlite3
 import os
+import uuid
+
+
+def _default_mem0_platform_id():
+    value = os.getenv("MEM0_PLATFORM_ID") or os.getenv("AURVEK_INSTANCE_ID")
+    if value and value.strip():
+        return _sanitize_platform_id(value)
+    return "aurvek-%s" % uuid.uuid4().hex[:12]
+
+
+def _sanitize_platform_id(value):
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in str(value).strip())
+    safe = safe.strip("._-")
+    return (safe or "aurvek-local")[:64]
+
+
+def _clean(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _parse_bool(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _memory_defaults():
+    active_provider = (_clean(os.getenv("MEMORY_ACTIVE_PROVIDER")) or "").lower()
+    if active_provider not in {"none", "atagia", "mem0"}:
+        active_provider = "atagia" if _parse_bool(os.getenv("ATAGIA_ENABLED")) else "none"
+
+    default_scope = (_clean(os.getenv("MEMORY_DEFAULT_SCOPE")) or "prompt").lower()
+    if default_scope not in {"global", "prompt"}:
+        default_scope = "prompt"
+
+    try:
+        timeout = float(_clean(os.getenv("MEM0_TIMEOUT_SECONDS")) or "30.0")
+    except ValueError:
+        timeout = 30.0
+    if timeout <= 0:
+        timeout = 30.0
+
+    try:
+        top_k = int(_clean(os.getenv("MEM0_TOP_K")) or "8")
+    except ValueError:
+        top_k = 8
+    top_k = min(max(top_k, 1), 50)
+
+    try:
+        none_context_max_tokens = int(
+            _clean(os.getenv("MEMORY_NONE_CONTEXT_MAX_TOKENS")) or "128000"
+        )
+    except ValueError:
+        none_context_max_tokens = 128000
+    none_context_max_tokens = min(max(none_context_max_tokens, 0), 2_000_000)
+
+    return [
+        ("memory_active_provider", active_provider),
+        ("memory_default_scope", default_scope),
+        ("mem0_base_url", _clean(os.getenv("MEM0_BASE_URL")) or "http://127.0.0.1:8888"),
+        ("mem0_platform_id", _default_mem0_platform_id()),
+        ("mem0_timeout_seconds", str(timeout)),
+        ("mem0_top_k", str(top_k)),
+        ("memory_none_context_max_tokens", str(none_context_max_tokens)),
+        ("memory_none_context_exceptions", _clean(os.getenv("MEMORY_NONE_CONTEXT_EXCEPTIONS")) or "[]"),
+    ]
 
 def init_db():
     db_path = 'db/Aurvek.db'
@@ -46,6 +113,13 @@ def init_db():
                 ("gransabio_extra_allowed_ips", ""),
             ]
             for key, value in gransabio_defaults:
+                conn.execute(
+                    "INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+
+            # Seed generic memory provider defaults
+            for key, value in _memory_defaults():
                 conn.execute(
                     "INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES (?, ?)",
                     (key, value),

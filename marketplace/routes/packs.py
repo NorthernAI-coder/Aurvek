@@ -57,6 +57,11 @@ from marketplace.services.entitlements import (
     revoke_entitlement,
     user_has_pack_access as user_has_pack_entitlement_access,
 )
+from mobile.client import (
+    ios_purchase_blocked,
+    ios_purchase_disabled_response,
+    purchase_metadata_for_request,
+)
 from prompts import create_pack_directory, get_pack_path, get_pack_components_dir
 from marketplace.services.landing_registration import sanitize_landing_reg_config
 from ranking import maybe_trigger_recalculation
@@ -2844,7 +2849,14 @@ async def api_revoke_pack_access(user_id: int, pack_id: int, current_user: User 
 # ---------------------------------------------------------------------------
 
 @router.get("/api/explore/packs")
-async def api_explore_packs(search: str = "", page: int = 1, limit: int = 24, mine: int = 0, current_user: User = Depends(get_current_user)):
+async def api_explore_packs(
+    request: Request,
+    search: str = "",
+    page: int = 1,
+    limit: int = 24,
+    mine: int = 0,
+    current_user: User = Depends(get_current_user),
+):
     require_discovery_enabled()
 
     if page < 1:
@@ -2859,8 +2871,25 @@ async def api_explore_packs(search: str = "", page: int = 1, limit: int = 24, mi
     async with get_db_connection(readonly=True) as conn:
         packs, total = await get_public_packs(conn, search=search, page=page, limit=limit, user_id=user_id, mine_only=bool(mine))
 
+    pack_payloads = []
+    for pack in packs:
+        pack_data = dict(pack)
+        user_has_access = bool(pack_data.get("user_has_access"))
+        pack_payloads.append(
+            {
+                **pack_data,
+                "has_landing_page": bool(pack_data["has_custom_landing"]),
+                **purchase_metadata_for_request(
+                    request,
+                    is_paid=bool(pack_data.get("is_paid")),
+                    user_has_access=user_has_access,
+                    price=pack_data.get("price"),
+                ),
+            }
+        )
+
     return JSONResponse({
-        "packs": [{**dict(p), "has_landing_page": bool(p["has_custom_landing"])} for p in packs],
+        "packs": pack_payloads,
         "total": total,
         "page": page,
         "pages": (total + limit - 1) // limit if total > 0 else 1,
@@ -2954,6 +2983,9 @@ async def api_purchase_pack(pack_id: int, request: Request, current_user: User =
 
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if ios_purchase_blocked(request):
+        return ios_purchase_disabled_response()
 
     try:
         body = await request.json()

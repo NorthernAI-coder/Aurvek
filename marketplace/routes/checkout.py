@@ -35,6 +35,7 @@ from marketplace.services.entitlements import (
     grant_prompt_entitlement,
     user_has_prompt_access as user_has_prompt_entitlement_access,
 )
+from mobile.client import ios_purchase_blocked, ios_purchase_disabled_response
 from models import User
 from save_images import generate_img_token
 
@@ -114,6 +115,9 @@ async def api_purchase_prompt(prompt_id: int, request: Request, current_user: Us
 
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if ios_purchase_blocked(request):
+        return ios_purchase_disabled_response()
 
     try:
         body = await request.json()

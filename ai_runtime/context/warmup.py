@@ -1,5 +1,5 @@
 from ai_runtime.dependencies import *
-from ai_runtime.atagia.context import _warmup_atagia_sidecar
+from ai_runtime.memory.context import _warmup_memory_provider
 from ai_runtime.context.formatting import flatten_multi_ai_context, parse_stored_message
 from ai_runtime.context.system import assemble_system_prompt, get_effective_blocks
 from ai_runtime.watchdog.prompting import _build_escalated_hint_block, _sanitize_watchdog_directive
@@ -376,10 +376,10 @@ async def _build_chat_warmup_snapshot(
     ).strftime("%Y-%m-%d %H:%M:%S.%f")
     effective_prompt_id = state.get("effective_prompt_id")
 
-    context_messages, prompt_runtime, atagia_ready = await asyncio.gather(
+    context_messages, prompt_runtime, memory_sidecar = await asyncio.gather(
         _load_warmup_context_messages(conversation_id, start_date),
         _load_warmup_prompt_runtime_snapshot(conversation_id, current_user, effective_prompt_id),
-        _warmup_atagia_sidecar(
+        _warmup_memory_provider(
             current_user.id,
             conversation_id,
             prompt_id=effective_prompt_id,
@@ -414,9 +414,7 @@ async def _build_chat_warmup_snapshot(
         "last_message_id": state.get("last_message_id") or 0,
         "prompt_runtime": prompt_runtime,
         "memory_context": [],
-        "sidecars": {
-            "atagia_ready": atagia_ready,
-        },
+        "sidecars": memory_sidecar,
     }
 
 

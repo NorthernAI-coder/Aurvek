@@ -231,13 +231,13 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
     async def fake_prompt_runtime(conversation_id, current_user, effective_prompt_id):
         return {"full_prompt": "runtime prompt"}
 
-    async def fake_warmup_atagia(user_id, conversation_id, *, prompt_id=None, incognito=None):
+    async def fake_warmup_memory(user_id, conversation_id, *, prompt_id=None, incognito=None):
         warmup_calls.append((user_id, conversation_id, prompt_id, incognito))
-        return True
+        return {"provider": "atagia", "ready": True, "atagia_ready": True}
 
     monkeypatch.setattr(runtime_warmup, "_load_warmup_context_messages", fake_context_messages)
     monkeypatch.setattr(runtime_warmup, "_load_warmup_prompt_runtime_snapshot", fake_prompt_runtime)
-    monkeypatch.setattr(runtime_warmup, "_warmup_atagia_sidecar", fake_warmup_atagia)
+    monkeypatch.setattr(runtime_warmup, "_warmup_memory_provider", fake_warmup_memory)
 
     key = WarmupCacheKey(
         user_id=7,
@@ -265,4 +265,4 @@ async def test_warmup_snapshot_primes_atagia_conversation_without_draft_text(mon
 
     assert warmup_calls == [(7, 99, 2, False)]
     assert snapshot["context_messages"] == [{"message": "previous", "type": "user"}]
-    assert snapshot["sidecars"] == {"atagia_ready": True}
+    assert snapshot["sidecars"] == {"provider": "atagia", "ready": True, "atagia_ready": True}

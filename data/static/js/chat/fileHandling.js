@@ -1,7 +1,25 @@
 const MAX_PDF_SIZE_MB = 25;
 const MAX_IMAGE_SIZE_MB = 20;
 const MAX_TEXT_SIZE_MB = 2;
-const DEFAULT_ATTACHMENT_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024;
+
+// Upload resilience: adaptive chunk sizing, per-chunk retry, cheap resume.
+const UPLOAD_MIN_CHUNK = 256 * 1024;          // == server ATTACHMENT_UPLOAD_MIN_CHUNK_SIZE_BYTES
+const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;     // == server ATTACHMENT_UPLOAD_MAX_CHUNK_SIZE_BYTES
+const UPLOAD_TARGET_CHUNK_SECONDS = 4;
+const UPLOAD_CHUNK_RETRY_DELAYS_MS = [600, 1800, 4500, 9000]; // backoff before retries 1..4 (jitter added per attempt)
+const UPLOAD_CHUNK_MAX_ATTEMPTS = UPLOAD_CHUNK_RETRY_DELAYS_MS.length + 1; // 1 initial attempt + 4 retries
+const UPLOAD_TIMEOUT_FLOOR_MS = 60000;
+const UPLOAD_TIMEOUT_CAP_MS = 170000;         // < nginx client_body_timeout 180s
+const UPLOAD_TIMEOUT_MIN_BPS = 32 * 1024;     // 32 KB/s floor for the whole-request deadline
+const UPLOAD_MAX_FULL_RETRIES_BEFORE_SHRINK = 2;
+// Connection-scoped quality signal (intentionally global, shared across files):
+// a persistently failing upload biases later fresh uploads smaller until one
+// upload fully succeeds (which resets recentFailures). entry.failures is the
+// separate per-File counter that only governs when to drop the resume entry.
+const uploadProfile = { ewmaBytesPerSec: 0, recentFailures: 0 };
+const resumeRegistry = new WeakMap();         // File -> { uploadId, chunkSize, conversationId, failures }
+const uploadSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const TEXT_FILE_EXTENSIONS = new Set([
     '.txt', '.md', '.csv', '.json', '.xml', '.html', '.htm',
@@ -381,6 +399,43 @@ function createAttachmentUploadId() {
     return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
 }
 
+function recordChunkThroughput(bytes, seconds) {
+    if (!(bytes > 0) || !(seconds > 0)) return;
+    const sample = bytes / seconds;
+    const alpha = 0.3;
+    uploadProfile.ewmaBytesPerSec = uploadProfile.ewmaBytesPerSec > 0
+        ? (alpha * sample) + ((1 - alpha) * uploadProfile.ewmaBytesPerSec)
+        : sample;
+}
+
+function recordChunkFailure() {
+    uploadProfile.recentFailures = Math.min(uploadProfile.recentFailures + 1, 4);
+}
+
+function pickAdaptiveChunkSize() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (conn && (conn.saveData || conn.effectiveType === '2g' || conn.effectiveType === 'slow-2g')) {
+        return UPLOAD_MIN_CHUNK;
+    }
+    let base;
+    if (uploadProfile.ewmaBytesPerSec > 0) {
+        base = uploadProfile.ewmaBytesPerSec * UPLOAD_TARGET_CHUNK_SECONDS;
+    } else if (conn && conn.downlink > 0) {
+        base = (conn.downlink * 1_000_000 / 8) * UPLOAD_TARGET_CHUNK_SECONDS; // Mbps -> bytes/s
+    } else {
+        base = getAttachmentUploadChunkSize();
+    }
+    base /= 2 ** uploadProfile.recentFailures;
+    return Math.max(UPLOAD_MIN_CHUNK, Math.min(UPLOAD_MAX_CHUNK, Math.floor(base)));
+}
+
+function chunkTimeoutMs(chunkBytes) {
+    return Math.max(
+        UPLOAD_TIMEOUT_FLOOR_MS,
+        Math.min(UPLOAD_TIMEOUT_CAP_MS, (chunkBytes / UPLOAD_TIMEOUT_MIN_BPS) * 1000)
+    );
+}
+
 function updateAttachmentUploadStatus(rendered, progress, text) {
     if (!rendered) return;
     const clamped = Math.max(0, Math.min(100, Math.round(progress)));
@@ -527,7 +582,7 @@ function createAttachmentUploadEcho(file, targetConversationId = null, displayOp
     return { element: userMessageElement, progressWrap, progressFill, status };
 }
 
-function postAttachmentForm(url, formData, { signal, onProgress } = {}) {
+function postAttachmentForm(url, formData, { signal, onProgress, timeout } = {}) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         let abortedBySignal = false;
@@ -535,6 +590,9 @@ function postAttachmentForm(url, formData, { signal, onProgress } = {}) {
         xhr.open('POST', url, true);
         xhr.withCredentials = true;
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        if (Number.isFinite(timeout) && timeout > 0) {
+            xhr.timeout = timeout;
+        }
 
         const abortHandler = () => {
             abortedBySignal = true;
@@ -570,12 +628,21 @@ function postAttachmentForm(url, formData, { signal, onProgress } = {}) {
             const error = new Error(body?.message || body?.error || `Upload failed (${xhr.status})`);
             error.uploadFailed = true;
             error.status = xhr.status;
+            error.uploadRetryable = (xhr.status >= 500 || xhr.status === 408 || xhr.status === 429);
             reject(error);
         };
         xhr.onerror = () => {
             if (signal) signal.removeEventListener('abort', abortHandler);
             const error = new Error('Network error while uploading attachment');
             error.uploadFailed = true;
+            error.uploadRetryable = true;
+            reject(error);
+        };
+        xhr.ontimeout = () => {
+            if (signal) signal.removeEventListener('abort', abortHandler);
+            const error = new Error('Upload timed out');
+            error.uploadFailed = true;
+            error.uploadRetryable = true;
             reject(error);
         };
         xhr.onabort = () => {
@@ -606,20 +673,76 @@ async function discardUploadedAttachmentRefs(conversationId, attachmentRefs) {
     }
 }
 
-async function uploadSingleAttachment(file, conversationId, rendered, options = {}) {
-    const uploadId = createAttachmentUploadId();
-    const chunkSize = getAttachmentUploadChunkSize();
-    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
-    const contentType = getUploadContentType(file);
-
-    for (let index = 0; index < totalChunks; index++) {
-        if (conversationId !== null && typeof currentConversationId !== 'undefined' && currentConversationId !== conversationId) {
-            const error = new Error('Conversation changed while uploading attachment');
-            error.uploadFailed = true;
-            throw error;
+function queryUploadStatus(conversationId, uploadId, expectedChunkSize, signal) {
+    // Best-effort: any error, mismatch, or non-2xx -> empty Set (never throws,
+    // never blocks a fresh attempt).
+    return new Promise((resolve) => {
+        let settled = false;
+        const done = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+        try {
+            const xhr = new XMLHttpRequest();
+            const url = `/api/conversations/${conversationId}/attachments/status?upload_id=${encodeURIComponent(uploadId)}`;
+            xhr.open('GET', url, true);
+            xhr.withCredentials = true;
+            xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+            if (signal) {
+                if (signal.aborted) {
+                    done(new Set());
+                    return;
+                }
+                signal.addEventListener('abort', () => {
+                    try { xhr.abort(); } catch (err) { /* ignore */ }
+                    done(new Set());
+                }, { once: true });
+            }
+            xhr.onload = () => {
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    done(new Set());
+                    return;
+                }
+                let body = null;
+                try {
+                    body = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+                } catch (err) {
+                    body = null;
+                }
+                if (body && body.exists && body.chunk_size === expectedChunkSize && Array.isArray(body.received_chunks)) {
+                    done(new Set(body.received_chunks));
+                    return;
+                }
+                done(new Set());
+            };
+            xhr.onerror = () => done(new Set());
+            xhr.ontimeout = () => done(new Set());
+            xhr.onabort = () => done(new Set());
+            xhr.send();
+        } catch (err) {
+            done(new Set());
         }
-        const start = index * chunkSize;
-        const end = Math.min(file.size, start + chunkSize);
+    });
+}
+
+async function uploadChunkWithRetry(file, conversationId, uploadId, index, totalChunks, start, end, chunkBytes, chunkSize, contentType, options, onProgress) {
+    for (let attempt = 0; attempt < UPLOAD_CHUNK_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            await uploadSleep(UPLOAD_CHUNK_RETRY_DELAYS_MS[attempt - 1] + Math.random() * 250);
+            if (options.signal && options.signal.aborted) {
+                const error = new Error('Upload cancelled');
+                error.name = 'AbortError';
+                throw error;
+            }
+            if (conversationId !== null && typeof currentConversationId !== 'undefined' && currentConversationId !== conversationId) {
+                const error = new Error('Conversation changed while uploading attachment');
+                error.uploadFailed = true;
+                error.uploadConversationChanged = true;
+                throw error;
+            }
+        }
+
         const chunkBlob = file.slice(start, end);
         const formData = new FormData();
         formData.append('upload_id', uploadId);
@@ -628,32 +751,120 @@ async function uploadSingleAttachment(file, conversationId, rendered, options = 
         formData.append('filename', file.name || 'attachment');
         formData.append('content_type', contentType);
         formData.append('total_size', String(file.size));
+        formData.append('chunk_size', String(chunkSize));
         formData.append('chunk', chunkBlob, `${file.name || 'attachment'}.part${index}`);
 
-        await postAttachmentForm(`/api/conversations/${conversationId}/attachments/chunk`, formData, {
-            signal: options.signal,
-            onProgress: (loaded, total) => {
-                const chunkFraction = total > 0 ? loaded / total : 0;
-                const overall = ((index + chunkFraction) / totalChunks) * 96;
-                updateAttachmentUploadStatus(rendered, overall, `${Math.max(1, Math.round(overall))}%`);
+        const startedAt = performance.now();
+        try {
+            await postAttachmentForm(`/api/conversations/${conversationId}/attachments/chunk`, formData, {
+                signal: options.signal,
+                timeout: chunkTimeoutMs(chunkBytes),
+                onProgress,
+            });
+            const elapsedSeconds = (performance.now() - startedAt) / 1000;
+            recordChunkThroughput(chunkBytes, elapsedSeconds);
+            return;
+        } catch (error) {
+            if (error.name === 'AbortError' || !error.uploadRetryable) {
+                throw error;
             }
-        });
+            if (attempt === UPLOAD_CHUNK_MAX_ATTEMPTS - 1) {
+                recordChunkFailure();
+                throw error;
+            }
+        }
+    }
+}
+
+async function uploadSingleAttachment(file, conversationId, rendered, options = {}) {
+    const contentType = getUploadContentType(file);
+    const isResume = resumeRegistry.has(file) && resumeRegistry.get(file).conversationId === conversationId;
+    let entry;
+    if (isResume) {
+        entry = resumeRegistry.get(file);
+    } else {
+        entry = {
+            uploadId: createAttachmentUploadId(),
+            chunkSize: pickAdaptiveChunkSize(),
+            conversationId,
+            failures: 0,
+        };
+        resumeRegistry.set(file, entry);
     }
 
-    updateAttachmentUploadStatus(rendered, 98, 'Processing');
+    const totalChunks = Math.max(1, Math.ceil(file.size / entry.chunkSize));
+    const received = isResume
+        ? await queryUploadStatus(conversationId, entry.uploadId, entry.chunkSize, options.signal)
+        : new Set();
 
-    const completeForm = new FormData();
-    completeForm.append('upload_id', uploadId);
-    completeForm.append('total_chunks', String(totalChunks));
-    completeForm.append('filename', file.name || 'attachment');
-    completeForm.append('content_type', contentType);
-    completeForm.append('total_size', String(file.size));
-    const completed = await postAttachmentForm(`/api/conversations/${conversationId}/attachments/complete`, completeForm, {
-        signal: options.signal
-    });
+    try {
+        let bytesDone = 0;
+        const sizeForPct = Math.max(1, file.size); // avoid NaN% for a 0-byte file
+        for (let index = 0; index < totalChunks; index++) {
+            if (conversationId !== null && typeof currentConversationId !== 'undefined' && currentConversationId !== conversationId) {
+                const error = new Error('Conversation changed while uploading attachment');
+                error.uploadFailed = true;
+                error.uploadConversationChanged = true;
+                throw error;
+            }
+            if (options.signal && options.signal.aborted) {
+                const error = new Error('Upload cancelled');
+                error.name = 'AbortError';
+                throw error;
+            }
 
-    markAttachmentUploadComplete(rendered);
-    return completed;
+            const start = index * entry.chunkSize;
+            const end = Math.min(file.size, start + entry.chunkSize);
+            const chunkBytes = end - start;
+
+            if (received.has(index)) {
+                bytesDone += chunkBytes;
+                const overall = (bytesDone / sizeForPct) * 96;
+                updateAttachmentUploadStatus(rendered, overall, `${Math.max(1, Math.round(overall))}%`);
+                continue;
+            }
+
+            await uploadChunkWithRetry(
+                file, conversationId, entry.uploadId, index, totalChunks,
+                start, end, chunkBytes, entry.chunkSize, contentType, options,
+                (loaded, total) => {
+                    const chunkFraction = total > 0 ? loaded / total : 0;
+                    const overall = ((bytesDone + chunkFraction * chunkBytes) / sizeForPct) * 96;
+                    updateAttachmentUploadStatus(rendered, overall, `${Math.max(1, Math.round(overall))}%`);
+                }
+            );
+            bytesDone += chunkBytes;
+        }
+
+        updateAttachmentUploadStatus(rendered, 98, 'Processing');
+
+        const completeForm = new FormData();
+        completeForm.append('upload_id', entry.uploadId);
+        completeForm.append('total_chunks', String(totalChunks));
+        completeForm.append('filename', file.name || 'attachment');
+        completeForm.append('content_type', contentType);
+        completeForm.append('total_size', String(file.size));
+        const completed = await postAttachmentForm(`/api/conversations/${conversationId}/attachments/complete`, completeForm, {
+            signal: options.signal
+        });
+
+        resumeRegistry.delete(file);
+        uploadProfile.recentFailures = 0;
+        markAttachmentUploadComplete(rendered);
+        return completed;
+    } catch (err) {
+        // Only genuine upload failures (network/timeout/5xx) count toward the
+        // resume-then-shrink threshold. A user cancel (AbortError) or a
+        // conversation switch is an intentional stop and must keep the resume
+        // entry so a later re-send can continue cheaply.
+        if (err.name !== 'AbortError' && !err.uploadConversationChanged) {
+            entry.failures += 1;
+            if (entry.failures >= UPLOAD_MAX_FULL_RETRIES_BEFORE_SHRINK) {
+                resumeRegistry.delete(file);
+            }
+        }
+        throw err;
+    }
 }
 
 async function uploadAttachmentsForMessage(files, conversationId, displayOptions = {}) {
@@ -695,8 +906,14 @@ async function uploadAttachmentsForMessage(files, conversationId, displayOptions
             }
             renderedAttachmentElements.attachmentRefs.push(uploaded);
         } catch (error) {
-            markAttachmentUploadFailed(rendered, error.message || 'Failed');
-            error.uploadFailed = true;
+            // A user cancel (AbortError) is not a failure: do not paint the echo
+            // red or mark uploadFailed, so chat.js handles it via its quiet
+            // AbortError branch. Still expose the echoes so that branch can
+            // remove them and revoke their blob URLs.
+            if (error.name !== 'AbortError') {
+                markAttachmentUploadFailed(rendered, error.message || 'Failed');
+                error.uploadFailed = true;
+            }
             error.renderedAttachmentElements = renderedAttachmentElements;
             throw error;
         }

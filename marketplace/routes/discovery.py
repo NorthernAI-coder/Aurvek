@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
-from auth import get_current_user
+from auth import get_current_user, unauthenticated_response
 from captcha_service import get_captcha_config
 from common import (
     AVATAR_TOKEN_EXPIRE_HOURS,
@@ -21,6 +21,7 @@ from common import (
 from database import get_db_connection
 from marketplace.config import require_discovery_enabled
 from marketplace.services.entitlements import active_entitlement_condition
+from mobile.client import purchase_metadata_for_request
 from models import User
 from ranking import maybe_trigger_recalculation
 from save_images import generate_img_token
@@ -34,7 +35,7 @@ async def get_public_prompts(current_user: User = Depends(get_current_user)) -> 
     require_discovery_enabled()
 
     if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
+        return unauthenticated_response()
 
     async with get_db_connection(readonly=True) as conn:
         async with conn.cursor() as cursor:
@@ -76,7 +77,7 @@ async def explore_categories(current_user: User = Depends(get_current_user)):
     require_discovery_enabled()
 
     if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
+        return unauthenticated_response()
 
     async with get_db_connection(readonly=True) as conn:
         async with conn.cursor() as cursor:
@@ -121,7 +122,7 @@ async def explore_prompts(
     require_discovery_enabled()
 
     if current_user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
+        return unauthenticated_response()
 
     await maybe_trigger_recalculation()
 
@@ -287,6 +288,12 @@ async def explore_prompts(
                 "purchase_price": row[12],
                 "user_has_access": bool(row[13]),
                 "has_landing_page": bool(row[14]),
+                **purchase_metadata_for_request(
+                    request,
+                    is_paid=bool(row[6]),
+                    user_has_access=bool(row[13]),
+                    price=row[12],
+                ),
             }
         )
 

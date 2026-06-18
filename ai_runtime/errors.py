@@ -6,6 +6,7 @@ from ai_runtime.attachments.pdf import (
     _message_mentions_pdf_context,
     _pdf_too_large_payload,
 )
+from ai_runtime.provider_health import provider_health_for_error_payload
 
 def _extract_human_error_message(raw_body: str, status_code: int, provider_label: str) -> str:
     """Extract a clean, user-facing error message from a provider error body."""
@@ -75,4 +76,6 @@ def _provider_error_payload(
         if generic_context_limit and current_pdf_count <= 0:
             return {"error": message}
         return _pdf_too_large_payload(provider_label, message, user_message, pdf_meta, current_user, conversation_id)
-    return {"error": message}
+    payload = {"error": message}
+    payload.update(provider_health_for_error_payload(provider_label))
+    return payload

@@ -15,7 +15,9 @@ from ai_runtime.attachments.pdf import (
     hydrate_pdf_for_context,
 )
 from ai_runtime.attachments.text_files import text_file_block_to_text_for_context
-from ai_runtime.atagia.context import _context_messages_for_provider, _resolve_atagia_context
+from ai_runtime.memory.context import _context_messages_for_memory_provider, _resolve_memory_context
+from ai_runtime.perf_trace import ChatPerfTrace
+from memory.health import get_user_memory_health_snapshot, should_surface_memory_health
 from ai_runtime.billing import assert_billable_claude_system_key
 from ai_runtime.config import (
     NATIVE_SEARCH_PROVIDERS,
@@ -35,6 +37,7 @@ from ai_runtime.context.formatting import (
     flatten_multi_ai_context,
     parse_stored_message,
 )
+from ai_runtime.context.history import apply_no_memory_context_budget
 from ai_runtime.context.system import assemble_system_prompt, get_effective_blocks
 from ai_runtime.context.warmup import (
     _build_warmup_cache_key_from_state,
@@ -42,6 +45,8 @@ from ai_runtime.context.warmup import (
 )
 from ai_runtime.providers.claude import call_claude_api
 from ai_runtime.providers.gemini import call_gemini_api
+from ai_runtime.providers.kimi import call_kimi_api
+from ai_runtime.providers.minimax import call_minimax_api
 from ai_runtime.providers.openai_chat import call_o1_api
 from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
@@ -81,6 +86,8 @@ async def process_save_message(
     No FastAPI dependencies (Form, File, Depends).
     """
     logger.debug("enters into process_save_message")
+    perf_trace = ChatPerfTrace.from_request(request)
+    perf_trace.mark("process_start", conversation_id=conversation_id, user_id=current_user.id)
 
     files = list(files or [])
     try:
@@ -150,6 +157,13 @@ async def process_save_message(
             raise ValueError("Message content cannot be empty")
 
         message_size = len(user_message.encode('utf-8'))
+        perf_trace.mark(
+            "message_parsed",
+            message_chars=len(user_message),
+            message_bytes=message_size,
+            file_count=len(files or []),
+            attachment_ref_count=len(attachment_refs or []),
+        )
     except zlib.error as e:
         logger.error(f"[process_save_message] - Decompression error: {e}")
         return JSONResponse(content={'success': False, 'message': 'Invalid compressed data'}, status_code=400)
@@ -221,6 +235,14 @@ async def process_save_message(
                 gransabio_enabled_col,
                 conversation_incognito,
             ) = conversation_row
+            perf_trace.mark(
+                "conversation_loaded",
+                llm_id=conversation_llm_id,
+                machine=machine,
+                model=model,
+                prompt_id=effective_prompt_id,
+                incognito=bool(conversation_incognito),
+            )
 
         conversation_incognito = bool(conversation_incognito)
 
@@ -571,6 +593,15 @@ async def process_save_message(
                         current_balance=current_balance,
                     )
 
+        perf_trace.mark(
+            "preflight_done",
+            llm_id=conversation_llm_id,
+            machine=machine,
+            model=model,
+            output_tokens=int(output_tokens),
+            byok=bool(is_byok),
+        )
+
         warmup_state = {
             "llm_id": conversation_llm_id,
             "effective_prompt_id": effective_prompt_id,
@@ -586,6 +617,7 @@ async def process_save_message(
         )
         warmup_snapshot = get_warmup_snapshot(warmup_key)
         context_messages_dicts = _copy_warmup_context_messages(warmup_snapshot)
+        warmup_hit = context_messages_dicts is not None
         if context_messages_dicts is not None:
             mark_warmup_consumed()
             logger.debug(
@@ -609,6 +641,11 @@ async def process_save_message(
                 for msg in context_messages
             ]
             context_messages_dicts = flatten_multi_ai_context(context_messages_dicts)
+        perf_trace.mark(
+            "history_loaded",
+            warmup_hit=warmup_hit,
+            context_messages=len(context_messages_dicts or []),
+        )
 
     if files:
         logger.debug("Has files")
@@ -992,6 +1029,8 @@ async def process_save_message(
 
     async def stream_response():
         yield ": stream-ready\n\n"
+        for event in perf_trace.pop_sse():
+            yield event
 
         if updated_chat_name:
             yield f"data: {orjson.dumps({'updated_chat_name': updated_chat_name}).decode()}\n\n"
@@ -1081,6 +1120,7 @@ async def process_save_message(
                     llm_id=conversation_llm_id,
                     byok=is_byok,
                     pending_attachment_refs=pending_attachment_refs,
+                    perf_trace=perf_trace,
                 )
                 async for chunk in _stream_with_sse_keepalives(response_stream):
                     yield chunk
@@ -1111,6 +1151,7 @@ async def get_ai_response(
     save_to_db: bool = True,
     byok: bool = False,
     pending_attachment_refs: Optional[list[str]] = None,
+    perf_trace: ChatPerfTrace | None = None,
 ):
     logger.info(f"*** Enters {machine}")
     logger.debug(f"Parameters received: conversation_id={conversation_id}, model={model}, max_tokens={max_tokens}")
@@ -1120,6 +1161,15 @@ async def get_ai_response(
     logger.debug(f"User ID: {user_id}")
     context_messages = flatten_multi_ai_context(context_messages)
     context_messages = filter_invalid_context_messages(context_messages)
+    if perf_trace:
+        event = perf_trace.sse(
+            "get_ai_response_start",
+            machine=machine,
+            model=model,
+            context_messages=len(context_messages or []),
+        )
+        if event:
+            yield event
 
     try:
         # Use read-only connection for SELECT queries
@@ -1443,7 +1493,11 @@ async def get_ai_response(
                     }
                     full_prompt = assemble_system_prompt(blocks, variables, prompt_base,
                                                         watchdog_enabled, watchdog_hint_block)
-                    atagia_decision = await _resolve_atagia_context(
+                    if perf_trace:
+                        event = perf_trace.sse("memory_context_start")
+                        if event:
+                            yield event
+                    memory_decision = await _resolve_memory_context(
                         full_prompt,
                         user_id=user_id,
                         conversation_id=conversation_id,
@@ -1451,13 +1505,50 @@ async def get_ai_response(
                         prompt_id=prompt_id,
                         incognito=conversation_incognito,
                     )
-                    full_prompt = atagia_decision.full_prompt
-                    context_messages = _context_messages_for_provider(
+                    if perf_trace:
+                        event = perf_trace.sse(
+                            "memory_context_done",
+                            memory_provider=memory_decision.provider,
+                            memory_active=memory_decision.active,
+                            memory_reason=memory_decision.reason,
+                            prompt_chars=len(memory_decision.full_prompt or ""),
+                        )
+                        if event:
+                            yield event
+                    full_prompt = memory_decision.full_prompt
+                    context_messages = _context_messages_for_memory_provider(
                         context_messages,
-                        atagia_decision,
+                        memory_decision,
                     )
+                    memory_health = get_user_memory_health_snapshot(
+                        memory_decision.provider,
+                        enabled=(
+                            memory_decision.provider != "none"
+                            and memory_decision.reason != "disabled_by_user"
+                        ),
+                    )
+                    if should_surface_memory_health(memory_health):
+                        yield f"data: {orjson.dumps({'type': 'memory_health', 'memory_health': memory_health}).decode()}\n\n"
+                    if memory_decision.provider == "none":
+                        context_messages = await apply_no_memory_context_budget(
+                            context_messages,
+                            llm_id=llm_id,
+                            prompt_id=prompt_id,
+                            full_prompt=full_prompt,
+                            current_message=message,
+                        )
                     if skip_context_pdfs:
                         context_messages = _drop_pdf_blocks_from_context(context_messages)
+                    if perf_trace:
+                        event = perf_trace.sse(
+                            "prompt_context_ready",
+                            prompt_chars=len(full_prompt or ""),
+                            context_messages=len(context_messages or []),
+                            memory_provider=memory_decision.provider,
+                            web_search_mode=web_search_mode,
+                        )
+                        if event:
+                            yield event
 
                 else:
                     logger.error(f"[get_ai_response] - No conversation found with id {conversation_id} for user {user_id}")
@@ -1683,6 +1774,14 @@ async def get_ai_response(
                             })
 
                 #logger.debug(f"get_ai_response -> Prepared messages for API: {api_messages}")
+                if perf_trace:
+                    event = perf_trace.sse(
+                        "provider_messages_ready",
+                        machine=machine,
+                        api_messages=len(api_messages or []),
+                    )
+                    if event:
+                        yield event
 
                 # =============================================================
                 # GranSabio routing - intercept before normal provider routing
@@ -1784,6 +1883,12 @@ async def get_ai_response(
                 elif machine == "OpenRouter":
                     api_func = call_openrouter_api
                     provider_tools = tools_for_openai(filtered_tools)
+                elif machine == "MiniMax":
+                    api_func = call_minimax_api
+                    provider_tools = tools_for_openai(filtered_tools)
+                elif machine == "Kimi":
+                    api_func = call_kimi_api
+                    provider_tools = tools_for_openai(filtered_tools)
                 else:
                     raise ValueError(f"Unknown machine type: {machine}")
 
@@ -1814,6 +1919,15 @@ async def get_ai_response(
                 # Add tools if available for this provider
                 if provider_tools:
                     kwargs["tools"] = provider_tools
+                if perf_trace:
+                    event = perf_trace.sse(
+                        "tools_ready",
+                        machine=machine,
+                        provider_tool_count=len(provider_tools or []),
+                        web_search_mode=web_search_mode,
+                    )
+                    if event:
+                        yield event
 
                 if machine == "Claude" and thinking_budget_tokens:
                     kwargs["thinking_budget_tokens"] = thinking_budget_tokens
@@ -1848,6 +1962,18 @@ async def get_ai_response(
                     logger.error(f"User {current_user.id} in own_only mode without API key for {machine}")
                     yield f"data: {orjson.dumps({'error': 'API key required', 'action': 'configure_api_keys'}).decode()}\n\n"
                     return
+                if perf_trace:
+                    event = perf_trace.sse(
+                        "provider_call_start",
+                        machine=machine,
+                        model=model,
+                        byok=bool(resolved_key),
+                        use_system_key=bool(use_system and not resolved_key),
+                    )
+                    if event:
+                        yield event
+                    if machine == "GPT":
+                        kwargs["perf_trace"] = perf_trace
 
                 # Call the API and collect response
                 # Watch for tool_call in the response stream
@@ -1857,10 +1983,23 @@ async def get_ai_response(
                 _IMAGE_DL_ERROR_PATTERNS = ("unable to download", "could not download", "error downloading", "failed to fetch image")
                 _retried_base64 = False
 
+                def _is_perf_trace_chunk(c):
+                    if not isinstance(c, str) or not c.startswith("data: "):
+                        return False
+                    try:
+                        chunk_data = orjson.loads(c[6:].strip())
+                    except orjson.JSONDecodeError:
+                        return False
+                    return chunk_data.get("type") == "perf_trace"
+
                 # Peek at first chunk to detect image download errors
                 first_chunk = None
+                prefetched_chunks = []
                 api_stream = api_func(**kwargs)
                 async for chunk in api_stream:
+                    if _is_perf_trace_chunk(chunk):
+                        prefetched_chunks.append(chunk)
+                        continue
                     first_chunk = chunk
                     break
 
@@ -1879,8 +2018,12 @@ async def get_ai_response(
                             )
                             kwargs["messages"] = api_messages_b64
                             first_chunk = None
+                            prefetched_chunks = []
                             api_stream = api_func(**kwargs)
                             async for chunk in api_stream:
+                                if _is_perf_trace_chunk(chunk):
+                                    prefetched_chunks.append(chunk)
+                                    continue
                                 first_chunk = chunk
                                 break
                     except (orjson.JSONDecodeError, KeyError):
@@ -1893,7 +2036,7 @@ async def get_ai_response(
                 def _is_tool_pending_chunk(c):
                     return isinstance(c, str) and 'tool_call_pending' in c
 
-                for chunk in ([first_chunk] if first_chunk is not None else []):
+                for chunk in (prefetched_chunks + ([first_chunk] if first_chunk is not None else [])):
                     if _is_tool_call_chunk(chunk):
                         try:
                             if chunk.startswith("data: "):
@@ -1980,7 +2123,7 @@ async def get_ai_response(
                         # call_llm_api does messages.insert(0, {"role": "system", ...}) mutating the list.
                         # The first call already inserted it, so pop it before the second call.
                         # GPT and xAI excluded: their Responses API functions don't mutate the caller's message list.
-                        if machine == "OpenRouter":
+                        if machine in ("OpenRouter", "MiniMax", "Kimi"):
                             if api_messages and isinstance(api_messages[0], dict) and api_messages[0].get("role") == "system":
                                 api_messages.pop(0)
 
@@ -2045,7 +2188,7 @@ async def get_ai_response(
                         second_kwargs["web_search_mode"] = None
                         second_kwargs["messages"] = api_messages
 
-                        if machine == "OpenRouter":
+                        if machine in ("OpenRouter", "MiniMax", "Kimi"):
                             if api_messages and isinstance(api_messages[0], dict) and api_messages[0].get("role") == "system":
                                 api_messages.pop(0)
 

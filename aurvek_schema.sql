@@ -547,6 +547,70 @@ CREATE TABLE SYSTEM_CONFIG (
 );
 
 -- =============================================================================
+-- MEMORY PROVIDERS (generic memory provider preferences and sync metadata)
+-- =============================================================================
+CREATE TABLE MEMORY_USER_PREFERENCES (
+    user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    remember_across_chats INTEGER NOT NULL DEFAULT 1,
+    memory_scope TEXT NOT NULL DEFAULT 'prompt',
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, provider)
+);
+
+CREATE TABLE MEMORY_PROVIDER_MESSAGE_LINKS (
+    message_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    provider_event_id TEXT,
+    conversation_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    source TEXT NOT NULL DEFAULT 'live',
+    synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (message_id, provider)
+);
+
+CREATE TABLE MEMORY_PROVIDER_CONVERSATION_LINKS (
+    provider TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'live',
+    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (provider, conversation_id)
+);
+
+CREATE TABLE MEMORY_PROVIDER_SYNC_RUNS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT,
+    total_messages INTEGER NOT NULL DEFAULT 0,
+    processed_messages INTEGER NOT NULL DEFAULT 0,
+    linked_messages INTEGER NOT NULL DEFAULT 0,
+    skipped_messages INTEGER NOT NULL DEFAULT 0,
+    failed_messages INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    recent_errors TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE MEMORY_PROVIDER_SYNC_STATE (
+    provider TEXT NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, conversation_id)
+);
+
+CREATE INDEX idx_memory_provider_links_conversation
+ON MEMORY_PROVIDER_MESSAGE_LINKS(provider, conversation_id, message_id);
+
+-- =============================================================================
 -- USER_BRANDING (white-label customization)
 -- =============================================================================
 CREATE TABLE USER_BRANDING (

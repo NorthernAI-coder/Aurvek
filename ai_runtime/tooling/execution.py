@@ -3,6 +3,8 @@ from tools import function_handlers
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.providers.claude import call_claude_api
 from ai_runtime.providers.gemini import call_gemini_api
+from ai_runtime.providers.kimi import call_kimi_api
+from ai_runtime.providers.minimax import call_minimax_api
 from ai_runtime.providers.openai_chat import call_gpt_api, call_o1_api
 from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
@@ -41,10 +43,10 @@ def _build_tool_response_messages(api_messages: list, tool_call: dict, tool_resu
             "output": tool_result,
         })
 
-    elif machine == "OpenRouter":
+    elif machine in ("OpenRouter", "MiniMax", "Kimi"):
         # OpenAI Chat Completions compatible format
         tool_call_id = tool_call.get('id', f'call_{function_name}')
-        api_messages.append({
+        assistant_message = {
             "role": "assistant",
             "content": None,
             "tool_calls": [{
@@ -55,7 +57,10 @@ def _build_tool_response_messages(api_messages: list, tool_call: dict, tool_resu
                     "arguments": orjson.dumps(arguments).decode()
                 }
             }]
-        })
+        }
+        if machine == "Kimi" and tool_call.get("reasoning_content"):
+            assistant_message["reasoning_content"] = tool_call["reasoning_content"]
+        api_messages.append(assistant_message)
         api_messages.append({
             "role": "tool",
             "content": tool_result,
@@ -116,7 +121,24 @@ async def atFieldActivate(suspicious_text, messages, model, temperature, max_tok
     })
 
     logger.debug(f"SUSPICIOUS TEXT DETECTED, text after append: {messages}")
-    api_func = call_gpt_api if client == "GPT" else call_claude_api
+    if client == "Gemini":
+        api_func = call_gemini_api
+    elif client == "O1":
+        api_func = call_o1_api
+    elif client == "GPT":
+        api_func = call_gpt_api
+    elif client == "Claude":
+        api_func = call_claude_api
+    elif client == "xAI":
+        api_func = call_xai_responses_api
+    elif client == "OpenRouter":
+        api_func = call_openrouter_api
+    elif client == "MiniMax":
+        api_func = call_minimax_api
+    elif client == "Kimi":
+        api_func = call_kimi_api
+    else:
+        api_func = call_claude_api
     async for chunk in api_func(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request):
         yield chunk
 
@@ -477,6 +499,10 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 api_func = call_xai_responses_api
             elif client == "OpenRouter":
                 api_func = call_openrouter_api
+            elif client == "MiniMax":
+                api_func = call_minimax_api
+            elif client == "Kimi":
+                api_func = call_kimi_api
             else:
                 # Fallback: just show the error if we can't do a second-pass
                 yield f"data: {orjson.dumps({'content': tool_error_message}).decode()}\n\n"
@@ -512,7 +538,7 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 second_kwargs["thinking_budget_tokens"] = thinking_budget_tokens
 
             # System prompt dedup for Chat Completions providers
-            if client == "OpenRouter":
+            if client in ("OpenRouter", "MiniMax", "Kimi"):
                 if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
                     messages.pop(0)
 

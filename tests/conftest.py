@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS LLM (
     provider_key TEXT,
     provider_model_id TEXT,
     enabled INTEGER DEFAULT 1,
+    context_window_tokens INTEGER DEFAULT 0,
+    max_input_tokens INTEGER DEFAULT 0,
     max_output_tokens INTEGER DEFAULT 0,
     input_token_cost REAL DEFAULT 0,
     output_token_cost REAL DEFAULT 0
@@ -93,7 +95,8 @@ CREATE TABLE IF NOT EXISTS USER_DETAILS (
     billing_max_limit REAL,
     billing_auto_refill_count INTEGER DEFAULT 0,
     api_key_mode TEXT DEFAULT 'system_only',
-    user_api_keys TEXT
+    user_api_keys TEXT,
+    allow_file_upload INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS SYSTEM_CONFIG (
@@ -189,6 +192,11 @@ def _clean_tables(db_path):
         "ATAGIA_SYNC_STATE",
         "ATAGIA_SYNC_RUNS",
         "ATAGIA_MESSAGE_LINKS",
+        "MEMORY_PROVIDER_SYNC_STATE",
+        "MEMORY_PROVIDER_SYNC_RUNS",
+        "MEMORY_PROVIDER_CONVERSATION_LINKS",
+        "MEMORY_PROVIDER_MESSAGE_LINKS",
+        "MEMORY_USER_PREFERENCES",
         "WATCHDOG_STATE",
         "WATCHDOG_EVENTS",
         "FILE_LEGACY_CLEANUP_CANDIDATES",
@@ -210,6 +218,14 @@ def _clean_tables(db_path):
             pass
     conn.commit()
     conn.close()
+    try:
+        import atagia_config
+        from memory.config import invalidate_memory_config_cache
+
+        atagia_config.invalidate_atagia_config_cache()
+        invalidate_memory_config_cache()
+    except Exception:
+        pass
 
 
 @pytest.fixture()

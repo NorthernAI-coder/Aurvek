@@ -9,6 +9,7 @@ from billing.wallet import (
     get_payment_success_model,
 )
 from common import get_template_context, templates
+from mobile.client import ios_purchase_blocked, ios_purchase_disabled_response
 from models import User
 
 
@@ -28,6 +29,9 @@ async def create_stripe_checkout_session(
 ):
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if ios_purchase_blocked(request):
+        return ios_purchase_disabled_response()
 
     data = await request.json()
     base_url = str(request.base_url).rstrip("/")

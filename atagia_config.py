@@ -83,7 +83,18 @@ async def get_atagia_config() -> dict[str, str]:
 
 async def get_atagia_bridge_config() -> AtagiaBridgeConfig:
     """Return bridge settings derived from admin config."""
-    return bridge_config_from_mapping(await get_atagia_config())
+    config = await get_atagia_config()
+    enabled_override = None
+    try:
+        from memory.config import get_active_memory_provider
+
+        enabled_override = (
+            _parse_bool(config.get("atagia_enabled"))
+            and await get_active_memory_provider() == "atagia"
+        )
+    except Exception:
+        enabled_override = None
+    return bridge_config_from_mapping(config, enabled_override=enabled_override)
 
 
 def bridge_config_from_mapping(
@@ -133,6 +144,12 @@ async def save_atagia_admin_config(payload: dict[str, Any]) -> dict[str, str]:
         await conn.commit()
 
     invalidate_atagia_config_cache()
+    try:
+        from memory.config import invalidate_memory_config_cache
+
+        invalidate_memory_config_cache()
+    except Exception:
+        pass
     fresh = await get_atagia_config()
     return {key: fresh.get(key, "") for key in updates}
 
@@ -144,6 +161,12 @@ async def reset_atagia_admin_config() -> dict[str, str]:
         await conn.commit()
 
     invalidate_atagia_config_cache()
+    try:
+        from memory.config import invalidate_memory_config_cache
+
+        invalidate_memory_config_cache()
+    except Exception:
+        pass
     return await get_atagia_config()
 
 

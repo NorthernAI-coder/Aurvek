@@ -369,14 +369,27 @@ async def get_public_packs(conn, search="", page=1, limit=24, user_id=None, mine
                   u.username AS created_by_username,
                   (SELECT COUNT(*) FROM PACK_ITEMS WHERE pack_id = p.id AND is_active = 1 AND (disable_at IS NULL OR disable_at > datetime('now'))) AS item_count,
                   CASE WHEN p.created_by_user_id = ? THEN 1 ELSE 0 END AS is_mine,
-                  p.is_public, p.status, p.has_custom_landing, p.ranking_score
+                  p.is_public, p.status, p.has_custom_landing, p.ranking_score,
+                  CASE
+                      WHEN p.created_by_user_id = ? THEN 1
+                      WHEN EXISTS (
+                          SELECT 1 FROM ENTITLEMENTS e_pack
+                          WHERE e_pack.user_id = ?
+                            AND e_pack.asset_type = 'pack'
+                            AND e_pack.asset_id = p.id
+                            AND e_pack.status = 'active'
+                            AND (e_pack.starts_at IS NULL OR julianday(e_pack.starts_at) <= julianday('now'))
+                            AND (e_pack.expires_at IS NULL OR julianday(e_pack.expires_at) > julianday('now'))
+                      ) THEN 1
+                      ELSE 0
+                  END AS user_has_access
            FROM PACKS p
            LEFT JOIN USERS u ON p.created_by_user_id = u.id
            WHERE {base_where}
              AND (p.name LIKE ? OR p.description LIKE ?)
            {order_clause}
            LIMIT ? OFFSET ?""",
-        (uid,) + base_params + (f"%{search}%", f"%{search}%", limit, offset),
+        (uid, uid, uid) + base_params + (f"%{search}%", f"%{search}%", limit, offset),
     )
     packs = await cursor.fetchall()
 

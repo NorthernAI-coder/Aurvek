@@ -35,6 +35,8 @@
                         <option value="O1" {% if llm_machine == "O1" %}selected{% endif %}>O1</option>
                         <option value="Gemini" {% if llm_machine == "Gemini" %}selected{% endif %}>Gemini</option>
                         <option value="OpenRouter" {% if llm_machine == "OpenRouter" %}selected{% endif %}>OpenRouter</option>
+                        <option value="MiniMax" {% if llm_machine == "MiniMax" %}selected{% endif %}>MiniMax</option>
+                        <option value="Kimi" {% if llm_machine == "Kimi" %}selected{% endif %}>Kimi</option>
                     </select>
                     <small class="form-text text-muted">Select the AI provider/machine type</small>
                     {% endif %}

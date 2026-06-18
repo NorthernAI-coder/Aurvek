@@ -3,6 +3,8 @@ from ai_runtime.config import _log_truncated_response
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.providers.openai_chat import call_llm_api
+from ai_runtime.providers.openai_responses import _convert_messages_for_responses_api
+from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
 
 async def call_xai_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None, tools=None,
                        input_token_fallback=None,
@@ -165,7 +167,7 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                             etype = event_type or event_data.get("type", "")
 
                             # --- Text streaming ---
-                            if etype == "response.output_text.delta":
+                            if etype in ("response.output_text.delta", "response.text.delta"):
                                 delta = event_data.get("delta", "")
                                 if delta:
                                     content += delta
@@ -257,6 +259,7 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                                 if isinstance(error_code, str) and error_code.strip() and error_code.strip() not in error_msg:
                                     error_msg = f"{error_code.strip()}: {error_msg}"
                                 logger.error(f"[call_xai_responses_api] Response failed: {error_msg}")
+                                await record_provider_error_for_label("xAI (Grok)", message=error_msg, model=model, byok=byok)
                                 yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', error_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                                 error_yielded = True
 
@@ -279,6 +282,13 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                     raw_log = f"[call_xai_responses_api] Error: status {response.status}. Body: {error_body}"
                     logger.error(raw_log)
                     human_msg = _extract_human_error_message(error_body, response.status, "xAI (Grok)")
+                    await record_provider_error_for_label(
+                        "xAI (Grok)",
+                        message=human_msg,
+                        status_code=response.status,
+                        model=model,
+                        byok=byok,
+                    )
                     yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
                     error_yielded = True
 
@@ -286,21 +296,24 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
             error_message = f"[call_xai_responses_api] Request timed out after {timeout_seconds}s for model {model}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "xAI (Grok)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("xAI (Grok)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except aiohttp.ClientError as exc:
             error_message = f"[call_xai_responses_api] Network error: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "xAI (Grok)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("xAI (Grok)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
         except Exception as exc:
             error_message = f"[call_xai_responses_api] Unexpected error: {str(exc)}"
             logger.error(error_message)
             human_msg = _human_exception_error(exc, "xAI (Grok)")
-            yield f"data: {orjson.dumps({'error': human_msg}).decode()}\n\n"
+            await record_provider_error_for_label("xAI (Grok)", message=human_msg, exception=exc, model=model, byok=byok)
+            yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
     # Emit citations if any were collected
@@ -318,6 +331,7 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
         logger.info(f"[call_xai_responses_api] Tool call detected: {function_name}")
         logger.debug(f"[call_xai_responses_api] Tool call args: {parsed_args}")
 
+        await record_provider_success_for_label("xAI (Grok)", model=model, byok=byok)
         yield f"data: {orjson.dumps({'tool_call': {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return
@@ -332,9 +346,12 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
                 logger.warning(f"Empty bot response for conversation {conversation_id}, user {current_user.id}. "
                                f"Provider: xai_responses. Not saving to DB.")
                 if not error_yielded:
-                    yield f'data: {orjson.dumps({"error": "The AI returned an empty response. Please try again."}).decode()}\n\n'
+                    await record_provider_error_for_label("xAI (Grok)", message="empty response", model=model, byok=byok)
+                    empty_msg = "The AI returned an empty response. Please try again."
+                    yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             return
         else:
+            await record_provider_success_for_label("xAI (Grok)", model=model, byok=byok)
             citations_data = orjson.dumps(citations).decode() if citations else None
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
@@ -345,5 +362,13 @@ async def call_xai_responses_api(messages, model, temperature, max_tokens, promp
 
         yield content.strip()
     else:
+        if content.strip():
+            await record_provider_success_for_label("xAI (Grok)", model=model, byok=byok)
+        elif not error_yielded:
+            await record_provider_error_for_label("xAI (Grok)", message="empty response", model=model, byok=byok)
+            empty_msg = "The AI returned an empty response. Please try again."
+            yield f"data: {orjson.dumps(_provider_error_payload('xAI (Grok)', empty_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         yield f"data: {orjson.dumps({'token_info': True, 'input_tokens': input_tokens, 'output_tokens': output_tokens}).decode()}\n\n"
         yield "data: [DONE]\n\n"

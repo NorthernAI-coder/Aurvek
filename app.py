@@ -125,7 +125,10 @@ from common import MAX_API_IMAGE_SIZE_MB, MAX_CHAT_IMAGE_DIMENSION
 from common import compute_static_hashes
 import nh3
 from chat.registration import router as chat_router
-from chat.services.attachment_uploads import prune_stale_attachment_upload_chunks
+from chat.services.attachment_uploads import (
+    ATTACHMENT_UPLOAD_MAX_CHUNK_SIZE_BYTES,
+    prune_stale_attachment_upload_chunks,
+)
 from chat.services.privacy import (
     ensure_conversation_privacy_schema,
 )
@@ -218,6 +221,10 @@ from marketplace.routes.discovery import router as marketplace_discovery_router
 from marketplace.routes.geo import router as marketplace_geo_router
 from marketplace.routes.marketing import router as marketplace_marketing_router
 from marketplace.routes.acquisition import router as marketplace_acquisition_router
+from auth_apple import router as apple_auth_router
+from content_reports.routes import router as content_reports_router
+from legal.routes import router as legal_router
+from mobile.routes import router as mobile_router
 from marketplace.routes.prompt_landing_builder import router as prompt_landing_builder_router
 from marketplace.routes.prompt_landings import (
     custom_domain_router as prompt_custom_domain_router,
@@ -226,6 +233,7 @@ from marketplace.routes.prompt_landings import (
 )
 from marketplace.routes.ranking import router as marketplace_ranking_router
 from marketplace.routes.storefronts import router as marketplace_storefronts_router
+from memory.routes import router as memory_router
 from marketplace.services.acquisition_context import (
     handle_pack_for_existing_user,
     render_custom_domain_login,
@@ -456,6 +464,11 @@ app.include_router(prompts_router)
 app.include_router(packs_router)
 app.include_router(integrations_router)
 app.include_router(billing_router)
+app.include_router(apple_auth_router)
+app.include_router(legal_router)
+app.include_router(mobile_router)
+app.include_router(content_reports_router)
+app.include_router(memory_router)
 app.include_router(custom_domains_router)
 app.include_router(custom_domains_admin_router)
 app.include_router(marketplace_discovery_router)
@@ -578,6 +591,36 @@ if READONLY_MODE:
                 "message": "Service is in read-only mode. Normal service will resume shortly."
             }
         )
+
+
+ATTACHMENT_UPLOAD_CHUNK_REQUEST_RE = re.compile(r"^/api/conversations/\d+/attachments/chunk$")
+ATTACHMENT_UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+ATTACHMENT_UPLOAD_MAX_REQUEST_BYTES = (
+    ATTACHMENT_UPLOAD_MAX_CHUNK_SIZE_BYTES + ATTACHMENT_UPLOAD_MULTIPART_OVERHEAD_BYTES
+)
+
+
+@app.middleware("http")
+async def reject_oversized_attachment_chunk_requests(request: Request, call_next):
+    if (
+        request.method == "POST"
+        and ATTACHMENT_UPLOAD_CHUNK_REQUEST_RE.match(request.url.path)
+    ):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_size = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "message": "Invalid Content-Length"},
+                )
+            if request_size > ATTACHMENT_UPLOAD_MAX_REQUEST_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"success": False, "message": "Attachment upload chunk is too large"},
+                )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -1189,20 +1232,50 @@ class MemoryPreferencesUpdateRequest(BaseModel):
     remember_across_chats: Optional[bool] = None
     remember_across_devices: Optional[bool] = None
     memory_privacy_mode: Optional[str] = None
+    memory_scope: Optional[str] = None
 
 
 VALID_MEMORY_PRIVACY_MODES = {"balanced", "trusted_private"}
+VALID_MEMORY_SCOPES = {"global", "prompt"}
 
 
 @app.get("/api/user/memory-preferences")
 async def get_user_memory_preferences(current_user: User = Depends(get_current_user)):
-    """Get the current user's Atagia memory sharing preferences."""
+    """Get the current user's active memory-provider preferences."""
     if current_user is None:
         return unauthenticated_response()
 
-    from atagia_bridge import get_atagia_bridge
+    from memory.config import get_active_memory_provider, get_user_memory_preferences as get_local_memory_preferences
+    from memory.health import get_user_memory_health_snapshot
 
-    preferences = await get_atagia_bridge().get_memory_preferences(current_user.id)
+    provider = await get_active_memory_provider()
+    local_preferences = await get_local_memory_preferences(current_user.id, provider)
+    preferences = dict(local_preferences)
+    if provider == "atagia" and local_preferences.get("remember_across_chats") is not False:
+        from atagia_bridge import get_atagia_bridge
+
+        atagia_preferences = await get_atagia_bridge().get_memory_preferences(current_user.id)
+        memory_scope = preferences.get("memory_scope")
+        if atagia_preferences.get("available", False):
+            preferences = {**atagia_preferences, "provider": "atagia", "memory_scope": memory_scope}
+        else:
+            preferences = {
+                **preferences,
+                "provider": "atagia",
+                "remember_across_devices": True,
+                "memory_privacy_mode": "balanced",
+                "provider_available": False,
+                "provider_message": "Memory is not available right now.",
+            }
+    elif provider == "atagia":
+        preferences = {
+            **preferences,
+            "provider": "atagia",
+            "remember_across_devices": True,
+            "memory_privacy_mode": "balanced",
+        }
+    memory_enabled = provider != "none" and local_preferences.get("remember_across_chats") is not False
+    preferences["memory_health"] = get_user_memory_health_snapshot(provider, enabled=memory_enabled)
     return JSONResponse(content=preferences)
 
 
@@ -1211,24 +1284,85 @@ async def update_user_memory_preferences(
     payload: MemoryPreferencesUpdateRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Update the current user's Atagia memory sharing preferences."""
+    """Update the current user's active memory-provider preferences."""
     if current_user is None:
         return unauthenticated_response()
 
-    from atagia_bridge import get_atagia_bridge
+    from memory.config import (
+        get_active_memory_provider,
+        get_user_memory_preferences as get_local_memory_preferences,
+        save_user_memory_preferences,
+    )
+    from memory.health import get_user_memory_health_snapshot
 
     if (
         payload.memory_privacy_mode is not None
         and payload.memory_privacy_mode not in VALID_MEMORY_PRIVACY_MODES
     ):
         raise HTTPException(status_code=400, detail="Invalid memory privacy mode.")
+    if payload.memory_scope is not None and payload.memory_scope not in VALID_MEMORY_SCOPES:
+        raise HTTPException(status_code=400, detail="Invalid memory scope.")
 
-    preferences = await get_atagia_bridge().set_memory_preferences(
-        current_user.id,
-        remember_across_chats=payload.remember_across_chats,
-        remember_across_devices=payload.remember_across_devices,
-        memory_privacy_mode=payload.memory_privacy_mode,
+    provider = await get_active_memory_provider()
+    if provider == "none":
+        preferences = await get_local_memory_preferences(current_user.id, provider)
+        preferences["memory_health"] = get_user_memory_health_snapshot(provider, enabled=False)
+        return JSONResponse(content=preferences, status_code=503)
+
+    local_preferences = await get_local_memory_preferences(current_user.id, provider)
+    requested_remember = (
+        payload.remember_across_chats
+        if payload.remember_across_chats is not None
+        else local_preferences.get("remember_across_chats", True)
     )
+    memory_enabled = requested_remember is not False
+    if provider == "atagia" and memory_enabled:
+        from atagia_bridge import get_atagia_bridge
+
+        atagia_preferences = await get_atagia_bridge().set_memory_preferences(
+            current_user.id,
+            remember_across_chats=payload.remember_across_chats,
+            remember_across_devices=payload.remember_across_devices,
+            memory_privacy_mode=payload.memory_privacy_mode,
+        )
+        if not atagia_preferences.get("available", False):
+            preferences = {
+                **atagia_preferences,
+                "provider": "atagia",
+                "message": "Memory is not available right now.",
+                "memory_scope": payload.memory_scope or local_preferences.get("memory_scope"),
+                "memory_health": get_user_memory_health_snapshot(provider, enabled=True),
+            }
+            return JSONResponse(content=preferences, status_code=503)
+        local_preferences = await save_user_memory_preferences(
+            current_user.id,
+            provider,
+            remember_across_chats=payload.remember_across_chats,
+            memory_scope=payload.memory_scope,
+        )
+        preferences = {
+            **atagia_preferences,
+            "provider": "atagia",
+            "memory_scope": local_preferences.get("memory_scope"),
+        }
+    else:
+        local_preferences = await save_user_memory_preferences(
+            current_user.id,
+            provider,
+            remember_across_chats=payload.remember_across_chats,
+            memory_scope=payload.memory_scope,
+        )
+        memory_enabled = local_preferences.get("remember_across_chats") is not False
+        preferences = local_preferences
+
+    if provider == "atagia" and not memory_enabled:
+        preferences = {
+            **local_preferences,
+            "provider": "atagia",
+            "remember_across_devices": True,
+            "memory_privacy_mode": payload.memory_privacy_mode or "balanced",
+        }
+    preferences["memory_health"] = get_user_memory_health_snapshot(provider, enabled=memory_enabled)
     status_code = 200 if preferences.get("available", False) else 503
     return JSONResponse(content=preferences, status_code=status_code)
 
@@ -1303,6 +1437,24 @@ async def test_api_key(request: Request, current_user: User = Depends(get_curren
                     else:
                         error_text = await response.text()
                         return JSONResponse(content={"success": False, "message": f"Invalid xAI key: {error_text}"})
+
+        elif provider == "minimax":
+            async with aiohttp.ClientSession() as session:
+                headers = {"Authorization": f"Bearer {key}"}
+                async with session.get("https://api.minimax.io/v1/models", headers=headers) as response:
+                    if response.status == 200:
+                        return JSONResponse(content={"success": True, "message": "MiniMax API key is valid"})
+                    error_text = await response.text()
+                    return JSONResponse(content={"success": False, "message": f"Invalid MiniMax key: {error_text}"})
+
+        elif provider in ("kimi", "moonshot"):
+            async with aiohttp.ClientSession() as session:
+                headers = {"Authorization": f"Bearer {key}"}
+                async with session.get("https://api.moonshot.ai/v1/models", headers=headers) as response:
+                    if response.status == 200:
+                        return JSONResponse(content={"success": True, "message": "Kimi API key is valid"})
+                    error_text = await response.text()
+                    return JSONResponse(content={"success": False, "message": f"Invalid Kimi key: {error_text}"})
 
         elif provider == "elevenlabs":
             async with aiohttp.ClientSession() as session:
@@ -5498,11 +5650,15 @@ async def delete_users(request: Request, current_user: User = Depends(get_curren
 @app.post("/api/delete-account")
 async def delete_account(request: Request, current_user: User = Depends(get_current_user)):
     if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return unauthenticated_response()
 
     try:
         await delete_user(current_user.username, current_user, request_ip=None)
-        return {"message": "Account deleted successfully"}
+        return {
+            "success": True,
+            "message": "Account deleted successfully",
+            "logout": True,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5521,6 +5677,9 @@ def _normalize_provider_name(provider: str) -> str:
         "xai": "x-ai",
         "x-ai": "x-ai",
         "openrouter": "openrouter",
+        "minimax": "minimax",
+        "kimi": "kimi",
+        "moonshot": "kimi",
     }
     return aliases.get(provider_key, provider_key)
 
@@ -6677,6 +6836,8 @@ LLM_SYNC_PROVIDER_TABS = [
     {"key": "anthropic", "label": "Claude", "icon": "fa-brain"},
     {"key": "google", "label": "Gemini", "icon": "fa-gem"},
     {"key": "xai", "label": "xAI", "icon": "fa-xmark"},
+    {"key": "minimax", "label": "MiniMax", "icon": "fa-bolt"},
+    {"key": "kimi", "label": "Kimi", "icon": "fa-moon"},
 ]
 
 

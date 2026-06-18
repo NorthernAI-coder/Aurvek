@@ -836,6 +836,34 @@ body > .chat-menu-content.menu-above {
     transform: translateX(-50%) scale(1.1);
 }
 
+.provider-health-banner {
+    border-top: 1px solid rgba(245, 158, 11, 0.35);
+    border-bottom: 1px solid rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.12);
+}
+
+.provider-health-banner .api-keys-banner-content {
+    gap: 10px;
+}
+
+.provider-health-banner i {
+    color: #f59e0b;
+}
+
+#provider-health-banner-text {
+    line-height: 1.35;
+}
+
+.provider-health-modal-note {
+    display: block;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(128, 128, 128, 0.25);
+    color: var(--text-secondary, #8f96a3);
+    font-size: 0.9rem;
+    line-height: 1.35;
+}
+
 /* =============================================
    Collapsible Long User Messages
    ============================================= */

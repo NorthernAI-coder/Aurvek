@@ -6,8 +6,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 import logging
 import os
+import time
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
+
+from memory.health import record_memory_failure, record_memory_success
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +265,7 @@ class AtagiaBridge:
         incognito: bool | None = None,
     ) -> Any | None:
         """Return Atagia context for one user turn, or None on disabled/error."""
+        started_at = time.perf_counter()
         config = await self._get_config()
         if not config.enabled or not message_text:
             self._last_error = None
@@ -289,9 +293,25 @@ class AtagiaBridge:
                 memory_privacy_mode=memory_privacy_mode,
             )
             self._last_error = None if result is not None else getattr(sidecar, "last_error", None)
+            latency_ms = _elapsed_ms(started_at)
+            if self._last_error:
+                record_memory_failure(
+                    "atagia",
+                    "get_context",
+                    message=_bridge_error_text(self._last_error),
+                    latency_ms=latency_ms,
+                )
+            else:
+                record_memory_success("atagia", "get_context", latency_ms=latency_ms)
             return result
         except Exception as exc:
             self._last_error = _bridge_exception("get_context_for_turn", exc)
+            record_memory_failure(
+                "atagia",
+                "get_context",
+                exception=exc,
+                latency_ms=_elapsed_ms(started_at),
+            )
             logger.warning(
                 "Atagia get_context failed; falling back to Aurvek context",
                 exc_info=True,
@@ -314,6 +334,7 @@ class AtagiaBridge:
         incognito: bool | None = None,
     ) -> bool:
         """Persist the assistant response in Atagia, returning success."""
+        started_at = time.perf_counter()
         config = await self._get_config()
         if not config.enabled or not response_text:
             self._last_error = None
@@ -340,9 +361,25 @@ class AtagiaBridge:
                 memory_privacy_mode=memory_privacy_mode,
             )
             self._last_error = None if result else getattr(sidecar, "last_error", None)
+            latency_ms = _elapsed_ms(started_at)
+            if self._last_error:
+                record_memory_failure(
+                    "atagia",
+                    "record_response",
+                    message=_bridge_error_text(self._last_error),
+                    latency_ms=latency_ms,
+                )
+            elif result:
+                record_memory_success("atagia", "record_response", latency_ms=latency_ms)
             return result
         except Exception as exc:
             self._last_error = _bridge_exception("record_assistant_response", exc)
+            record_memory_failure(
+                "atagia",
+                "record_response",
+                exception=exc,
+                latency_ms=_elapsed_ms(started_at),
+            )
             logger.warning(
                 "Atagia add_response failed; continuing without sidecar persistence",
                 exc_info=True,
@@ -406,6 +443,7 @@ class AtagiaBridge:
 
     async def get_memory_preferences(self, user_id: int | str) -> dict[str, Any]:
         """Return Atagia user memory preferences, fail-open to defaults."""
+        started_at = time.perf_counter()
         config = await self._get_config()
         if not config.enabled:
             self._last_error = None
@@ -417,9 +455,20 @@ class AtagiaBridge:
             )
             self._last_error = None
             preferences["available"] = True
+            record_memory_success(
+                "atagia",
+                "preferences",
+                latency_ms=_elapsed_ms(started_at),
+            )
             return preferences
         except Exception as exc:
             self._last_error = _bridge_exception("get_memory_preferences", exc)
+            record_memory_failure(
+                "atagia",
+                "preferences",
+                exception=exc,
+                latency_ms=_elapsed_ms(started_at),
+            )
             logger.warning("Atagia memory preference fetch failed", exc_info=True)
             return _unavailable_memory_preferences(user_id, str(exc))
 
@@ -432,6 +481,7 @@ class AtagiaBridge:
         memory_privacy_mode: str | None = None,
     ) -> dict[str, Any]:
         """Persist Atagia user memory preferences."""
+        started_at = time.perf_counter()
         config = await self._get_config()
         if not config.enabled:
             self._last_error = None
@@ -446,9 +496,20 @@ class AtagiaBridge:
             )
             self._last_error = None
             preferences["available"] = True
+            record_memory_success(
+                "atagia",
+                "preferences_update",
+                latency_ms=_elapsed_ms(started_at),
+            )
             return preferences
         except Exception as exc:
             self._last_error = _bridge_exception("set_memory_preferences", exc)
+            record_memory_failure(
+                "atagia",
+                "preferences_update",
+                exception=exc,
+                latency_ms=_elapsed_ms(started_at),
+            )
             logger.warning("Atagia memory preference update failed", exc_info=True)
             return _unavailable_memory_preferences(user_id, str(exc))
 
@@ -487,6 +548,7 @@ class AtagiaBridge:
 
     async def test_connection(self) -> tuple[bool, str]:
         """Best-effort admin connection check using real Atagia resources."""
+        started_at = time.perf_counter()
         config = await self._get_config()
         if not config.enabled:
             self._last_error = None
@@ -495,9 +557,27 @@ class AtagiaBridge:
             sidecar = await self._ensure_sidecar_bridge(config)
             ok, message = await sidecar.test_connection()
             self._last_error = None if ok else getattr(sidecar, "last_error", None)
+            latency_ms = _elapsed_ms(started_at)
+            if ok:
+                record_memory_success("atagia", "test_connection", latency_ms=latency_ms)
+            else:
+                record_memory_failure(
+                    "atagia",
+                    "test_connection",
+                    message=message or _bridge_error_text(self._last_error),
+                    latency_ms=latency_ms,
+                    unavailable=True,
+                )
             return ok, message
         except Exception as exc:
             self._last_error = _bridge_exception("test_connection", exc)
+            record_memory_failure(
+                "atagia",
+                "test_connection",
+                exception=exc,
+                latency_ms=_elapsed_ms(started_at),
+                unavailable=True,
+            )
             logger.warning("Atagia connection test failed", exc_info=True)
             return False, str(exc)
 
@@ -898,6 +978,18 @@ def _bridge_exception(operation: str, exc: Exception) -> dict[str, str]:
     }
 
 
+def _bridge_error_text(error: Any) -> str:
+    if not error:
+        return ""
+    if isinstance(error, Mapping):
+        return str(error.get("message") or error)
+    return str(error)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 1)
+
+
 def _aurvek_user_id(value: int | str) -> str:
     text = str(value).strip()
     if text.startswith("aurvek:user:"):
@@ -1106,6 +1198,8 @@ async def _http_purge_conversation(
                 },
                 headers=_http_headers(config, user_id),
             )
+            if response.status_code == 404:
+                return
             response.raise_for_status()
         except Exception:
             response = await client.post(
@@ -1113,6 +1207,8 @@ async def _http_purge_conversation(
                 json={**payload_base, "confirmation": "DELETE_CONVERSATION"},
                 headers=_http_headers(config, user_id),
             )
+            if response.status_code == 404:
+                return
             response.raise_for_status()
 
 

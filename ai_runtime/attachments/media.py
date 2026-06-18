@@ -80,7 +80,7 @@ async def hydrate_image_for_context(
                 "url": token_url,
             }
         }
-    # GPT, OpenRouter, Gemini — all use OpenAI image_url format with token URL
+    # OpenAI-compatible providers and Gemini use image_url format with token URL.
     return {
         "type": "image_url",
         "image_url": {"url": token_url}
@@ -169,7 +169,7 @@ def format_image_for_provider(machine: str, image_url_base: str, image_data_b64:
             "type": "image_url",
             "image_url": {"url": f"data:{send_media};base64,{send_b64}"}
         }
-    elif machine in ("GPT", "OpenRouter"):
+    elif machine in ("GPT", "OpenRouter", "MiniMax", "Kimi"):
         content_to_send = {
             "type": "image_url",
             "image_url": {"url": f"data:{media_type};base64,{image_data_b64}"}
