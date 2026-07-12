@@ -1,14 +1,15 @@
+import math
 import secrets
 
 import stripe
 from fastapi import HTTPException
 
 from billing.discounts import (
+    DISCOUNT_SCOPE_WALLET,
+    WALLET_REDEMPTION_PURPOSE,
     DiscountError,
-    claim_discount_usage_for_checkout,
     decrement_discount_usage,
-    restore_discount_usage_for_checkout,
-    validate_discount_code,
+    validate_wallet_credit_code,
 )
 from common import STRIPE_SECRET_KEY
 from database import get_db_connection
@@ -21,73 +22,52 @@ MAX_WALLET_TOPUP = 500
 
 def validate_wallet_amount(amount: float) -> float:
     amount = float(amount)
-    if amount < MIN_WALLET_TOPUP or amount > MAX_WALLET_TOPUP:
+    if (
+        not math.isfinite(amount)
+        or amount < MIN_WALLET_TOPUP
+        or amount > MAX_WALLET_TOPUP
+    ):
         raise HTTPException(status_code=400, detail="Amount must be between $5 and $500")
     return amount
 
 
 async def create_wallet_checkout(data: dict, base_url: str, user_id: int) -> dict:
+    try:
+        discount_code = (data.get("discount_code", "") or "").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid request data: {exc}") from exc
+
+    if discount_code:
+        try:
+            wallet_credit = await validate_wallet_credit_code(discount_code, user_id)
+        except DiscountError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        return {
+            "free_purchase": True,
+            "grant_amount": wallet_credit.grant_amount,
+            "message": "Wallet credit code validated",
+        }
+
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
     try:
-        amount = validate_wallet_amount(float(data.get("amount", 0)))
-        discount_code = (data.get("discount_code", "") or "").strip()
+        original_amount = validate_wallet_amount(float(data.get("amount", 0)))
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid request data: {exc}") from exc
 
-    original_amount = amount
     try:
-        discount = await validate_discount_code(discount_code, original_amount)
-    except DiscountError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-
-    if discount.final_amount == 0:
-        await credit_free_wallet_topup(
-            user_id=user_id,
-            original_amount=original_amount,
-            discount_code=discount_code,
-            description_prefix="100% discount top-up",
-            reference_prefix="free_topup",
-        )
-        logger.info(
-            "Free top-up (100%% discount): user=%s, amount=$%.2f, code=%s",
-            user_id,
-            original_amount,
-            discount_code,
-        )
-        return {"free_purchase": True, "message": "100% discount applied"}
-
-    discount_claimed = False
-    discount_claim_reference = None
-    try:
-        if discount_code:
-            discount_claim_reference = f"discount-claim-{secrets.token_hex(16)}"
-            discount = await claim_discount_usage_for_checkout(discount_code, original_amount)
-            discount_claimed = True
-            if discount.final_amount == 0:
-                await restore_discount_usage_for_checkout(discount_code)
-                discount_claimed = False
-                await credit_free_wallet_topup(
-                    user_id=user_id,
-                    original_amount=original_amount,
-                    discount_code=discount_code,
-                    description_prefix="100% discount top-up",
-                    reference_prefix="free_topup",
-                )
-                return {"free_purchase": True, "message": "100% discount applied"}
-
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[
                 {
                     "price_data": {
                         "currency": "usd",
-                        "unit_amount": int(discount.final_amount * 100),
+                        "unit_amount": int(original_amount * 100),
                         "product_data": {
-                            "name": f"AURVEK Balance - ${discount.final_amount:.2f}",
+                            "name": f"AURVEK Balance - ${original_amount:.2f}",
                             "description": (
                                 f"Add ${original_amount:.2f} to your AURVEK account balance"
                             ),
@@ -102,46 +82,29 @@ async def create_wallet_checkout(data: dict, base_url: str, user_id: int) -> dic
             metadata={
                 "user_id": str(user_id),
                 "original_amount": str(original_amount),
-                "final_amount": str(discount.final_amount),
-                "discount_code": discount_code,
-                "discount_claimed": "1" if discount_claimed else "0",
-                "discount_claim_reference": discount_claim_reference or "",
+                "final_amount": str(original_amount),
+                "discount_code": "",
+                "discount_claimed": "0",
+                "discount_claim_reference": "",
             },
         )
         return {"url": session.url}
     except stripe.error.StripeError as exc:
-        if discount_claimed:
-            await restore_discount_usage_for_checkout(
-                discount_code,
-                reference_id=discount_claim_reference,
-                user_id=user_id,
-            )
         logger.error("Stripe error creating checkout session: %s", exc)
         raise HTTPException(
             status_code=500,
             detail=f"Payment service error: {str(exc)}",
         ) from exc
-    except DiscountError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-    except Exception:
-        if discount_claimed:
-            await restore_discount_usage_for_checkout(
-                discount_code,
-                reference_id=discount_claim_reference,
-                user_id=user_id,
-            )
-        raise
 
 
 async def credit_free_wallet_topup(
     *,
     user_id: int,
-    original_amount: float,
     discount_code: str,
     description_prefix: str,
     reference_prefix: str,
 ) -> dict:
-    original_amount = validate_wallet_amount(original_amount)
+    discount_code = (discount_code or "").strip()
     if not discount_code:
         raise HTTPException(status_code=400, detail="Discount code is required")
 
@@ -149,10 +112,12 @@ async def credit_free_wallet_topup(
         cursor = await conn.cursor()
         try:
             await conn.execute("BEGIN IMMEDIATE")
-            discount = await validate_discount_code(discount_code, original_amount, conn=conn)
-            if discount.final_amount != 0:
-                await conn.rollback()
-                raise HTTPException(status_code=400, detail="Discount does not fully cover this payment")
+            wallet_credit = await validate_wallet_credit_code(
+                discount_code,
+                user_id,
+                conn=conn,
+            )
+            grant_amount = wallet_credit.grant_amount
 
             await cursor.execute(
                 "SELECT balance FROM USER_DETAILS WHERE user_id = ?",
@@ -164,8 +129,24 @@ async def credit_free_wallet_topup(
                 raise HTTPException(status_code=404, detail="User not found")
 
             balance_before = user_details[0]
-            balance_after = balance_before + original_amount
+            balance_after = balance_before + grant_amount
             reference_id = f"{reference_prefix}_{user_id}_{secrets.token_hex(8)}"
+
+            await cursor.execute(
+                """
+                INSERT INTO DISCOUNT_REDEMPTIONS
+                    (discount_code, user_id, purpose, grant_amount,
+                     transaction_reference, redeemed_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    discount_code,
+                    user_id,
+                    WALLET_REDEMPTION_PURPOSE,
+                    grant_amount,
+                    reference_id,
+                ),
+            )
 
             await cursor.execute(
                 "UPDATE USER_DETAILS SET balance = ? WHERE user_id = ?",
@@ -180,17 +161,28 @@ async def credit_free_wallet_topup(
                 """,
                 (
                     user_id,
-                    original_amount,
+                    grant_amount,
                     balance_before,
                     balance_after,
-                    f"{description_prefix} - ${original_amount:.2f} balance credited",
+                    f"{description_prefix} - ${grant_amount:.2f} balance credited",
                     reference_id,
                     discount_code,
                 ),
             )
-            await decrement_discount_usage(conn, discount_code)
+            await decrement_discount_usage(
+                conn,
+                discount_code,
+                scope=DISCOUNT_SCOPE_WALLET,
+            )
             await conn.commit()
-            return {"new_balance": balance_after, "reference_id": reference_id}
+            return {
+                "new_balance": balance_after,
+                "reference_id": reference_id,
+                "grant_amount": grant_amount,
+            }
+        except DiscountError as exc:
+            await conn.rollback()
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
         except HTTPException:
             await conn.rollback()
             raise

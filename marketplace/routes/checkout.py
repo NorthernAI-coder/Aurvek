@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -41,6 +42,51 @@ from save_images import generate_img_token
 
 
 router = APIRouter()
+
+
+@router.get("/purchase/prompt/{prompt_id}", response_class=HTMLResponse)
+async def prompt_purchase_bridge(
+    request: Request,
+    prompt_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    """Move an isolated landing visitor onto the trusted checkout origin."""
+    require_checkout_enabled()
+    purchase_path = f"/purchase/prompt/{int(prompt_id)}"
+    if current_user is None:
+        return RedirectResponse(
+            url="/login?" + urlencode({"next": purchase_path}),
+            status_code=302,
+        )
+
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.execute(
+            """
+            SELECT name, purchase_price
+            FROM PROMPTS
+            WHERE id = ? AND public = 1
+            """,
+            (prompt_id,),
+        )
+        prompt = await cursor.fetchone()
+        if not prompt or not prompt[1] or float(prompt[1]) <= 0:
+            raise HTTPException(status_code=404, detail="Prompt not available for purchase")
+        if await user_has_prompt_entitlement_access(
+            conn,
+            user_id=current_user.id,
+            prompt_id=prompt_id,
+        ):
+            return RedirectResponse(url="/chat", status_code=302)
+
+    context = await get_template_context(request, current_user)
+    context.update(
+        {
+            "prompt_id": int(prompt_id),
+            "prompt_name": prompt[0],
+            "purchase_price": float(prompt[1]),
+        }
+    )
+    return templates.TemplateResponse("prompt_purchase_bridge.html", context)
 
 
 @router.get("/pack-purchase-success", response_class=HTMLResponse)

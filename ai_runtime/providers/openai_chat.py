@@ -3,13 +3,16 @@ from ai_runtime.config import _is_gpt5_model, safe_log_headers, _log_truncated_r
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
+from billing.usage_reservations import accumulate_ai_provider_call_usage
 
 async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, user_message=None, user_api_key=None,
                       input_token_fallback=None,
                       pdf_error_metadata=None,
                       prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                       llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
-                      pending_attachment_refs: Optional[list[str]] = None):
+                      pending_attachment_refs: Optional[list[str]] = None,
+                      strip_device_action_blocks: bool = False,
+                      billing_reservation_id: str | None = None):
     global stop_signals
     logger.debug("enters call_o1_api")
 
@@ -113,9 +116,29 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
             yield f"data: {orjson.dumps(_provider_error_payload('OpenAI (o1)', human_msg, user_message, pdf_error_metadata, current_user, conversation_id)).decode()}\n\n"
             error_yielded = True
 
-    # Include reasoning_tokens in output_tokens and total_tokens
-    output_tokens += reasoning_tokens
-    total_tokens += reasoning_tokens
+    # OpenAI includes reasoning tokens in completion_tokens/total_tokens.
+    # Keep the detail for diagnostics without charging those tokens twice.
+    if (
+        billing_reservation_id
+        and save_to_db
+        and not error_yielded
+        and (content or input_tokens or output_tokens)
+    ):
+        input_tokens, output_tokens = await accumulate_ai_provider_call_usage(
+            reservation_id=billing_reservation_id,
+            user_id=user_id,
+            reported_input_tokens=input_tokens,
+            reported_output_tokens=output_tokens,
+            input_payload=(prompt, messages),
+            output_payload=content,
+            input_token_fallback=input_token_fallback,
+            output_token_cap=max_tokens,
+            llm_id=llm_id,
+            model=model,
+            prompt_id=prompt_id,
+            byok=byok,
+        )
+        total_tokens = input_tokens + output_tokens
 
     # Save the content to the database using read-write connection
     if save_to_db:
@@ -136,7 +159,10 @@ async def call_o1_api(messages, model, temperature, max_tokens, prompt, conversa
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
+                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs,
+                                                                        strip_device_action_blocks=strip_device_action_blocks,
+                                                                        billing_reservation_id=billing_reservation_id,
+                                                                        billing_only_accumulated_usage=bool(billing_reservation_id))
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -163,7 +189,9 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
                        omit_temperature: bool = False,
                        use_max_completion_tokens: bool = False,
                        include_stream_usage: bool = True,
-                       pending_attachment_refs: Optional[list[str]] = None):
+                       pending_attachment_refs: Optional[list[str]] = None,
+                       strip_device_action_blocks: bool = False,
+                       billing_reservation_id: str | None = None):
     """
     Generic LLM API call function for OpenAI-compatible APIs.
     Used by GPT, xAI, and OpenRouter.
@@ -425,6 +453,30 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
     if thinking_open:
         yield f"data: {orjson.dumps({'type': 'thinking_end'}).decode()}\n\n"
 
+    billing_input_tokens = input_tokens
+    billing_output_tokens = output_tokens
+    if (
+        billing_reservation_id
+        and save_to_db
+        and (content or function_name or input_tokens or output_tokens)
+    ):
+        billing_input_tokens, billing_output_tokens = (
+            await accumulate_ai_provider_call_usage(
+                reservation_id=billing_reservation_id,
+                user_id=current_user.id,
+                reported_input_tokens=input_tokens,
+                reported_output_tokens=output_tokens,
+                input_payload=messages,
+                output_payload=(content, function_name, function_arguments),
+                input_token_fallback=input_token_fallback,
+                output_token_cap=max_tokens,
+                llm_id=llm_id,
+                model=model,
+                prompt_id=prompt_id,
+                byok=byok,
+            )
+        )
+
     # If a tool call was detected, emit it and return without saving to DB
     # The caller (get_ai_response) will handle the tool call and save the result
     # When save_to_db=False (Multi-AI), skip tool handling entirely
@@ -440,7 +492,15 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
         logger.debug(f"[call_llm_api] - Tool call args: {parsed_args}")
 
         await record_provider_success_for_label(provider_label, model=model, byok=byok)
-        tool_call_payload = {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}
+        tool_call_payload = {
+            'name': function_name,
+            'arguments': parsed_args,
+            'id': tool_call_id,
+            '_billing_usage': {
+                'input_tokens': billing_input_tokens,
+                'output_tokens': billing_output_tokens,
+            },
+        }
         if reasoning_content_for_message:
             tool_call_payload["reasoning_content"] = reasoning_content_for_message
         yield f"data: {orjson.dumps({'tool_call': tool_call_payload}).decode()}\n\n"
@@ -466,7 +526,10 @@ async def call_llm_api(messages, model, temperature, max_tokens, prompt, convers
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
+                                                                        llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs,
+                                                                        strip_device_action_blocks=strip_device_action_blocks,
+                                                                        billing_reservation_id=billing_reservation_id,
+                                                                        billing_only_accumulated_usage=bool(billing_reservation_id))
             if user_message_id and bot_message_id:
                 yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
@@ -488,7 +551,9 @@ async def call_gpt_api(messages, model, temperature, max_tokens, prompt, convers
                        pdf_error_metadata=None,
                        prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                        llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
-                       pending_attachment_refs: Optional[list[str]] = None):
+                       pending_attachment_refs: Optional[list[str]] = None,
+                       strip_device_action_blocks: bool = False,
+                       billing_reservation_id: str | None = None):
     api_url = "https://api.openai.com/v1/chat/completions"
     api_key = user_api_key or openai.api_key  # Use user's key if provided
 
@@ -517,5 +582,7 @@ async def call_gpt_api(messages, model, temperature, max_tokens, prompt, convers
         web_search_mode=web_search_mode,
         byok=byok,
         pending_attachment_refs=pending_attachment_refs,
+        strip_device_action_blocks=strip_device_action_blocks,
+        billing_reservation_id=billing_reservation_id,
     ):
         yield chunk

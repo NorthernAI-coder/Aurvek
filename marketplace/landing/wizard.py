@@ -2,82 +2,31 @@
 """
 Landing Page Wizard - Uses Claude Code to generate professional landing pages.
 
-Based on the pattern from translation_scanner.py but with Write tool enabled
-and --cwd to restrict file operations to the prompt directory.
-
-Supports AI image generation via tools/generate_images_cli.py
+Claude is invoked only through the verified OS sandbox runner.  The model gets
+Read/Write/Edit access to the mounted destination and no shell tool.
 """
 
 import os
-import sys
 import subprocess
-import shutil
 from pathlib import Path
 from typing import Optional
 
 from common import fix_landing_seo_tags
-
-# Project root directory. This module lives under marketplace/landing/.
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-IMAGE_CLI_PATH = PROJECT_ROOT / "tools" / "generate_images_cli.py"
-
-# Fix Windows console encoding
-if sys.platform == "win32":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
+from marketplace.landing.sandbox import (
+    WizardSandboxUnavailable,
+    get_wizard_sandbox_status,
+    run_claude_in_sandbox,
+)
 
 def is_claude_available() -> tuple:
     """
-    Check if Claude CLI is installed and accessible.
-
-    Supports both native installation (recommended) and legacy npm installation.
-    Native install location: ~/.local/bin/claude (or claude.exe on Windows)
+    Check whether the verified wizard sandbox runner is available.
 
     Returns:
-        tuple: (is_available: bool, path: str)
+        tuple: (is_available: bool, runner path or reason)
     """
-    # Try standard PATH lookup first
-    claude_path = shutil.which("claude")
-    if claude_path:
-        return True, claude_path
-
-    if sys.platform == "win32":
-        # Try .exe extension on Windows (native install)
-        claude_exe = shutil.which("claude.exe")
-        if claude_exe:
-            return True, claude_exe
-
-        # Check native installation path on Windows: %USERPROFILE%\.local\bin\claude.exe
-        native_paths = [
-            Path.home() / ".local" / "bin" / "claude.exe",
-            Path(os.environ.get("USERPROFILE", "")) / ".local" / "bin" / "claude.exe",
-        ]
-        for path in native_paths:
-            if path.exists():
-                return True, str(path)
-
-        # Legacy: Try .cmd extension on Windows (old npm install)
-        claude_cmd = shutil.which("claude.cmd")
-        if claude_cmd:
-            return True, claude_cmd
-
-        # Legacy: Check npm global install paths on Windows
-        npm_paths = [
-            Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
-            Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
-        ]
-        for path in npm_paths:
-            if path.exists():
-                return True, str(path)
-    else:
-        # Unix/macOS/Linux: Check native installation path ~/.local/bin/claude
-        native_path = Path.home() / ".local" / "bin" / "claude"
-        if native_path.exists():
-            return True, str(native_path)
-
-    return False, ""
+    status = get_wizard_sandbox_status()
+    return status.available, status.runner_path or status.reason
 
 
 def find_claude_executable() -> str:
@@ -90,13 +39,25 @@ def find_claude_executable() -> str:
     Raises:
         FileNotFoundError: If Claude CLI is not found
     """
-    available, path = is_claude_available()
+    available, path_or_reason = is_claude_available()
     if available:
-        return path
-    raise FileNotFoundError(
-        "Claude Code CLI not found. Install with: irm https://claude.ai/install.ps1 | iex (PowerShell) "
-        "or see: https://code.claude.com/docs/en/setup"
-    )
+        return path_or_reason
+    raise WizardSandboxUnavailable(path_or_reason)
+
+
+def _claude_command(max_turns: int) -> list[str]:
+    """Build the command executed inside the verified sandbox."""
+    return [
+        "claude",
+        "--allowedTools",
+        "Write,Read,Edit",
+        "--permission-mode",
+        "acceptEdits",
+        "--max-turns",
+        str(max_turns),
+        "--model",
+        "sonnet",
+    ]
 
 
 def _apply_seo_fix(prompt_dir: Path, landing_url: str) -> None:
@@ -150,23 +111,11 @@ LANGUAGE: {language_full}
 ########################################################################
 
 ########################################################################
-# IMAGE GENERATION (OPTIONAL - Use if user requests custom images)
+# ASSET RULES
 ########################################################################
-You can generate AI images using this command:
-
-python "{image_cli_path}" --prompt "DESCRIPTION" --output "static/img/FILENAME.png" --engine poe --ratio 16:9
-
-Available options:
-- Engines: gemini (fast), poe (best quality with references), openai
-- Ratios: 1:1, 16:9, 9:16, 4:3, 3:4
-- For style references: --refs existing_image.png
-
-Examples:
-- Hero image: python "{image_cli_path}" -p "Professional hero image for AI chatbot, blue gradient, modern tech" -o "static/img/hero.png" -e poe -r 16:9
-- Feature icon: python "{image_cli_path}" -p "Simple icon representing AI conversation, minimal style" -o "static/img/feature1.png" -e gemini -r 1:1
-
-IMPORTANT: First create the static/img/ directory if needed, then generate images.
-Only generate images if the user specifically requests them or if they would significantly improve the landing page.
+- Shell commands and external image generators are unavailable in this sandbox.
+- Reuse existing files under static/img/ when suitable.
+- Inline SVG and CSS artwork are allowed when they do not require external tools.
 ########################################################################
 
 ########################################################################
@@ -225,7 +174,7 @@ REQUIREMENTS:
 OPTIONAL (create if beneficial for the design):
 - static/css/custom.css for additional styles beyond Tailwind
 - static/js/custom.js for interactivity (smooth scroll, animations)
-- Generate custom images using the image generation tool (only if requested or clearly beneficial)
+- Reuse existing images or create inline SVG/CSS artwork when beneficial
 
 Use the Write tool to create the files. Start with home.html.
 The current working directory is already the prompt folder, so use relative paths like "home.html" or "static/css/custom.css".
@@ -314,35 +263,18 @@ def generate_landing(
         secondary_color=secondary_color,
         language_full=language_full,
         context_section=context_section,
-        image_cli_path=str(IMAGE_CLI_PATH),
         landing_url=landing_url or "(not provided)"
     )
 
-    claude_exe = find_claude_executable()
-
-    # Build command with specific Bash permission for image generation only
-    # The pattern "Bash(python {path}:*)" allows ONLY that specific script
-    image_cli_pattern = f"Bash(python {IMAGE_CLI_PATH}:*)"
-
-    cmd = [
-        claude_exe,
-        "--allowedTools", f"Write,Read,Edit,{image_cli_pattern}",
-        "--permission-mode", "bypassPermissions",
-        "--max-turns", "15",  # More turns to allow for image generation
-        "--model", "sonnet"
-    ]
+    cmd = _claude_command(15)
 
     try:
         # Pass prompt via stdin to avoid Windows CMD issues with newlines and escaping
-        result = subprocess.run(
+        result = run_claude_in_sandbox(
             cmd,
-            input=wizard_prompt,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
+            prompt=wizard_prompt,
+            workspace=prompt_dir,
             timeout=timeout,
-            cwd=str(prompt_dir)
         )
 
         # Check what files were created
@@ -394,7 +326,7 @@ def generate_landing(
     except FileNotFoundError:
         return {
             "success": False,
-            "error": "Claude CLI not found. Make sure 'claude' is installed and in PATH."
+            "error": "Verified wizard sandbox runner became unavailable."
         }
     except Exception as e:
         return {
@@ -497,19 +429,11 @@ USER REQUEST:
 ########################################################################
 
 ########################################################################
-# IMAGE GENERATION (Use if user requests new images)
+# ASSET RULES
 ########################################################################
-You can generate AI images using this command:
-
-python "{image_cli_path}" --prompt "DESCRIPTION" --output "static/img/FILENAME.png" --engine poe --ratio 16:9
-
-Available options:
-- Engines: gemini (fast), poe (best quality), openai
-- Ratios: 1:1, 16:9, 9:16, 4:3, 3:4
-- For style references (to match existing images): --refs static/img/existing.png
-
-Example:
-python "{image_cli_path}" -p "Hero image matching the style of existing landing page" -o "static/img/new_hero.png" -e poe -r 16:9 --refs static/img/hero.png
+- Shell commands and external image generators are unavailable in this sandbox.
+- Reuse existing files under static/img/ when suitable.
+- Inline SVG and CSS artwork are allowed when they do not require external tools.
 ########################################################################
 
 ########################################################################
@@ -611,33 +535,17 @@ def modify_landing(
         file_list=file_list_str,
         user_instructions=instructions,
         context_section=context_section,
-        image_cli_path=str(IMAGE_CLI_PATH)
     )
 
-    claude_exe = find_claude_executable()
-
-    # Build command with specific Bash permission for image generation only
-    image_cli_pattern = f"Bash(python {IMAGE_CLI_PATH}:*)"
-
-    cmd = [
-        claude_exe,
-        "--allowedTools", f"Write,Read,Edit,{image_cli_pattern}",
-        "--permission-mode", "bypassPermissions",
-        "--max-turns", "20",  # More turns for modifications with images
-        "--model", "sonnet"
-    ]
+    cmd = _claude_command(20)
 
     try:
         # Pass prompt via stdin to avoid Windows CMD issues with newlines and escaping
-        result = subprocess.run(
+        result = run_claude_in_sandbox(
             cmd,
-            input=modify_prompt,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
+            prompt=modify_prompt,
+            workspace=prompt_dir,
             timeout=timeout,
-            cwd=str(prompt_dir)
         )
 
         # For modify, we consider it successful if Claude ran without error
@@ -668,7 +576,7 @@ def modify_landing(
     except FileNotFoundError:
         return {
             "success": False,
-            "error": "Claude CLI not found. See: https://docs.anthropic.com/en/docs/claude-code/getting-started"
+            "error": "Verified wizard sandbox runner became unavailable."
         }
     except Exception as e:
         return {
@@ -810,23 +718,11 @@ LANGUAGE: {language_full}
 ########################################################################
 
 ########################################################################
-# IMAGE GENERATION (OPTIONAL - Use if user requests custom images)
+# ASSET RULES
 ########################################################################
-You can generate AI images using this command:
-
-python "{image_cli_path}" --prompt "DESCRIPTION" --output "welcome/static/img/FILENAME.png" --engine poe --ratio 16:9
-
-Available options:
-- Engines: gemini (fast), poe (best quality with references), openai
-- Ratios: 1:1, 16:9, 9:16, 4:3, 3:4
-- For style references: --refs existing_image.png
-
-Examples:
-- Background image: python "{image_cli_path}" -p "Immersive atmospheric background for AI assistant, dark cinematic" -o "welcome/static/img/bg.png" -e poe -r 16:9
-- Feature icon: python "{image_cli_path}" -p "Simple icon representing AI conversation, minimal style" -o "welcome/static/img/feature1.png" -e gemini -r 1:1
-
-IMPORTANT: First create the welcome/static/img/ directory if needed, then generate images.
-Only generate images if the user specifically requests them or if they would significantly improve the welcome page.
+- Shell commands and external image generators are unavailable in this sandbox.
+- Reuse existing files under welcome/static/img/ when suitable.
+- Inline SVG and CSS artwork are allowed when they do not require external tools.
 ########################################################################
 
 ########################################################################
@@ -857,7 +753,7 @@ REQUIREMENTS:
 OPTIONAL (create if beneficial for the design):
 - welcome/static/css/custom.css for additional styles beyond Tailwind
 - welcome/static/js/custom.js for interactivity (smooth scroll, animations, particles)
-- Generate custom images using the image generation tool (only if requested or clearly beneficial)
+- Reuse existing images or create inline SVG/CSS artwork when beneficial
 
 Use the Write tool to create the files. Start with welcome/index.html.
 The current working directory is already the prompt folder, so use relative paths like "welcome/index.html" or "welcome/static/css/custom.css".
@@ -898,19 +794,11 @@ USER REQUEST:
 ########################################################################
 
 ########################################################################
-# IMAGE GENERATION (Use if user requests new images)
+# ASSET RULES
 ########################################################################
-You can generate AI images using this command:
-
-python "{image_cli_path}" --prompt "DESCRIPTION" --output "welcome/static/img/FILENAME.png" --engine poe --ratio 16:9
-
-Available options:
-- Engines: gemini (fast), poe (best quality), openai
-- Ratios: 1:1, 16:9, 9:16, 4:3, 3:4
-- For style references (to match existing images): --refs welcome/static/img/existing.png
-
-Example:
-python "{image_cli_path}" -p "Background image matching the style of existing welcome page" -o "welcome/static/img/new_bg.png" -e poe -r 16:9 --refs welcome/static/img/bg.png
+- Shell commands and external image generators are unavailable in this sandbox.
+- Reuse existing files under welcome/static/img/ when suitable.
+- Inline SVG and CSS artwork are allowed when they do not require external tools.
 ########################################################################
 
 ########################################################################
@@ -928,8 +816,8 @@ INSTRUCTIONS:
 4. Preserve the existing design style unless asked to change it
 5. Use Edit tool to modify existing files when possible
 6. Use Write tool only if creating new files is necessary
-7. If the user requests new images, generate them using the image CLI
-8. If referencing existing images, you can use them as style references with --refs
+7. Reuse existing images when requested; do not run shell commands or generators
+8. Prefer inline SVG or CSS artwork when no suitable image exists
 9. Ensure any chat/start buttons link to "{chat_url}"
 10. All files must remain within the welcome/ subdirectory
 
@@ -1012,34 +900,18 @@ def generate_welcome(
         language_full=language_full,
         context_section=context_section,
         avatar_section=avatar_section,
-        image_cli_path=str(IMAGE_CLI_PATH),
         chat_url=chat_url
     )
 
-    claude_exe = find_claude_executable()
-
-    # Build command with specific Bash permission for image generation only
-    image_cli_pattern = f"Bash(python {IMAGE_CLI_PATH}:*)"
-
-    cmd = [
-        claude_exe,
-        "--allowedTools", f"Write,Read,Edit,{image_cli_pattern}",
-        "--permission-mode", "bypassPermissions",
-        "--max-turns", "15",
-        "--model", "sonnet"
-    ]
+    cmd = _claude_command(15)
 
     try:
         # Pass prompt via stdin to avoid Windows CMD issues with newlines and escaping
-        result = subprocess.run(
+        result = run_claude_in_sandbox(
             cmd,
-            input=wizard_prompt,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
+            prompt=wizard_prompt,
+            workspace=prompt_dir,
             timeout=timeout,
-            cwd=str(prompt_dir)
         )
 
         # Check what files were created
@@ -1089,7 +961,7 @@ def generate_welcome(
     except FileNotFoundError:
         return {
             "success": False,
-            "error": "Claude CLI not found. Make sure 'claude' is installed and in PATH."
+            "error": "Verified wizard sandbox runner became unavailable."
         }
     except Exception as e:
         return {
@@ -1240,35 +1112,19 @@ def modify_welcome(
         existing_files=file_list_str,
         instructions=instructions,
         context_section=context_section,
-        image_cli_path=str(IMAGE_CLI_PATH),
         chat_url=chat_url,
         language_full=language_full
     )
 
-    claude_exe = find_claude_executable()
-
-    # Build command with specific Bash permission for image generation only
-    image_cli_pattern = f"Bash(python {IMAGE_CLI_PATH}:*)"
-
-    cmd = [
-        claude_exe,
-        "--allowedTools", f"Write,Read,Edit,{image_cli_pattern}",
-        "--permission-mode", "bypassPermissions",
-        "--max-turns", "20",
-        "--model", "sonnet"
-    ]
+    cmd = _claude_command(20)
 
     try:
         # Pass prompt via stdin to avoid Windows CMD issues with newlines and escaping
-        result = subprocess.run(
+        result = run_claude_in_sandbox(
             cmd,
-            input=modify_prompt,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
+            prompt=modify_prompt,
+            workspace=prompt_dir,
             timeout=timeout,
-            cwd=str(prompt_dir)
         )
 
         if result.returncode == 0:
@@ -1294,7 +1150,7 @@ def modify_welcome(
     except FileNotFoundError:
         return {
             "success": False,
-            "error": "Claude CLI not found. See: https://docs.anthropic.com/en/docs/claude-code/getting-started"
+            "error": "Verified wizard sandbox runner became unavailable."
         }
     except Exception as e:
         return {

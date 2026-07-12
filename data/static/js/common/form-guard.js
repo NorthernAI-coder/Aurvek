@@ -14,6 +14,7 @@
  *   FormGuard.createGroup(name)      // guard group for complex pages
  *   FormGuard.navigate(url, opts)    // safe programmatic navigation
  *   FormGuard.reloadIfClean()        // safe reload after AJAX save
+ *   FormGuard.resumeAfterSubmit(el)  // reset submit state after custom cancellation
  */
 (function() {
     'use strict';
@@ -111,6 +112,25 @@
             container.removeEventListener('input', onDirty);
             container.removeEventListener('change', onDirty);
         };
+    }
+
+    function trackFormSubmission(entry, event) {
+        entry._fgSubmitGeneration = (entry._fgSubmitGeneration || 0) + 1;
+        var generation = entry._fgSubmitGeneration;
+        entry._fgSubmitting = !event.defaultPrevented;
+
+        // AJAX handlers may run after this listener and call preventDefault().
+        // Re-check once submit dispatch has completed so a failed/cancelled AJAX
+        // save never suppresses the unsaved-changes warning.
+        var afterDispatch = function() {
+            if (entry._fgSubmitGeneration !== generation) return;
+            if (event.defaultPrevented) entry._fgSubmitting = false;
+        };
+        if (typeof queueMicrotask === 'function') {
+            queueMicrotask(afterDispatch);
+        } else {
+            Promise.resolve().then(afterDispatch);
+        }
     }
 
     // -- Warning modal --
@@ -243,13 +263,14 @@
                 _fgSnapshot: serializeForm(form, exclude),
                 _fgDirty: false,
                 _fgDirtyManual: false,
-                _fgSubmitting: false
+                _fgSubmitting: false,
+                _fgSubmitGeneration: 0
             };
             _ungrouped.push(entry);
 
             // Auto-attach submit handler for form POST
-            form.addEventListener('submit', function() {
-                entry._fgSubmitting = true;
+            form.addEventListener('submit', function(event) {
+                trackFormSubmission(entry, event);
             });
 
             return entry;
@@ -309,6 +330,7 @@
                     entry._fgDirty = false;
                     entry._fgDirtyManual = false;
                     entry._fgSubmitting = false;
+                    entry._fgSubmitGeneration = (entry._fgSubmitGeneration || 0) + 1;
                     if (entry._fgMode === 'snapshot') {
                         entry._fgSnapshot = serializeForm(entry._fgElement, entry._fgExclude);
                     }
@@ -324,6 +346,19 @@
                 if (_ungrouped[i]._fgElement === el) return isEntryDirty(_ungrouped[i]);
             }
             return false;
+        },
+
+        resumeAfterSubmit: function(elOrSelector) {
+            var el = resolveEl(elOrSelector);
+            if (!el) return;
+            for (var i = 0; i < _ungrouped.length; i++) {
+                if (_ungrouped[i]._fgElement === el) {
+                    _ungrouped[i]._fgSubmitting = false;
+                    _ungrouped[i]._fgSubmitGeneration =
+                        (_ungrouped[i]._fgSubmitGeneration || 0) + 1;
+                    return;
+                }
+            }
         },
 
         unwatch: function(elOrSelector) {
@@ -433,6 +468,15 @@
         if (shouldWarn()) {
             e.preventDefault();
             e.returnValue = '';
+        }
+    });
+
+    window.addEventListener('pageshow', function() {
+        _guardDisabled = false;
+        for (var i = 0; i < _ungrouped.length; i++) {
+            _ungrouped[i]._fgSubmitting = false;
+            _ungrouped[i]._fgSubmitGeneration =
+                (_ungrouped[i]._fgSubmitGeneration || 0) + 1;
         }
     });
 

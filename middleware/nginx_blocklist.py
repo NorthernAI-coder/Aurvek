@@ -6,11 +6,16 @@ When IPs are blocked/unblocked by SecurityTracker, changes are synced
 to the file and nginx is reloaded with debounce to avoid excessive reloads.
 """
 
+import asyncio
+import ipaddress
 import logging
 import os
+import stat
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
+from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +51,27 @@ if not NGINX_CONF and _NGINX_BASE:
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BLOCKLIST_PATH = os.getenv("NGINX_BLOCKLIST_PATH", os.path.join(_PROJECT_ROOT, "data", "nginx_blocklist.conf"))
 DEBOUNCE_SECONDS = int(os.getenv("NGINX_BLOCKLIST_DEBOUNCE", "180"))
+RECONCILE_SECONDS = max(10, int(os.getenv("NGINX_BLOCKLIST_RECONCILE_SECONDS", "60")))
+MAX_ENTRIES = max(1, int(os.getenv("NGINX_BLOCKLIST_MAX_ENTRIES", "10000")))
 ENABLED = os.getenv("NGINX_BLOCKLIST_ENABLED", "true").lower() in ("true", "1", "yes")
+RELOAD_MODE = (os.getenv("NGINX_BLOCKLIST_RELOAD_MODE", "direct") or "direct").strip().lower()
+if RELOAD_MODE not in {"direct", "external"}:
+    logger.warning(
+        "NGINX_BLOCKLIST: Unknown reload mode %r; falling back to direct",
+        RELOAD_MODE,
+    )
+    RELOAD_MODE = "direct"
 
 
 class NginxBlocklistManager:
     """Manages a dynamic nginx IP blocklist with debounced reload."""
 
     def __init__(self):
-        self._blocked_ips: set = set()
+        self._blocked_ips: set[str] = set()
         self._dirty: bool = False
         self._last_reload_ts: float = 0.0
+        self._generation: int = 0
+        self._reload_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,20 +81,93 @@ class NginxBlocklistManager:
         """Add IP to blocklist. Marks dirty. Skips admin IPs."""
         if not ENABLED:
             return
-        from middleware.security import SecurityConfig
-        if ip in SecurityConfig.get_admin_ips():
+
+        normalized_ip = self._normalize_ip(ip)
+        if normalized_ip is None:
+            logger.warning("NGINX_BLOCKLIST: Ignoring invalid IP: %r", ip)
             return
-        if ip not in self._blocked_ips:
-            self._blocked_ips.add(ip)
+        if not self._is_edge_eligible(normalized_ip):
+            logger.warning("NGINX_BLOCKLIST: Ignoring non-public edge IP: %s", normalized_ip)
+            return
+
+        from middleware.security import SecurityConfig
+        if normalized_ip in SecurityConfig.get_admin_ips():
+            return
+
+        if normalized_ip not in self._blocked_ips:
+            if len(self._blocked_ips) >= MAX_ENTRIES:
+                logger.error(
+                    "NGINX_BLOCKLIST: Entry limit reached (%d); ignoring %s",
+                    MAX_ENTRIES,
+                    normalized_ip,
+                )
+                return
+            self._blocked_ips.add(normalized_ip)
             self._dirty = True
+            self._generation += 1
 
     def remove_ip(self, ip: str) -> None:
         """Remove IP from blocklist. Marks dirty."""
         if not ENABLED:
             return
-        if ip in self._blocked_ips:
-            self._blocked_ips.discard(ip)
+
+        normalized_ip = self._normalize_ip(ip)
+        if normalized_ip is None:
+            return
+
+        if normalized_ip in self._blocked_ips:
+            self._blocked_ips.discard(normalized_ip)
             self._dirty = True
+            self._generation += 1
+
+    def reconcile_ips(self, active_ips: Iterable[str], *, remove_missing: bool) -> bool:
+        """Reconcile the file state with an active SecurityTracker snapshot."""
+        if not ENABLED:
+            return False
+
+        normalized: set[str] = set()
+        truncated = False
+        invalid_snapshot_entry = False
+        for ip in active_ips:
+            normalized_ip = self._normalize_ip(ip)
+            if normalized_ip is None:
+                logger.warning("NGINX_BLOCKLIST: Snapshot contains invalid IP: %r", ip)
+                invalid_snapshot_entry = True
+                continue
+            if not self._is_edge_eligible(normalized_ip):
+                continue
+            if normalized_ip in normalized:
+                continue
+            if len(normalized) >= MAX_ENTRIES:
+                truncated = True
+                break
+            normalized.add(normalized_ip)
+
+        from middleware.security import SecurityConfig
+        normalized.difference_update(SecurityConfig.get_admin_ips())
+
+        if remove_missing and not truncated and not invalid_snapshot_entry:
+            desired = normalized
+        else:
+            desired = set(sorted(self._blocked_ips)[:MAX_ENTRIES])
+            additions = sorted(normalized - desired)
+            available_slots = max(0, MAX_ENTRIES - len(desired))
+            desired.update(additions[:available_slots])
+            if len(additions) > available_slots:
+                truncated = True
+
+        if desired == self._blocked_ips:
+            return False
+
+        self._blocked_ips = desired
+        self._dirty = True
+        self._generation += 1
+        if truncated:
+            logger.error(
+                "NGINX_BLOCKLIST: Snapshot exceeded %d entries; kept existing entries",
+                MAX_ENTRIES,
+            )
+        return True
 
     async def maybe_reload(self) -> None:
         """
@@ -88,25 +177,15 @@ class NginxBlocklistManager:
         if not ENABLED or not self._dirty:
             return
 
-        now = time.time()
-        if (now - self._last_reload_ts) < DEBOUNCE_SECONDS:
-            return
+        async with self._reload_lock:
+            if not self._dirty:
+                return
 
-        self._write_blocklist()
+            now = time.time()
+            if (now - self._last_reload_ts) < DEBOUNCE_SECONDS:
+                return
 
-        ok = self._nginx_test()
-        if not ok:
-            logger.error("NGINX_BLOCKLIST: Config test failed, skipping reload")
-            self._last_reload_ts = now
-            return
-
-        reloaded = self._nginx_reload()
-        if reloaded:
-            self._dirty = False
-            logger.info("NGINX_BLOCKLIST: Reloaded with %d blocked IPs", len(self._blocked_ips))
-        else:
-            logger.warning("NGINX_BLOCKLIST: Reload failed; keeping pending blocklist changes for retry")
-        self._last_reload_ts = now
+            await self._flush_pending(now=now, context="update")
 
     async def initialize(self) -> None:
         """
@@ -124,26 +203,55 @@ class NginxBlocklistManager:
         else:
             self._load_existing()
 
-        logger.info("NGINX_BLOCKLIST: Initialized with %d IPs", len(self._blocked_ips))
+        logger.info(
+            "NGINX_BLOCKLIST: Initialized with %d IPs (reload_mode=%s)",
+            len(self._blocked_ips),
+            RELOAD_MODE,
+        )
+
+    async def reconcile_once(self) -> None:
+        """Reconcile persisted entries with the authoritative security backend."""
+        if not ENABLED:
+            return
+
+        from middleware.security import get_active_security_block_ips_snapshot_async
+
+        generation_before_snapshot = self._generation
+        snapshot = await get_active_security_block_ips_snapshot_async(limit=MAX_ENTRIES)
+        self.reconcile_ips(
+            snapshot["ips"],
+            remove_missing=(
+                bool(snapshot["authoritative"])
+                and self._generation == generation_before_snapshot
+            ),
+        )
+        if snapshot.get("truncated"):
+            logger.error(
+                "NGINX_BLOCKLIST: Active backend snapshot reached the %d entry limit; "
+                "stale entries will not be removed",
+                MAX_ENTRIES,
+            )
+        await self.maybe_reload()
+
+    async def reconciliation_loop(self) -> None:
+        """Periodically remove expired blocks and recover backend changes."""
+        while True:
+            await asyncio.sleep(RECONCILE_SECONDS)
+            try:
+                await self.reconcile_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("NGINX_BLOCKLIST: Periodic reconciliation failed")
 
     async def shutdown(self) -> None:
         """Flush final changes if dirty."""
         if not ENABLED or not self._dirty:
             return
 
-        self._write_blocklist()
-        ok = self._nginx_test()
-        reloaded = False
-        if ok:
-            reloaded = self._nginx_reload()
-            if reloaded:
-                logger.info("NGINX_BLOCKLIST: Shutdown flush completed (%d IPs)", len(self._blocked_ips))
-            else:
-                logger.error("NGINX_BLOCKLIST: Shutdown flush reload failed")
-        else:
-            logger.error("NGINX_BLOCKLIST: Shutdown flush - config test failed, skipped reload")
-        if ok and reloaded:
-            self._dirty = False
+        async with self._reload_lock:
+            if self._dirty:
+                await self._flush_pending(now=time.time(), context="shutdown")
 
     def _build_nginx_cmd(self, *args: str) -> list[str]:
         """
@@ -161,8 +269,58 @@ class NginxBlocklistManager:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_ip(ip: str) -> str | None:
+        try:
+            address = ipaddress.ip_address((ip or "").strip())
+            if getattr(address, "scope_id", None) is not None:
+                return None
+            return str(address)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_edge_eligible(ip: str) -> bool:
+        """External/root promotion accepts only globally routable addresses."""
+        return RELOAD_MODE != "external" or ipaddress.ip_address(ip).is_global
+
+    async def _flush_pending(self, *, now: float, context: str) -> None:
+        generation = self._generation
+        entry_count = len(self._blocked_ips)
+        self._write_blocklist()
+
+        if RELOAD_MODE == "external":
+            if self._generation == generation:
+                self._dirty = False
+            self._last_reload_ts = now
+            logger.info(
+                "NGINX_BLOCKLIST: Wrote %d IPs for external reload (%s)",
+                entry_count,
+                context,
+            )
+            return
+
+        ok = await asyncio.to_thread(self._nginx_test)
+        if not ok:
+            logger.error("NGINX_BLOCKLIST: Config test failed, skipping reload")
+            self._last_reload_ts = now
+            return
+
+        reloaded = await asyncio.to_thread(self._nginx_reload)
+        if reloaded:
+            if self._generation == generation:
+                self._dirty = False
+            logger.info(
+                "NGINX_BLOCKLIST: Reloaded with %d blocked IPs (%s)",
+                entry_count,
+                context,
+            )
+        else:
+            logger.warning("NGINX_BLOCKLIST: Reload failed; keeping pending changes for retry")
+        self._last_reload_ts = now
+
     def _write_blocklist(self) -> None:
-        """Write the blocklist file in nginx geo format."""
+        """Atomically write the blocklist staging file in nginx map format."""
         lines = [
             "# Auto-generated by AURVEK NginxBlocklistManager",
             "# DO NOT EDIT MANUALLY - changes will be overwritten",
@@ -173,8 +331,31 @@ class NginxBlocklistManager:
 
         content = "\n".join(lines) + "\n"
 
-        with open(BLOCKLIST_PATH, "w", encoding="utf-8") as f:
-            f.write(content)
+        parent = os.path.dirname(os.path.abspath(BLOCKLIST_PATH))
+        os.makedirs(parent, exist_ok=True)
+
+        target_mode = 0o644
+        try:
+            target_mode = stat.S_IMODE(os.stat(BLOCKLIST_PATH).st_mode)
+        except FileNotFoundError:
+            pass
+
+        temp_path = ""
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix=".nginx-blocklist-", dir=parent)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_path, target_mode)
+            os.replace(temp_path, BLOCKLIST_PATH)
+            temp_path = ""
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
 
     def _load_existing(self) -> None:
         """Load IPs from existing blocklist file (geo format: 'IP 1;')."""
@@ -186,8 +367,27 @@ class NginxBlocklistManager:
                         continue
                     # Expected format: "1.2.3.4 1;"
                     parts = line.split()
-                    if len(parts) >= 2 and parts[1] == "1;":
-                        self._blocked_ips.add(parts[0])
+                    if len(parts) == 2 and parts[1] == "1;":
+                        normalized_ip = self._normalize_ip(parts[0])
+                        if normalized_ip is None:
+                            logger.warning(
+                                "NGINX_BLOCKLIST: Ignoring invalid persisted IP: %r",
+                                parts[0],
+                            )
+                            continue
+                        if not self._is_edge_eligible(normalized_ip):
+                            logger.warning(
+                                "NGINX_BLOCKLIST: Ignoring non-public persisted IP: %s",
+                                normalized_ip,
+                            )
+                            continue
+                        if len(self._blocked_ips) >= MAX_ENTRIES:
+                            logger.error(
+                                "NGINX_BLOCKLIST: Persisted list exceeds %d entries; truncating",
+                                MAX_ENTRIES,
+                            )
+                            break
+                        self._blocked_ips.add(normalized_ip)
         except Exception as exc:
             logger.error("NGINX_BLOCKLIST: Failed to load existing file: %s", exc)
 

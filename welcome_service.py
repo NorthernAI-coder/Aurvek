@@ -9,8 +9,16 @@ managing the product switcher data.
 import os
 import json
 import logging
+import re
+from html import escape
 from fastapi.responses import HTMLResponse
 from database import get_db_connection
+from marketplace.landing.isolation import (
+    build_creator_content_url,
+    creator_content_unavailable_response,
+    safe_iframe_url,
+    sign_content_token,
+)
 from marketplace.services.entitlements import active_entitlement_condition
 from marketplace.services.entitlements import user_has_pack_access as user_has_pack_entitlement_access
 from marketplace.services.entitlements import user_has_prompt_access as user_has_prompt_entitlement_access
@@ -225,31 +233,53 @@ async def serve_welcome_world(request, user, world: dict) -> HTMLResponse:
     Returns an HTMLResponse with the welcome HTML enriched with the
     product switcher data and navbar overlay.
     """
-    welcome_dir = os.path.join(world["path"], "welcome")
-    index_path = os.path.join(welcome_dir, "index.html")
+    access_token = sign_content_token(
+        {
+            "purpose": "welcome",
+            "entity_type": world["type"],
+            "entity_id": int(world["id"]),
+        },
+        ttl_seconds=8 * 60 * 60,
+    )
+    if not access_token:
+        return creator_content_unavailable_response()
 
-    with open(index_path, "r", encoding="utf-8") as f:
-        html = f.read()
-
-    # Rewrite static asset paths to include world tag for cache isolation
-    # e.g. /home/static/img/avatar.webp -> /home/static/p57/img/avatar.webp
-    world_tag = f"{'p' if world['type'] == 'prompt' else 'k'}{world['id']}"
-    html = html.replace("/home/static/", f"/home/static/{world_tag}/")
+    isolated_path = (
+        f"/_aurvek/welcome/{world['type']}/{int(world['id'])}/{access_token}/"
+    )
+    iframe_url = build_creator_content_url(isolated_path)
+    if not iframe_url:
+        return creator_content_unavailable_response()
 
     # Build navbar HTML
     navbar_html = render_aurvek_world_navbar(world)
 
     # Build switcher data
     switcher_data = await get_world_switcher_data(user, world)
-    switcher_script = (
-        f"<script>window.__aurvekWorlds = {json.dumps(switcher_data)};</script>"
-    )
-
-    # Inject before </head> and </body>
-    html = html.replace("</head>", switcher_script + "\n</head>", 1)
-    html = html.replace("</body>", navbar_html + "\n</body>", 1)
-
-    return HTMLResponse(html)
+    switcher_json = json.dumps(switcher_data).replace("</", "<\\/")
+    switcher_script = f"<script>window.__aurvekWorlds = {switcher_json};</script>"
+    title = escape(str(world.get("name") or "Welcome"))
+    wrapper = f"""<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <title>{title}</title>
+    <style>
+        html,body{{height:100%;margin:0;background:#0b0d12;overflow:hidden}}
+        .aurvek-world-frame{{position:fixed;inset:0;border:0;width:100%;height:100%}}
+    </style>
+    {switcher_script}
+</head>
+<body>
+    <iframe class="aurvek-world-frame" src="{safe_iframe_url(iframe_url)}"
+        title="{title}" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
+        referrerpolicy="no-referrer"></iframe>
+    {navbar_html}
+</body>
+</html>"""
+    return HTMLResponse(wrapper, headers={"Cache-Control": "no-store"})
 
 
 def render_aurvek_world_navbar(world: dict) -> str:
@@ -260,7 +290,12 @@ def render_aurvek_world_navbar(world: dict) -> str:
     and does not require Jinja2 rendering.
     """
     with open(_NAVBAR_TEMPLATE_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+        html = f.read()
+    return re.sub(
+        r"\{\{\s*get_static_url\('([^']+)'\)\s*\}\}",
+        r"\1",
+        html,
+    )
 
 
 async def get_world_switcher_data(user, current_world: dict) -> dict:
@@ -323,5 +358,3 @@ async def get_world_switcher_data(user, current_world: dict) -> dict:
         "current": current,
         "products": products,
     }
-
-

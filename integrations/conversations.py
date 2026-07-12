@@ -323,6 +323,29 @@ async def set_external_conversation(
                 "message": f"Conversation #{conv_id} is locked. Use !new to start a fresh one.",
             }
 
+        try:
+            await cursor.execute(
+                """
+                SELECT 1
+                FROM EXTERNAL_DEVICE_BINDINGS
+                WHERE user_id = ?
+                  AND conversation_id = ?
+                LIMIT 1
+                """,
+                (user_id, conv_id),
+            )
+            if await cursor.fetchone():
+                await conn.rollback()
+                return {
+                    "success": False,
+                    "error": "external_devices_attached",
+                    "message": "Remove external device access before assigning this conversation to WhatsApp or Telegram.",
+                }
+        except sqlite3.OperationalError as exc:
+            if "EXTERNAL_DEVICE_BINDINGS" not in str(exc).upper():
+                await conn.rollback()
+                raise
+
         ok, err_code, err_msg = await can_use_platform(user_id, target_platform, cursor)
         if not ok:
             await conn.rollback()

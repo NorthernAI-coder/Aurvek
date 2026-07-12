@@ -6,7 +6,9 @@
 class UserCredentialsManager {
     constructor() {
         this.STORAGE_KEY = 'aurvek_user_api_keys';
+        this.STORAGE_MODE_KEY = 'aurvek_credentials_storage_mode';
         this.storageMode = 'session'; // 'session' | 'persistent' | 'server'
+        this.storageModes = ['session', 'persistent', 'server'];
         this.providers = ['openai', 'anthropic', 'google', 'xai', 'minimax', 'kimi', 'elevenlabs'];
         this.init();
     }
@@ -16,22 +18,131 @@ class UserCredentialsManager {
      */
     init() {
         // Load storage mode preference
-        const savedMode = localStorage.getItem('aurvek_credentials_storage_mode');
-        if (savedMode) {
+        const savedMode = localStorage.getItem(this.STORAGE_MODE_KEY);
+        if (this.storageModes.includes(savedMode)) {
             this.storageMode = savedMode;
-        }
-
-        // Also check if there are keys in localStorage (persistent mode)
-        const persistentData = localStorage.getItem(this.STORAGE_KEY);
-        if (persistentData) {
-            const data = JSON.parse(persistentData);
-            if (data.storageMode) {
-                this.storageMode = data.storageMode;
+        } else {
+            // Legacy fallback: only infer the mode from stored data when there is
+            // no explicit preference.  A stale browser copy must never override
+            // a successfully saved server/session preference.
+            const persistentData = localStorage.getItem(this.STORAGE_KEY);
+            if (persistentData) {
+                try {
+                    const data = JSON.parse(persistentData);
+                    if (this.storageModes.includes(data.storageMode)) {
+                        this.storageMode = data.storageMode;
+                    }
+                } catch (error) {
+                    console.error('Error parsing stored API credentials:', error);
+                }
             }
         }
 
         // Load existing keys into form
-        this.loadKeysToForm();
+        this.loadKeysToForm().catch(error => {
+            console.error('Error loading API credentials:', error);
+        });
+    }
+
+    isLocalMode(mode) {
+        return mode === 'session' || mode === 'persistent';
+    }
+
+    getStorageForMode(mode) {
+        if (mode === 'session') return sessionStorage;
+        if (mode === 'persistent') return localStorage;
+        throw new Error(`Storage mode "${mode}" does not use browser storage.`);
+    }
+
+    /**
+     * Server responses intentionally contain display masks, never secrets.
+     * Keep this check at every write/test boundary so legacy masks cannot be
+     * uploaded or tested if they have already leaked into browser storage.
+     */
+    isMaskedKey(key) {
+        if (typeof key !== 'string') return false;
+        const value = key.trim();
+        return value === '****' || /^[\s\S]{8}\.\.\.[\s\S]{4}$/.test(value);
+    }
+
+    getMaskedProviders(keys) {
+        if (!keys || typeof keys !== 'object') return [];
+        return Object.entries(keys)
+            .filter(([, key]) => this.isMaskedKey(key))
+            .map(([provider]) => provider);
+    }
+
+    getLocalDataForMode(mode) {
+        const storage = this.getStorageForMode(mode);
+        const stored = storage.getItem(this.STORAGE_KEY);
+        if (!stored) return { storageMode: mode, keys: {} };
+
+        let data;
+        try {
+            data = JSON.parse(stored);
+        } catch (error) {
+            throw new Error('Stored API keys could not be read. Clear the invalid browser data and try again.');
+        }
+
+        const keys = data && typeof data.keys === 'object' && !Array.isArray(data.keys)
+            ? { ...data.keys }
+            : {};
+        return { storageMode: mode, keys };
+    }
+
+    saveLocalKeysForMode(mode, keys) {
+        const maskedProviders = this.getMaskedProviders(keys);
+        if (maskedProviders.length > 0) {
+            throw new Error('Masked API keys cannot be stored as credentials. Re-enter the full keys first.');
+        }
+        this.getStorageForMode(mode).setItem(
+            this.STORAGE_KEY,
+            JSON.stringify({ storageMode: mode, keys: { ...keys } })
+        );
+    }
+
+    captureStorageState() {
+        return {
+            preference: localStorage.getItem(this.STORAGE_MODE_KEY),
+            persistent: localStorage.getItem(this.STORAGE_KEY),
+            session: sessionStorage.getItem(this.STORAGE_KEY)
+        };
+    }
+
+    restoreStorageState(snapshot) {
+        const restoreItem = (storage, key, value) => {
+            if (value === null) storage.removeItem(key);
+            else storage.setItem(key, value);
+        };
+
+        try {
+            restoreItem(localStorage, this.STORAGE_MODE_KEY, snapshot.preference);
+            restoreItem(localStorage, this.STORAGE_KEY, snapshot.persistent);
+            restoreItem(sessionStorage, this.STORAGE_KEY, snapshot.session);
+        } catch (error) {
+            console.error('Could not fully restore API credential storage state:', error);
+        }
+    }
+
+    collectReenteredKeys(requiredKeys) {
+        const requiredProviders = Object.keys(requiredKeys || {}).filter(provider => requiredKeys[provider]);
+        const providers = Array.from(new Set([...this.providers, ...requiredProviders]));
+        const keys = {};
+        const missing = [];
+
+        for (const provider of providers) {
+            const input = document.getElementById(`key-${provider}`);
+            const value = input?.value?.trim() || '';
+            const isDisplayMask = input?.dataset?.hasServerKey === 'true' || this.isMaskedKey(value);
+
+            if (value && !isDisplayMask) {
+                keys[provider] = value;
+            } else if (requiredProviders.includes(provider)) {
+                missing.push(provider);
+            }
+        }
+
+        return { keys, missing };
     }
 
     /**
@@ -39,7 +150,7 @@ class UserCredentialsManager {
      * @returns {Storage} localStorage or sessionStorage
      */
     getStorage() {
-        return this.storageMode === 'persistent' ? localStorage : sessionStorage;
+        return this.getStorageForMode(this.storageMode);
     }
 
     /**
@@ -47,48 +158,90 @@ class UserCredentialsManager {
      * @param {string} mode - 'session' | 'persistent' | 'server'
      */
     async setStorageMode(mode) {
-        const oldMode = this.storageMode;
-        this.storageMode = mode;
-
-        // Save mode preference
-        localStorage.setItem('aurvek_credentials_storage_mode', mode);
-
-        // If switching away from server mode, we might want to keep server keys
-        // If switching to server mode, we might want to migrate local keys
-
-        if (oldMode !== 'server' && mode === 'server') {
-            // Migrating to server - upload current local keys
-            const localKeys = this.getLocalKeys();
-            if (Object.keys(localKeys.keys).length > 0) {
-                await this.saveAllToServer(localKeys.keys);
-            }
-        } else if (oldMode === 'server' && mode !== 'server') {
-            // Migrating from server - download keys to local storage
-            const serverKeys = await this.getAllFromServer();
-            if (serverKeys && Object.keys(serverKeys).length > 0) {
-                this.saveLocalKeys(serverKeys);
-            }
-        } else if (oldMode === 'session' && mode === 'persistent') {
-            // Move from session to persistent
-            const sessionData = sessionStorage.getItem(this.STORAGE_KEY);
-            if (sessionData) {
-                localStorage.setItem(this.STORAGE_KEY, sessionData);
-                sessionStorage.removeItem(this.STORAGE_KEY);
-            }
-        } else if (oldMode === 'persistent' && mode === 'session') {
-            // Move from persistent to session
-            const persistentData = localStorage.getItem(this.STORAGE_KEY);
-            if (persistentData) {
-                sessionStorage.setItem(this.STORAGE_KEY, persistentData);
-                localStorage.removeItem(this.STORAGE_KEY);
-            }
+        if (!this.storageModes.includes(mode)) {
+            return { success: false, message: 'Invalid credential storage mode.' };
         }
 
-        // Update the stored data with new mode
-        const storage = this.getStorage();
-        const data = this.getAllLocalData();
-        data.storageMode = mode;
-        storage.setItem(this.STORAGE_KEY, JSON.stringify(data));
+        const oldMode = this.storageMode;
+        if (oldMode === mode) {
+            return { success: true, mode };
+        }
+
+        let snapshot = null;
+
+        try {
+            snapshot = this.captureStorageState();
+            if (this.isLocalMode(oldMode)) {
+                // Read the source explicitly before changing this.storageMode.
+                const sourceData = this.getLocalDataForMode(oldMode);
+                const maskedProviders = this.getMaskedProviders(sourceData.keys);
+                if (maskedProviders.length > 0) {
+                    const requiredReentry = Object.fromEntries(
+                        maskedProviders.map(provider => [provider, true])
+                    );
+                    const reentry = this.collectReenteredKeys(requiredReentry);
+                    if (reentry.missing.length > 0) {
+                        const error = new Error(
+                            `Re-enter the full API key for: ${reentry.missing.join(', ')} before changing storage mode.`
+                        );
+                        error.reentryRequired = true;
+                        error.missingProviders = reentry.missing;
+                        error.maskedProviders = maskedProviders;
+                        throw error;
+                    }
+                    for (const provider of maskedProviders) {
+                        sourceData.keys[provider] = reentry.keys[provider];
+                    }
+                }
+
+                if (mode === 'server') {
+                    if (Object.keys(sourceData.keys).length > 0) {
+                        const result = await this.saveAllToServer(sourceData.keys);
+                        if (!result?.success) {
+                            throw new Error(result?.message || 'Could not save API keys on the server.');
+                        }
+                    }
+                    this.getStorageForMode(oldMode).removeItem(this.STORAGE_KEY);
+                } else {
+                    this.saveLocalKeysForMode(mode, sourceData.keys);
+                    this.getStorageForMode(oldMode).removeItem(this.STORAGE_KEY);
+                }
+            } else {
+                // The server only exposes masks. Read them as metadata so every
+                // server-stored provider must be re-entered before going local.
+                const serverResult = await this.getAllFromServerResult();
+                if (!serverResult.success) {
+                    throw new Error(serverResult.message || 'Could not read server API key status.');
+                }
+
+                const reentry = this.collectReenteredKeys(serverResult.keys);
+                if (reentry.missing.length > 0) {
+                    const error = new Error(
+                        `Re-enter the full API key for: ${reentry.missing.join(', ')} before switching to browser storage.`
+                    );
+                    error.reentryRequired = true;
+                    error.missingProviders = reentry.missing;
+                    throw error;
+                }
+                this.saveLocalKeysForMode(mode, reentry.keys);
+            }
+
+            // Persist the preference and in-memory mode only after migration has
+            // completed successfully.
+            localStorage.setItem(this.STORAGE_MODE_KEY, mode);
+            this.storageMode = mode;
+            return { success: true, mode };
+        } catch (error) {
+            if (snapshot) this.restoreStorageState(snapshot);
+            this.storageMode = oldMode;
+            return {
+                success: false,
+                message: error.message || 'Could not change credential storage mode.',
+                reentryRequired: Boolean(error.reentryRequired),
+                missingProviders: error.missingProviders || [],
+                maskedProviders: error.maskedProviders || []
+            };
+        }
     }
 
     /**
@@ -96,9 +249,7 @@ class UserCredentialsManager {
      * @returns {Object} Storage data object
      */
     getAllLocalData() {
-        const storage = this.getStorage();
-        const stored = storage.getItem(this.STORAGE_KEY);
-        return stored ? JSON.parse(stored) : { storageMode: this.storageMode, keys: {} };
+        return this.getLocalDataForMode(this.storageMode);
     }
 
     /**
@@ -114,9 +265,7 @@ class UserCredentialsManager {
      * @param {Object} keys - Keys object to save
      */
     saveLocalKeys(keys) {
-        const storage = this.getStorage();
-        const data = { storageMode: this.storageMode, keys };
-        storage.setItem(this.STORAGE_KEY, JSON.stringify(data));
+        this.saveLocalKeysForMode(this.storageMode, keys);
     }
 
     /**
@@ -125,18 +274,30 @@ class UserCredentialsManager {
      * @param {string} key - API key
      */
     async setKey(provider, key) {
-        if (this.storageMode === 'server') {
-            return await this.saveToServer(provider, key);
+        const normalizedKey = typeof key === 'string' ? key.trim() : '';
+        if (normalizedKey && this.isMaskedKey(normalizedKey)) {
+            return {
+                success: false,
+                message: 'Re-enter the full API key. Masked values cannot be saved.'
+            };
         }
 
-        const data = this.getAllLocalData();
-        if (key) {
-            data.keys[provider] = key;
-        } else {
-            delete data.keys[provider];
+        if (this.storageMode === 'server') {
+            return await this.saveToServer(provider, normalizedKey);
         }
-        this.getStorage().setItem(this.STORAGE_KEY, JSON.stringify(data));
-        return { success: true };
+
+        try {
+            const data = this.getAllLocalData();
+            if (normalizedKey) {
+                data.keys[provider] = normalizedKey;
+            } else {
+                delete data.keys[provider];
+            }
+            this.saveLocalKeys(data.keys);
+            return { success: true };
+        } catch (error) {
+            return { success: false, message: error.message || 'Could not save the API key.' };
+        }
     }
 
     /**
@@ -159,7 +320,9 @@ class UserCredentialsManager {
      */
     async getAllKeys() {
         if (this.storageMode === 'server') {
-            return await this.getAllFromServer();
+            // Server keys are resolved server-side. GET only returns masks, which
+            // must never be sent back as request credentials.
+            return {};
         }
         return this.getAllLocalData().keys;
     }
@@ -171,6 +334,18 @@ class UserCredentialsManager {
      * @returns {Promise<Object>} Test result
      */
     async testKey(provider, key) {
+        const normalizedKey = typeof key === 'string' ? key.trim() : '';
+        if (!normalizedKey) {
+            return { success: false, message: 'Enter an API key to test.' };
+        }
+        if (this.isMaskedKey(normalizedKey)) {
+            return {
+                success: false,
+                message: 'Re-enter the full API key before testing it.',
+                masked: true
+            };
+        }
+
         try {
             const response = await fetch('/api/test-api-key', {
                 method: 'POST',
@@ -179,9 +354,16 @@ class UserCredentialsManager {
                     'X-Requested-With': 'XMLHttpRequest'
                 },
                 credentials: 'include',
-                body: JSON.stringify({ provider, key })
+                body: JSON.stringify({ provider, key: normalizedKey })
             });
-            return await response.json();
+            const result = await response.json();
+            if (!response.ok || !result?.success) {
+                return {
+                    success: false,
+                    message: result?.message || `API key test failed (${response.status}).`
+                };
+            }
+            return result;
         } catch (error) {
             return { success: false, message: error.message };
         }
@@ -194,6 +376,13 @@ class UserCredentialsManager {
      * @returns {Promise<Object>} Save result
      */
     async saveToServer(provider, key) {
+        if (key && this.isMaskedKey(key)) {
+            return {
+                success: false,
+                message: 'Re-enter the full API key. Masked values cannot be saved.'
+            };
+        }
+
         try {
             const response = await fetch('/api/user-credentials', {
                 method: 'POST',
@@ -210,6 +399,13 @@ class UserCredentialsManager {
             if (response.status === 403 && result.error === 'not_allowed') {
                 this.showNotAllowedError();
                 return { success: false, message: result.message, notAllowed: true };
+            }
+
+            if (!response.ok || !result?.success) {
+                return {
+                    success: false,
+                    message: result?.message || `Could not save the API key (${response.status}).`
+                };
             }
 
             return result;
@@ -231,6 +427,18 @@ class UserCredentialsManager {
      * @returns {Promise<Object>} Save result
      */
     async saveAllToServer(keys) {
+        const maskedProviders = this.getMaskedProviders(keys);
+        if (maskedProviders.length > 0) {
+            return {
+                success: false,
+                message: 'Masked API keys cannot be uploaded. Re-enter the full keys first.',
+                maskedProviders
+            };
+        }
+        if (!keys || Object.keys(keys).length === 0) {
+            return { success: true, message: 'No API keys to migrate.' };
+        }
+
         try {
             const response = await fetch('/api/user-credentials/batch', {
                 method: 'POST',
@@ -247,6 +455,13 @@ class UserCredentialsManager {
             if (response.status === 403 && result.error === 'not_allowed') {
                 this.showNotAllowedError();
                 return { success: false, message: result.message, notAllowed: true };
+            }
+
+            if (!response.ok || !result?.success) {
+                return {
+                    success: false,
+                    message: result?.message || `Could not save API keys (${response.status}).`
+                };
             }
 
             return result;
@@ -269,6 +484,10 @@ class UserCredentialsManager {
                 }
             });
             const data = await response.json();
+            if (!response.ok) {
+                console.error('Error getting key status from server:', data?.message || response.status);
+                return null;
+            }
             return data.exists ? data.key : null;
         } catch (error) {
             console.error('Error getting key from server:', error);
@@ -280,7 +499,7 @@ class UserCredentialsManager {
      * Get all keys from server
      * @returns {Promise<Object>} Keys object
      */
-    async getAllFromServer() {
+    async getAllFromServerResult() {
         try {
             const response = await fetch('/api/user-credentials', {
                 credentials: 'include',
@@ -289,11 +508,26 @@ class UserCredentialsManager {
                 }
             });
             const data = await response.json();
-            return data.keys || {};
+            if (!response.ok || data?.success === false) {
+                return {
+                    success: false,
+                    keys: {},
+                    message: data?.message || `Could not read server API keys (${response.status}).`
+                };
+            }
+            const keys = data?.keys && typeof data.keys === 'object' && !Array.isArray(data.keys)
+                ? data.keys
+                : {};
+            return { success: true, keys };
         } catch (error) {
             console.error('Error getting keys from server:', error);
-            return {};
+            return { success: false, keys: {}, message: error.message };
         }
+    }
+
+    async getAllFromServer() {
+        const result = await this.getAllFromServerResult();
+        return result.success ? result.keys : {};
     }
 
     /**
@@ -303,21 +537,35 @@ class UserCredentialsManager {
     async deleteKey(provider) {
         if (this.storageMode === 'server') {
             try {
-                await fetch(`/api/user-credentials/${provider}`, {
+                const response = await fetch(`/api/user-credentials/${provider}`, {
                     method: 'DELETE',
                     credentials: 'include',
                     headers: {
                         'X-Requested-With': 'XMLHttpRequest'
                     }
                 });
+                const result = await response.json();
+                if (!response.ok || !result?.success) {
+                    return {
+                        success: false,
+                        message: result?.message || `Could not delete the API key (${response.status}).`
+                    };
+                }
+                return result;
             } catch (error) {
                 console.error('Error deleting key from server:', error);
+                return { success: false, message: error.message };
             }
         }
 
-        const data = this.getAllLocalData();
-        delete data.keys[provider];
-        this.getStorage().setItem(this.STORAGE_KEY, JSON.stringify(data));
+        try {
+            const data = this.getAllLocalData();
+            delete data.keys[provider];
+            this.saveLocalKeys(data.keys);
+            return { success: true };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
     }
 
     /**
@@ -348,30 +596,40 @@ class UserCredentialsManager {
      * Load keys into the form fields
      */
     async loadKeysToForm() {
-        // Set storage mode radio
-        const modeRadio = document.querySelector(`input[name="storageMode"][value="${this.storageMode}"]`);
-        if (modeRadio) {
-            modeRadio.checked = true;
+        this.syncStorageModeUI();
+
+        let keys;
+        if (this.storageMode === 'server') {
+            const result = await this.getAllFromServerResult();
+            if (!result.success) {
+                return result;
+            }
+            keys = result.keys;
+        } else {
+            keys = this.getAllLocalData().keys;
         }
 
-        // Update storage info text
-        this.updateStorageInfo();
-
-        // Load keys for each provider
         for (const provider of this.providers) {
-            const key = await this.getKey(provider);
+            const key = keys[provider] || '';
             const input = document.getElementById(`key-${provider}`);
-            if (input && key) {
-                // Show masked key for server mode, actual key for local modes
-                if (this.storageMode === 'server') {
-                    input.value = key; // Server returns masked key
+            if (input) {
+                input.value = key;
+                delete input.dataset.hasServerKey;
+                if (key && this.storageMode === 'server') {
+                    // This value is display-only and must never be saved/tested.
                     input.dataset.hasServerKey = 'true';
-                } else {
-                    input.value = key;
                 }
-                this.updateStatus(provider, 'saved', 'Key saved');
+                this.updateStatus(provider, key ? 'saved' : '', key ? 'Key saved' : '');
             }
         }
+        return { success: true };
+    }
+
+    syncStorageModeUI() {
+        document.querySelectorAll('input[name="storageMode"]').forEach(radio => {
+            radio.checked = radio.value === this.storageMode;
+        });
+        this.updateStorageInfo();
     }
 
     /**
@@ -430,6 +688,10 @@ class UserCredentialsManager {
      * @returns {Promise<boolean>}
      */
     async hasKeys() {
+        if (this.storageMode === 'server') {
+            const result = await this.getAllFromServerResult();
+            return result.success && Object.keys(result.keys).length > 0;
+        }
         const keys = await this.getAllKeys();
         return Object.keys(keys).length > 0;
     }
@@ -439,6 +701,9 @@ class UserCredentialsManager {
      * @returns {Promise<string|null>} Base64 encoded keys or null
      */
     async getKeysForRequest() {
+        if (this.storageMode === 'server') {
+            return null;
+        }
         const keys = await this.getAllKeys();
         if (Object.keys(keys).length === 0) {
             return null;
@@ -453,13 +718,52 @@ window.userCredentials = new UserCredentialsManager();
 // DOM Ready - Setup event handlers
 document.addEventListener('DOMContentLoaded', () => {
     const manager = window.userCredentials;
+    let storageModeChangeInProgress = false;
 
     // Storage mode change handlers
     document.querySelectorAll('input[name="storageMode"]').forEach(radio => {
         radio.addEventListener('change', async (e) => {
-            await manager.setStorageMode(e.target.value);
-            manager.updateStorageInfo();
-            NotificationModal.toast('Storage mode changed', 'info');
+            if (storageModeChangeInProgress) {
+                manager.syncStorageModeUI();
+                return;
+            }
+
+            const radios = Array.from(document.querySelectorAll('input[name="storageMode"]'));
+            storageModeChangeInProgress = true;
+            radios.forEach(item => { item.disabled = true; });
+
+            try {
+                const result = await manager.setStorageMode(e.target.value);
+                if (!result.success) {
+                    // The manager deliberately keeps its previous mode until all
+                    // migration work succeeds. Reflect that rollback in the UI.
+                    manager.syncStorageModeUI();
+                    NotificationModal.toast(
+                        result.message || 'Could not change storage mode',
+                        result.reentryRequired ? 'warning' : 'error'
+                    );
+                    return;
+                }
+
+                const loadResult = await manager.loadKeysToForm();
+                if (loadResult?.success === false) {
+                    NotificationModal.toast(
+                        loadResult.message || 'Storage mode changed, but keys could not be refreshed',
+                        'warning'
+                    );
+                } else {
+                    NotificationModal.toast('Storage mode changed', 'info');
+                }
+            } catch (error) {
+                manager.syncStorageModeUI();
+                NotificationModal.toast(
+                    error.message || 'Could not change storage mode',
+                    'error'
+                );
+            } finally {
+                radios.forEach(item => { item.disabled = false; });
+                storageModeChangeInProgress = false;
+            }
         });
     });
 
@@ -503,6 +807,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 NotificationModal.toast(`Please enter a ${provider} API key first`, 'warning');
                 return;
             }
+            if (input.dataset.hasServerKey === 'true' || manager.isMaskedKey(key)) {
+                NotificationModal.toast(
+                    `Re-enter the full ${provider} API key before testing it`,
+                    'warning'
+                );
+                return;
+            }
 
             manager.updateStatus(provider, 'testing');
             btn.disabled = true;
@@ -541,25 +852,44 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
 
         let savedCount = 0;
+        let failedCount = 0;
+        let maskedCount = 0;
 
         for (const provider of manager.providers) {
             const input = document.getElementById(`key-${provider}`);
             const key = input?.value.trim();
 
-            if (key && !input.dataset.hasServerKey) {
-                await manager.setKey(provider, key);
-                manager.updateStatus(provider, 'saved', 'Key saved');
-                savedCount++;
+            if (key && (input.dataset.hasServerKey === 'true' || manager.isMaskedKey(key))) {
+                maskedCount++;
+                continue;
+            }
+
+            if (key) {
+                const result = await manager.setKey(provider, key);
+                if (result?.success) {
+                    manager.updateStatus(provider, 'saved', 'Key saved');
+                    savedCount++;
+                } else {
+                    manager.updateStatus(provider, 'error', result?.message || 'Could not save key');
+                    failedCount++;
+                }
             }
         }
 
         btn.disabled = false;
         btn.innerHTML = '<i class="fas fa-save"></i> Save All';
 
-        if (savedCount > 0) {
+        if (failedCount > 0) {
+            NotificationModal.toast(
+                `${failedCount} API key(s) could not be saved. Review the marked fields.`,
+                'error'
+            );
+        } else if (savedCount > 0) {
             var credForm = document.getElementById('apiKeysForm');
             if (credForm) FormGuard.markClean(credForm);
             NotificationModal.toast(`Saved ${savedCount} API key(s)`, 'success');
+        } else if (maskedCount > 0) {
+            NotificationModal.toast('Stored server masks were not saved. Re-enter a full key to replace it.', 'info');
         } else {
             NotificationModal.toast('No new keys to save', 'info');
         }
@@ -573,12 +903,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let validCount = 0;
         let testedCount = 0;
+        let maskedCount = 0;
 
         for (const provider of manager.providers) {
             const input = document.getElementById(`key-${provider}`);
             const key = input?.value.trim();
 
             if (key) {
+                if (input.dataset.hasServerKey === 'true' || manager.isMaskedKey(key)) {
+                    maskedCount++;
+                    continue;
+                }
                 testedCount++;
                 manager.updateStatus(provider, 'testing');
 
@@ -597,9 +932,18 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.innerHTML = '<i class="fas fa-vial"></i> Test All';
 
         if (testedCount === 0) {
-            NotificationModal.toast('No API keys to test', 'info');
+            NotificationModal.toast(
+                maskedCount > 0
+                    ? 'Re-enter a full API key before testing server-stored credentials'
+                    : 'No API keys to test',
+                maskedCount > 0 ? 'warning' : 'info'
+            );
         } else {
-            NotificationModal.toast(`${validCount}/${testedCount} keys are valid`, validCount === testedCount ? 'success' : 'warning');
+            const skipped = maskedCount > 0 ? `; ${maskedCount} masked key(s) skipped` : '';
+            NotificationModal.toast(
+                `${validCount}/${testedCount} keys are valid${skipped}`,
+                validCount === testedCount && maskedCount === 0 ? 'success' : 'warning'
+            );
         }
     });
 
@@ -638,4 +982,3 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(function() { FormGuard.markClean(_fgCredContainer); }, 500);
     }
 });
-

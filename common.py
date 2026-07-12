@@ -6,6 +6,7 @@ import html
 import time
 import hashlib
 import asyncio
+import math
 import secrets
 import string
 import unicodedata
@@ -48,8 +49,34 @@ openrouter_key = os.getenv('OPENROUTER_API_KEY')
 minimax_key = os.getenv('MINIMAX_API_KEY')
 moonshot_key = os.getenv('MOONSHOT_API_KEY') or os.getenv('KIMI_API_KEY')
 
-# Security: cookie secure flag (requires HTTPS in production)
-SECURE_COOKIES = os.getenv("SECURE_COOKIES", "false").lower() == "true"
+# Security: cookies are HTTPS-only unless local HTTP development explicitly
+# opts out. Production refuses an insecure override instead of silently
+# issuing authentication cookies over plaintext connections.
+def resolve_secure_cookie_setting(
+    environment: str | None,
+    raw_value: str | None,
+) -> bool:
+    environment = (environment or "").strip().lower()
+    if raw_value is None:
+        enabled = True
+    else:
+        normalized = raw_value.strip().lower()
+        if normalized not in {"true", "false"}:
+            raise RuntimeError("SECURE_COOKIES must be either 'true' or 'false'.")
+        enabled = normalized == "true"
+
+    if not enabled and environment not in {"dev", "development", "local", "test", "testing"}:
+        raise RuntimeError(
+            "SECURE_COOKIES=false is allowed only when ENVIRONMENT explicitly "
+            "identifies a local or test environment."
+        )
+    return enabled
+
+
+SECURE_COOKIES = resolve_secure_cookie_setting(
+    os.getenv("ENVIRONMENT"),
+    os.getenv("SECURE_COOKIES"),
+)
 PRIMARY_APP_DOMAIN = os.getenv("PRIMARY_APP_DOMAIN", "").strip()
 
 # Failover read-only mode: blocks all write operations (POST/PUT/DELETE/PATCH)
@@ -455,12 +482,27 @@ DATA_DIR = SCRIPT_DIR / "data"
 class Cost:
     TTS_COST_PER_CHARACTER = 0.0002  # Default values, in case of failure
     STT_COST_PER_MINUTE = 0.0059  # Deepgram default
-    DALLE_COST = 0.016
+    # Media generation must be backed by a concrete SERVICES row.  The
+    # monetary defaults below are only compatibility values; without a
+    # matching service id the reservation layer fails closed.
+    DALLE_COST = 0.04
     IMAGE_GENERATION_COST = DALLE_COST
+    MEDIA_GENERATION_SERVICES = {}
 
     TTS_SERVICE_ID = None
     STT_SERVICE_ID = None
     DALLE_SERVICE_ID = None
+
+    @classmethod
+    def get_media_generation_service(
+        cls,
+        service_name: str,
+    ) -> tuple[float, int | None]:
+        """Return the configured fixed price and service id for generated media."""
+        service = cls.MEDIA_GENERATION_SERVICES.get(str(service_name or ""))
+        if not service:
+            return 0.0, None
+        return float(service["cost"] or 0.0), service["service_id"]
 
     @classmethod
     async def initialize(cls):
@@ -482,8 +524,14 @@ class Cost:
             cls.STT_COST_PER_MINUTE = costs.get('STT_COST_PER_MINUTE', cls.STT_COST_PER_MINUTE)
             cls.STT_SERVICE_ID = costs.get('STT_SERVICE_ID')
             
-        cls.DALLE_COST = costs.get('DALLE_COST', cls.DALLE_COST)
-        cls.DALLE_SERVICE_ID = costs.get('DALLE_SERVICE_ID')
+        cls.MEDIA_GENERATION_SERVICES = costs.get(
+            'MEDIA_GENERATION_SERVICES',
+            {},
+        )
+        cls.DALLE_COST, cls.DALLE_SERVICE_ID = cls.get_media_generation_service(
+            'IMAGE-DALL-E-3-STANDARD-SQUARE'
+        )
+        cls.IMAGE_GENERATION_COST = cls.DALLE_COST
 
 
 
@@ -854,7 +902,7 @@ async def load_service_costs():
                 FROM SERVICES
             ''')
             costs = await cursor.fetchall()
-            cost_dict = {}
+            cost_dict = {'MEDIA_GENERATION_SERVICES': {}}
             for row in costs:
                 service_id, service_name, cost_per_unit = row
                 if service_name == 'TTS-ELEVENLABS':
@@ -872,9 +920,11 @@ async def load_service_costs():
                 elif service_name == 'STT':  # Maintain backward compatibility
                     cost_dict['STT_COST_PER_MINUTE'] = cost_per_unit
                     cost_dict['STT_SERVICE_ID'] = service_id
-                elif service_name == 'DALLE-2-256':
-                    cost_dict['DALLE_COST'] = cost_per_unit
-                    cost_dict['DALLE_SERVICE_ID'] = service_id
+                elif service_name.startswith(('IMAGE-', 'VIDEO-')):
+                    cost_dict['MEDIA_GENERATION_SERVICES'][service_name] = {
+                        'cost': cost_per_unit,
+                        'service_id': service_id,
+                    }
                     
             return cost_dict
         except Exception as e:
@@ -1777,8 +1827,12 @@ async def get_user_billing_info(user_id: int, conn=None) -> dict:
             'billing_auto_refill_count': 0
         }
 
+    billing_account_id = row[0]
+    if billing_account_id is not None and int(billing_account_id) == int(user_id):
+        billing_account_id = None
+
     return {
-        'billing_account_id': row[0],
+        'billing_account_id': billing_account_id,
         'billing_limit': float(row[1]) if row[1] is not None else None,
         'billing_limit_action': row[2] or 'block',
         'billing_current_month_spent': float(row[3] or 0),
@@ -1973,6 +2027,7 @@ async def consume_token(
     prompt_id=None,
     byok=False,
     override_api_cost=None,
+    billing_account_id_override=None,
 ):
     """
     Consume tokens and apply pricing logic based on prompt configuration.
@@ -2100,7 +2155,13 @@ async def consume_token(
 
         # Check for team billing
         billing_info = await get_user_billing_info(user_id, conn)
-        billing_account_id = billing_info['billing_account_id']
+        if billing_account_id_override is None:
+            billing_account_id = billing_info['billing_account_id']
+        else:
+            reserved_payer_id = int(billing_account_id_override)
+            billing_account_id = (
+                None if reserved_payer_id == int(user_id) else reserved_payer_id
+            )
 
         if billing_account_id:
             # TEAM BILLING: charge billing owner's account instead of user's
@@ -2117,35 +2178,67 @@ async def consume_token(
             ''', (user_id,))
             user_billing = await cursor.fetchone()
             billing_limit = float(user_billing[0]) if user_billing[0] is not None else None
-            billing_limit_action = user_billing[1] or 'block'
+            billing_limit_action = str(user_billing[1] or 'block').lower()
             current_month_spent = float(user_billing[2] or 0)
             auto_refill_amount = float(user_billing[3]) if user_billing[3] is not None else 10.0
             max_limit = float(user_billing[4]) if user_billing[4] is not None else None
 
             # Check monthly spending limit
+            if (
+                billing_limit_action == 'auto_refill'
+                and max_limit is not None
+                and current_month_spent + total_cost > max_limit + 1e-12
+            ):
+                logger.info(
+                    "[consume_token] Team-billed user %s blocked - requested "
+                    "spend exceeds max limit. Requested: %s, Max: %s",
+                    user_id,
+                    current_month_spent + total_cost,
+                    max_limit,
+                )
+                return False
             if billing_limit is not None:
                 if current_month_spent + total_cost > billing_limit:
                     if billing_limit_action == 'block':
                         logger.info(f"[consume_token] Team-billed user {user_id} blocked - monthly limit reached. Limit: {billing_limit}, Spent: {current_month_spent}, Requested: {total_cost}")
                         return False
                     elif billing_limit_action == 'auto_refill':
-                        # Auto-refill: increase the limit automatically
-                        new_limit = billing_limit + auto_refill_amount
-
-                        # Check if we would exceed the maximum limit cap
-                        if max_limit is not None and new_limit > max_limit:
-                            logger.info(f"[consume_token] Team-billed user {user_id} blocked - auto_refill would exceed max limit. Current: {billing_limit}, Max: {max_limit}")
+                        requested_spend = current_month_spent + total_cost
+                        if (
+                            not math.isfinite(auto_refill_amount)
+                            or auto_refill_amount <= 0
+                        ):
+                            logger.info(
+                                "[consume_token] Team-billed user %s blocked - "
+                                "invalid auto-refill amount",
+                                user_id,
+                            )
+                            return False
+                        refill_gap = max(0.0, requested_spend - billing_limit)
+                        refill_count = max(
+                            1,
+                            math.ceil(
+                                max(0.0, refill_gap - 1e-12)
+                                / auto_refill_amount
+                            ),
+                        )
+                        new_limit = billing_limit + refill_count * auto_refill_amount
+                        if max_limit is not None:
+                            new_limit = min(new_limit, max_limit)
+                        if new_limit + 1e-12 < requested_spend:
+                            logger.info(f"[consume_token] Team-billed user {user_id} blocked - auto-refill cannot cover requested spend. Requested: {requested_spend}, Limit: {new_limit}")
                             return False
 
                         # Update the billing limit and increment auto_refill_count
                         await cursor.execute('''
                             UPDATE USER_DETAILS
                             SET billing_limit = ?,
-                                billing_auto_refill_count = billing_auto_refill_count + 1
+                                billing_auto_refill_count =
+                                    COALESCE(billing_auto_refill_count, 0) + ?
                             WHERE user_id = ?
-                        ''', (new_limit, user_id))
+                        ''', (new_limit, refill_count, user_id))
 
-                        logger.info(f"[consume_token] Team-billed user {user_id} auto-refill triggered. Limit: {billing_limit} -> {new_limit}")
+                        logger.info(f"[consume_token] Team-billed user {user_id} auto-refill triggered ({refill_count} increments). Limit: {billing_limit} -> {new_limit}")
                         billing_limit = new_limit  # Update local variable for subsequent checks
                     else:
                         # 'notify' - log warning but continue

@@ -65,6 +65,7 @@ class User:
         can_change_password: bool = False,
         google_id: Optional[str] = None,
         auth_provider: str = "local",
+        session_version: int = 1,
     ):
         self.id = id
         self.username = username
@@ -83,6 +84,10 @@ class User:
         self.can_change_password = can_change_password
         self.google_id = google_id
         self.auth_provider = auth_provider
+        self.session_version = max(1, int(session_version or 1))
+        self.auth_time = 0
+        self.session_expires_at = 0
+        self.used_magic_link = False
 
         # We initialize the role attributes
         self._is_admin = is_admin
@@ -170,7 +175,8 @@ class User:
             "current_prompt_id": self.current_prompt_id,
             "uses_magic_link": self.uses_magic_link,
             "authentication_mode": self.authentication_mode,
-            "can_change_password": self.can_change_password
+            "can_change_password": self.can_change_password,
+            "session_version": self.session_version,
         }
 
 

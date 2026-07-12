@@ -78,8 +78,8 @@
                 </div>
                 <div class="mb-3" id="initialPasswordContainer" style="display: none;">
                     <label for="initialPassword" class="form-label">Initial Password</label>
-                    <input type="password" class="form-control" id="initialPassword" name="initial_password" minlength="6">
-                    <small class="form-text text-muted">Minimum 6 characters required for password modes</small>
+                    <input type="password" class="form-control" id="initialPassword" name="initial_password" minlength="8">
+                    <small class="form-text text-muted">Minimum 8 characters required for password modes</small>
                 </div>
                 <div class="mb-3 form-check" id="canChangePasswordContainer" style="display: none;">
                     <input type="checkbox" class="form-check-input" id="canChangePassword" name="can_change_password">
@@ -144,7 +144,8 @@
         <div class="flex-row mt-3" id="verificationCodeContainer" style="display: none;">
             <div class="flex-column">
                 <label for="verificationCode" class="form-label">Verification Code</label>
-                <input type="text" class="form-control" id="verificationCode" name="verification_code">
+                <input type="text" class="form-control" id="verificationCode" inputmode="numeric" autocomplete="one-time-code">
+                <input type="hidden" id="phoneVerificationId" name="phone_verification_id">
             </div>
             <div class="flex-column"></div>
         </div>
@@ -181,10 +182,12 @@
                     <input type="checkbox" class="form-check-input" id="allowImageGeneration" name="allow_image_generation">
                     <label class="form-check-label" for="allowImageGeneration">Allow AI to generate images</label>
                 </div>
+                {% if is_admin %}
                 <div class="mb-3 form-check">
                     <input type="checkbox" class="form-check-input" id="skipVerification" name="skip_verification">
                     <label class="form-check-label" for="skipVerification">Skip phone verification</label>
                 </div>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -330,6 +333,8 @@
         const phoneInputField = document.getElementById('phone');
         const sendCodeButton = document.getElementById('sendCodeButton');
         const verificationCodeContainer = document.getElementById('verificationCodeContainer');
+        const verificationCodeInput = document.getElementById('verificationCode');
+        const phoneVerificationIdInput = document.getElementById('phoneVerificationId');
         const skipVerificationCheckbox = document.getElementById('skipVerification');
         const useRandomUsernameCheckbox = document.getElementById('useRandomUsername');
         const usernameInput = document.getElementById('username');
@@ -341,8 +346,23 @@
         const initialPasswordInput = document.getElementById('initialPassword');
 
         let phoneInputJS;
+        let phoneChallengeId = null;
+        let challengePhoneNumber = null;
+        let phoneChallengeApproved = false;
+
+        function resetPhoneVerification() {
+            phoneChallengeId = null;
+            challengePhoneNumber = null;
+            phoneChallengeApproved = false;
+            phoneVerificationIdInput.value = '';
+            verificationCodeInput.value = '';
+            verificationCodeContainer.style.display = 'none';
+        }
 
         function initPhoneInput() {
+            if (phoneInputJS) {
+                phoneInputJS.destroy();
+            }
             phoneInputJS = window.intlTelInput(phoneInputField, {
                 initialCountry: "auto",
                 geoIpLookup: async function(success) {
@@ -396,26 +416,63 @@
         async function handleFormSubmit(event) {
             event.preventDefault();
             const formData = new FormData(form);
-            formData.set('phone', phoneInputJS.getNumber());
+            const phoneNumber = phoneInputJS.getNumber();
+            formData.set('phone', phoneNumber);
 
             if (useRandomUsernameCheckbox.checked) {
                 formData.delete('username');
             }
 
-            if (!skipVerificationCheckbox.checked && phoneInputField.value && !formData.get('verification_code')) {
-                NotificationModal.warning('Verification Required', 'Please enter the verification code.');
-                return;
+            const skipVerification = Boolean(skipVerificationCheckbox?.checked);
+            if (phoneNumber && !skipVerification) {
+                if (!phoneChallengeId || challengePhoneNumber !== phoneNumber) {
+                    NotificationModal.warning('Verification Required', 'Send a verification code for this phone number first.');
+                    return;
+                }
+                if (!phoneChallengeApproved) {
+                    const code = verificationCodeInput.value.trim();
+                    if (!code) {
+                        NotificationModal.warning('Verification Required', 'Please enter the verification code.');
+                        return;
+                    }
+                    try {
+                        const verifyResponse = await secureFetch('/api/verify-code', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                challenge_id: phoneChallengeId,
+                                phone: phoneNumber,
+                                purpose: 'create_user',
+                                code: code
+                            })
+                        });
+                        if (!verifyResponse) return;
+                        const verifyResult = await verifyResponse.json();
+                        if (!verifyResponse.ok || verifyResult.status !== 'approved') {
+                            NotificationModal.error('Verification Failed', verifyResult.detail || 'The verification code is invalid.');
+                            return;
+                        }
+                        phoneChallengeApproved = true;
+                    } catch (error) {
+                        NotificationModal.error('Verification Failed', error.message || 'Could not verify the phone number.');
+                        return;
+                    }
+                }
+                phoneVerificationIdInput.value = phoneChallengeId;
+                formData.set('phone_verification_id', phoneChallengeId);
+            } else {
+                formData.delete('phone_verification_id');
             }
 
             // Validate password requirements
             const authMode = authenticationModeDropdown.value;
             const password = formData.get('initial_password');
-            if (authMode === 'password_only' && (!password || password.length < 6)) {
-                NotificationModal.warning('Password Required', 'Password is required and must be at least 6 characters for password-only mode.');
+            if (authMode === 'password_only' && (!password || password.length < 8)) {
+                NotificationModal.warning('Password Required', 'Password is required and must be at least 8 characters for password-only mode.');
                 return;
             }
-            if (authMode === 'magic_link_password' && password && password.length < 6) {
-                NotificationModal.warning('Invalid Password', 'Password must be at least 6 characters when provided.');
+            if (authMode === 'magic_link_password' && password && password.length < 8) {
+                NotificationModal.warning('Invalid Password', 'Password must be at least 8 characters when provided.');
                 return;
             }
 
@@ -472,6 +529,7 @@
 
         function resetForm(selectedPromptId, selectedMachine) {
             form.reset();
+            resetPhoneVerification();
             document.getElementById('promptDropdown').value = selectedPromptId;
             machineDropdown.value = selectedMachine;
             initPhoneInput();
@@ -483,16 +541,40 @@
 
         async function sendVerificationCode() {
             const phoneNumber = phoneInputJS.getNumber();
+            if (!phoneNumber) {
+                NotificationModal.warning('Phone Required', 'Enter a valid phone number first.');
+                return;
+            }
             try {
+                const checkResponse = await secureFetch('/api/check-phone-number', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone: phoneNumber })
+                });
+                if (!checkResponse) return;
+                const checkResult = await checkResponse.json();
+                if (!checkResponse.ok || checkResult.exists) {
+                    NotificationModal.error('Phone In Use', checkResult.detail || 'This phone number is already in use.');
+                    return;
+                }
+
                 const response = await secureFetch('/api/send-verification-code', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ phone: phoneNumber }),
+                    body: JSON.stringify({
+                        phone: phoneNumber,
+                        purpose: 'create_user'
+                    }),
                 });
                 if (!response) return; // Session expired
 
                 const result = await response.json();
                 if (response.ok && result.status === 'pending') {
+                    phoneChallengeId = result.challenge_id;
+                    challengePhoneNumber = phoneNumber;
+                    phoneChallengeApproved = false;
+                    phoneVerificationIdInput.value = '';
+                    verificationCodeInput.value = '';
                     verificationCodeContainer.style.display = 'block';
                     NotificationModal.success('Code Sent', 'Verification code sent successfully!');
                 } else {
@@ -554,7 +636,16 @@
 
         phoneInputField.addEventListener('input', () => {
             sendCodeButton.style.display = phoneInputField.value ? 'block' : 'none';
-            verificationCodeContainer.style.display = 'none';
+            resetPhoneVerification();
+        });
+
+        skipVerificationCheckbox?.addEventListener('change', () => {
+            if (skipVerificationCheckbox.checked) {
+                resetPhoneVerification();
+                sendCodeButton.style.display = 'none';
+            } else {
+                sendCodeButton.style.display = phoneInputField.value ? 'block' : 'none';
+            }
         });
 
         sendCodeButton.addEventListener('click', sendVerificationCode);

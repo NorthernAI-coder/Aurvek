@@ -11,6 +11,20 @@ CREATE TABLE SERVICES (
     type TEXT NOT NULL
 );
 
+-- Fixed media defaults verified on 2026-07-10 against the official provider
+-- pricing pages. Zero-priced third-party or variable-model entries deliberately
+-- remain disabled until an administrator configures their real unit price.
+INSERT INTO SERVICES (id, name, unit, cost_per_unit, type) VALUES
+    (8, 'IMAGE-DALL-E-3-STANDARD-SQUARE', 'image', 0.04, 'Images'),
+    (9, 'IMAGE-DALL-E-3-STANDARD-WIDE', 'image', 0.08, 'Images'),
+    (10, 'IMAGE-GEMINI-2.5-FLASH', 'image', 0.039, 'Images'),
+    (11, 'IMAGE-IDEOGRAM-V2', 'image', 0.0, 'Images'),
+    (12, 'IMAGE-POE', 'image', 0.0, 'Images'),
+    (13, 'IMAGE-OPENAI-GPT-IMAGE', 'image', 0.0, 'Images'),
+    (14, 'VIDEO-VEO-3.1-FAST-8S-720P', 'video', 0.80, 'Video'),
+    (15, 'VIDEO-VEO-3.1-STANDARD-8S-720P', 'video', 3.20, 'Video'),
+    (16, 'VIDEO-VEO-3.1-LITE-8S-720P', 'video', 0.40, 'Video');
+
 CREATE TABLE VOICES (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -60,10 +74,49 @@ CREATE TABLE USERS (
     is_enabled BOOLEAN, user_info TEXT, profile_picture TEXT, email TEXT,
     google_id TEXT,
     auth_provider TEXT DEFAULT 'local',
+    session_version INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (role_id) REFERENCES USER_ROLES(id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON USERS(google_id);
+
+CREATE TABLE PHONE_VERIFICATION_CHALLENGES (
+    id TEXT PRIMARY KEY,
+    actor_user_id INTEGER NOT NULL,
+    phone_number TEXT NOT NULL,
+    purpose TEXT NOT NULL CHECK(
+        purpose IN ('create_user', 'profile_phone_change')
+    ),
+    request_ip TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'reserved' CHECK(
+        status IN (
+            'reserved', 'pending', 'approved', 'consumed',
+            'provider_error', 'superseded', 'expired', 'failed'
+        )
+    ),
+    verification_attempts INTEGER NOT NULL DEFAULT 0 CHECK(
+        verification_attempts >= 0
+    ),
+    provider_sid TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    approved_at INTEGER,
+    consumed_at INTEGER,
+    last_attempt_at INTEGER,
+    FOREIGN KEY (actor_user_id) REFERENCES USERS(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_phone_verification_actor_created
+ON PHONE_VERIFICATION_CHALLENGES(actor_user_id, created_at);
+
+CREATE INDEX idx_phone_verification_phone_created
+ON PHONE_VERIFICATION_CHALLENGES(phone_number, created_at);
+
+CREATE INDEX idx_phone_verification_ip_created
+ON PHONE_VERIFICATION_CHALLENGES(request_ip, created_at);
+
+CREATE INDEX idx_phone_verification_status_expires
+ON PHONE_VERIFICATION_CHALLENGES(status, expires_at);
 
 CREATE TABLE PROMPTS (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +191,9 @@ CREATE TABLE CONVERSATIONS (
     start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP, chat_name TEXT, stats TEXT, last_analyzed TIMESTAMP, folder_id INTEGER
                 REFERENCES CHAT_FOLDERS(id),
+    elevenlabs_session_id TEXT,
+    elevenlabs_status TEXT
+        CHECK(elevenlabs_status IN ('active', 'completed', 'failed')),
     active_extension_id INTEGER DEFAULT NULL,
     branched_from_id INTEGER DEFAULT NULL,
     branched_at_message_id INTEGER DEFAULT NULL,
@@ -162,6 +218,121 @@ CREATE TABLE MESSAGES (
     FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id),
     FOREIGN KEY (user_id) REFERENCES USERS(id)
 );
+
+CREATE TABLE EXTERNAL_DEVICES (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    slug TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    device_type TEXT NOT NULL DEFAULT 'custom',
+    icon_class TEXT,
+    icon_asset_path TEXT,
+    notes TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    token_hash TEXT NOT NULL,
+    token_prefix TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_seen_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    UNIQUE(user_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_devices_user_id
+ON EXTERNAL_DEVICES(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_external_devices_token_prefix
+ON EXTERNAL_DEVICES(token_prefix);
+
+CREATE INDEX IF NOT EXISTS idx_external_devices_enabled
+ON EXTERNAL_DEVICES(enabled);
+
+CREATE TABLE EXTERNAL_DEVICE_GROUPS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    slug TEXT NOT NULL,
+    name TEXT NOT NULL,
+    icon_class TEXT,
+    notes TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    UNIQUE(user_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_groups_user_id
+ON EXTERNAL_DEVICE_GROUPS(user_id);
+
+CREATE TABLE EXTERNAL_DEVICE_GROUP_MEMBERS (
+    device_id INTEGER NOT NULL,
+    group_id INTEGER NOT NULL,
+    is_primary_route_group INTEGER NOT NULL DEFAULT 0,
+    routing_priority INTEGER NOT NULL DEFAULT 100,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(device_id, group_id),
+    FOREIGN KEY (device_id) REFERENCES EXTERNAL_DEVICES(id) ON DELETE CASCADE,
+    FOREIGN KEY (group_id) REFERENCES EXTERNAL_DEVICE_GROUPS(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_group_members_group_id
+ON EXTERNAL_DEVICE_GROUP_MEMBERS(group_id);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_group_members_device_id
+ON EXTERNAL_DEVICE_GROUP_MEMBERS(device_id);
+
+CREATE TABLE EXTERNAL_DEVICE_BINDINGS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    target_type TEXT NOT NULL CHECK(target_type IN ('device', 'group')),
+    target_id INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    response_mode TEXT NOT NULL DEFAULT 'text',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id) ON DELETE CASCADE,
+    UNIQUE(target_type, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_bindings_user_id
+ON EXTERNAL_DEVICE_BINDINGS(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_bindings_conversation_id
+ON EXTERNAL_DEVICE_BINDINGS(conversation_id);
+
+CREATE TABLE EXTERNAL_DEVICE_EVENTS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id INTEGER NOT NULL,
+    conversation_id INTEGER,
+    external_message_id TEXT,
+    direction TEXT NOT NULL CHECK(direction IN ('in', 'out', 'system')),
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    latency_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (device_id) REFERENCES EXTERNAL_DEVICES(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_events_device_created
+ON EXTERNAL_DEVICE_EVENTS(device_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_events_conversation_created
+ON EXTERNAL_DEVICE_EVENTS(conversation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_events_created_id
+ON EXTERNAL_DEVICE_EVENTS(created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_external_device_events_type_direction_created
+ON EXTERNAL_DEVICE_EVENTS(event_type, direction, created_at, device_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_device_events_message_id
+ON EXTERNAL_DEVICE_EVENTS(device_id, external_message_id)
+WHERE external_message_id IS NOT NULL;
 
 -- =============================================================================
 -- MESSAGES_FTS (full-text search index for message content)
@@ -200,6 +371,43 @@ CREATE TABLE SERVICE_USAGE (
     FOREIGN KEY (service_id) REFERENCES SERVICES(id)
 );
 
+CREATE TABLE BILLING_USAGE_RESERVATIONS (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    billing_account_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('ai', 'image', 'stt', 'video')),
+    service_id INTEGER,
+    usage_quantity REAL CHECK(usage_quantity IS NULL OR usage_quantity > 0),
+    amount REAL NOT NULL CHECK(amount > 0),
+    settled_amount REAL CHECK(settled_amount IS NULL OR settled_amount >= 0),
+    accumulated_input_tokens INTEGER NOT NULL DEFAULT 0
+        CHECK(accumulated_input_tokens >= 0),
+    accumulated_output_tokens INTEGER NOT NULL DEFAULT 0
+        CHECK(accumulated_output_tokens >= 0),
+    accumulated_components TEXT NOT NULL DEFAULT '[]',
+    billing_limit_delta REAL NOT NULL DEFAULT 0
+        CHECK(billing_limit_delta >= 0),
+    billing_refill_count_delta INTEGER NOT NULL DEFAULT 0
+        CHECK(billing_refill_count_delta >= 0),
+    billing_month TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'settled', 'refunded')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    provider_started_at TIMESTAMP,
+    provider_succeeded_at TIMESTAMP,
+    settled_at TIMESTAMP,
+    refunded_at TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (billing_account_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (service_id) REFERENCES SERVICES(id)
+);
+
+CREATE INDEX idx_billing_usage_reservations_active
+    ON BILLING_USAGE_RESERVATIONS(status, created_at);
+
+CREATE INDEX idx_billing_usage_reservations_account
+    ON BILLING_USAGE_RESERVATIONS(billing_account_id, created_at);
+
 CREATE TABLE DISCOUNTS (
     code TEXT PRIMARY KEY,
     discount_value REAL,
@@ -209,8 +417,34 @@ CREATE TABLE DISCOUNTS (
     unlimited_usage BOOLEAN DEFAULT FALSE, 
     unlimited_validity BOOLEAN DEFAULT FALSE,
     created_by_user_id INTEGER,
+    scope TEXT NOT NULL DEFAULT 'marketplace'
+        CHECK(scope IN ('marketplace', 'wallet')),
+    wallet_grant_amount REAL
+        CHECK(
+            wallet_grant_amount IS NULL OR
+            (wallet_grant_amount >= 5 AND wallet_grant_amount <= 500)
+        ),
     FOREIGN KEY (created_by_user_id) REFERENCES USERS(id)
 );
+
+CREATE TABLE DISCOUNT_REDEMPTIONS (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discount_code TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    grant_amount REAL NOT NULL CHECK(
+        grant_amount >= 5 AND grant_amount <= 500
+    ),
+    transaction_reference TEXT,
+    redeemed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    UNIQUE(discount_code, user_id, purpose)
+);
+
+CREATE INDEX idx_discount_redemptions_user_date
+    ON DISCOUNT_REDEMPTIONS(user_id, redeemed_at);
+CREATE INDEX idx_discount_redemptions_code
+    ON DISCOUNT_REDEMPTIONS(discount_code);
 
 CREATE TABLE "PROMPT_PERMISSIONS" (
 
@@ -312,6 +546,7 @@ CREATE TABLE USER_DETAILS (
     web_search_show_sources BOOLEAN DEFAULT 1,
     web_search_inline_citations BOOLEAN DEFAULT 0,
     domain_slots_purchased INTEGER DEFAULT 0,
+    storage_quota_bytes INTEGER DEFAULT NULL CHECK(storage_quota_bytes IS NULL OR storage_quota_bytes >= 0),
     CONSTRAINT USER_DETAILS_PK PRIMARY KEY (user_id),
     CONSTRAINT FK_USER_DETAILS_LLM FOREIGN KEY (llm_id) REFERENCES LLM(id),
     CONSTRAINT FK_USER_DETAILS_PROMPTS_2 FOREIGN KEY (current_prompt_id) REFERENCES PROMPTS(id),
@@ -664,6 +899,30 @@ CREATE TABLE PROMPT_AGENT_MAPPING (
 CREATE INDEX idx_prompt_agent_mapping_agent ON PROMPT_AGENT_MAPPING(agent_id);
 
 -- =============================================================================
+-- ELEVENLABS_CALL_SESSIONS (immutable call ownership and completion marker)
+-- =============================================================================
+CREATE TABLE ELEVENLABS_CALL_SESSIONS (
+    session_id TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'completed', 'failed')),
+    transcript_saved_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_elevenlabs_call_sessions_conversation
+    ON ELEVENLABS_CALL_SESSIONS(conversation_id, created_at);
+
+CREATE UNIQUE INDEX idx_elevenlabs_one_active_call
+    ON ELEVENLABS_CALL_SESSIONS(conversation_id)
+    WHERE status = 'active';
+
+-- =============================================================================
 -- PROMPT_CUSTOM_DOMAINS (custom domain configuration)
 -- =============================================================================
 CREATE TABLE PROMPT_CUSTOM_DOMAINS (
@@ -998,6 +1257,24 @@ CREATE TABLE WELCOME_MESSAGE_READS (
 );
 
 CREATE INDEX idx_welcome_reads_user ON WELCOME_MESSAGE_READS(user_id);
+
+-- =============================================================================
+-- GENERATED MEDIA FILES (storage-quota ledger for AI-generated media on disk)
+-- =============================================================================
+CREATE TABLE GENERATED_MEDIA_FILES (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('image', 'video', 'pdf', 'mp3', 'wav')),
+    rel_path TEXT NOT NULL UNIQUE,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_generated_media_user ON GENERATED_MEDIA_FILES(user_id);
+CREATE INDEX idx_generated_media_conversation ON GENERATED_MEDIA_FILES(conversation_id);
 
 -- =============================================================================
 -- PERFORMANCE INDEXES (hot-path queries)

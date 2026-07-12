@@ -1,5 +1,12 @@
 from ai_runtime.dependencies import *
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    extend_ai_reservation,
+    revalidate_user_billing,
+)
 from tools import function_handlers
+from rediscfg import redis_client
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.providers.claude import call_claude_api
 from ai_runtime.providers.gemini import call_gemini_api
@@ -10,12 +17,29 @@ from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
 from ai_runtime.providers.xai import call_xai_responses_api
 
+
+TOOL_RESULT_MAX_BYTES = 64 * 1024
+TOOL_CALL_SERIALIZATION_BYTES_PER_OUTPUT_TOKEN = 16
+
+
+def truncate_tool_result_for_ai(value, max_bytes: int = TOOL_RESULT_MAX_BYTES) -> str:
+    """Bound tool text before it is added to a second provider request."""
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    suffix = b"\n[Tool result truncated by Aurvek]"
+    payload_limit = max(0, max_bytes - len(suffix))
+    truncated = encoded[:payload_limit].decode("utf-8", errors="ignore")
+    return truncated + suffix.decode("ascii")
+
 def _build_tool_response_messages(api_messages: list, tool_call: dict, tool_result: str, machine: str):
     """Append the assistant tool-call + tool-result messages to api_messages.
 
     Formats correctly per provider so the second-pass API call sees the
     complete tool round-trip in its conversation history.
     """
+    tool_result = truncate_tool_result_for_ai(tool_result)
     function_name = tool_call['name']
     arguments = tool_call['arguments']
 
@@ -109,7 +133,34 @@ def _build_tool_response_messages(api_messages: list, tool_call: dict, tool_resu
             )
         )
 
-async def atFieldActivate(suspicious_text, messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, client):
+async def atFieldActivate(
+    suspicious_text,
+    messages,
+    model,
+    temperature,
+    max_tokens,
+    prompt,
+    conversation_id,
+    current_user,
+    request,
+    client,
+    *,
+    user_message=None,
+    input_token_fallback=None,
+    user_api_key=None,
+    api_model=None,
+    pdf_error_metadata=None,
+    prompt_id=None,
+    watchdog_config=None,
+    watchdog_hint_active=False,
+    watchdog_hint_eval_id=None,
+    llm_id=None,
+    byok: bool = False,
+    thinking_budget_tokens=None,
+    pending_attachment_refs: Optional[list[str]] = None,
+    strip_device_action_blocks: bool = False,
+    billing_reservation_id: str | None = None,
+):
     """
     Handle suspicious text that was flagged by protection systems.
     Re-sends the message with a warning to the AI.
@@ -139,7 +190,37 @@ async def atFieldActivate(suspicious_text, messages, model, temperature, max_tok
         api_func = call_kimi_api
     else:
         api_func = call_claude_api
-    async for chunk in api_func(messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request):
+
+    provider_kwargs = {
+        "messages": messages,
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "prompt": prompt,
+        "conversation_id": conversation_id,
+        "current_user": current_user,
+        "request": request,
+        "user_message": user_message,
+        "input_token_fallback": input_token_fallback,
+        "pdf_error_metadata": pdf_error_metadata,
+        "prompt_id": prompt_id,
+        "watchdog_config": watchdog_config,
+        "watchdog_hint_active": watchdog_hint_active,
+        "watchdog_hint_eval_id": watchdog_hint_eval_id,
+        "llm_id": llm_id,
+        "byok": byok,
+        "pending_attachment_refs": pending_attachment_refs,
+        "strip_device_action_blocks": strip_device_action_blocks,
+        "billing_reservation_id": billing_reservation_id,
+    }
+    if user_api_key:
+        provider_kwargs["user_api_key"] = user_api_key
+    if client == "OpenRouter" and api_model:
+        provider_kwargs["api_model"] = api_model
+    if client == "Claude" and thinking_budget_tokens:
+        provider_kwargs["thinking_budget_tokens"] = thinking_budget_tokens
+
+    async for chunk in api_func(**provider_kwargs):
         yield chunk
 
 
@@ -444,9 +525,16 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                                pdf_error_metadata=None,
                                prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                                llm_id=None, byok: bool = False, thinking_budget_tokens=None,
-                               pending_attachment_refs: Optional[list[str]] = None):
+                               pending_attachment_refs: Optional[list[str]] = None,
+                               strip_device_action_blocks: bool = False,
+                               billing_preflight_amount: float = 0.0,
+                               billing_reservation_id: str | None = None,
+                               billing_first_call_accumulated: bool = False,
+                               billing_followup_hold_amount: float = 0.0):
     save_to_db = True
     final_content = ""
+    delivery_ack = None
+    deferred_delivery_chunks = []
     # Initialize with pre-tool content from Claude (if any)
     content_to_save = content + "\n\n" if content else ""
 
@@ -456,6 +544,21 @@ async def handle_function_call(function_name, function_arguments, messages, mode
         async for chunk in handler(function_arguments, messages, model, temperature, max_tokens, content, conversation_id, current_user, request, input_tokens, output_tokens, total_tokens, message_id, user_id, client, prompt, user_message):
             try:
                 chunk_data = orjson.loads(chunk.split("data: ")[1])
+                chunk_delivery_ack = None
+                ack_value = chunk_data.get("_delivery_ack")
+                if isinstance(ack_value, dict):
+                    ack_channel = str(ack_value.get("channel") or "")
+                    ack_token = str(ack_value.get("token") or "")
+                    reservation_id = str(
+                        ack_value.get("reservation_id") or ack_token
+                    )
+                    if ack_channel and ack_token and reservation_id:
+                        chunk_delivery_ack = {
+                            "channel": ack_channel,
+                            "token": ack_token,
+                            "reservation_id": reservation_id,
+                        }
+                        delivery_ack = chunk_delivery_ack
                 if 'content' in chunk_data:
                     if chunk_data.get('is_error'):
                         # Tool reported an error — collect it for second-pass instead of showing raw
@@ -465,11 +568,25 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                         content_to_save += chunk_data['content']
                     if chunk_data.get('yield', True):
                         final_content += chunk_data['content']
-                        yield chunk
+                        if chunk_delivery_ack:
+                            client_chunk_data = dict(chunk_data)
+                            client_chunk_data.pop("_delivery_ack", None)
+                            deferred_delivery_chunks.append(
+                                f"data: {orjson.dumps(client_chunk_data).decode()}\n\n"
+                            )
+                        else:
+                            yield chunk
                 elif 'video_content' in chunk_data:
                     # Forward video content to frontend for rendering
                     if chunk_data.get('yield', True):
-                        yield chunk
+                        if chunk_delivery_ack:
+                            client_chunk_data = dict(chunk_data)
+                            client_chunk_data.pop("_delivery_ack", None)
+                            deferred_delivery_chunks.append(
+                                f"data: {orjson.dumps(client_chunk_data).decode()}\n\n"
+                            )
+                        else:
+                            yield chunk
             except orjson.JSONDecodeError:
                 yield chunk
 
@@ -477,6 +594,21 @@ async def handle_function_call(function_name, function_arguments, messages, mode
         # respond naturally instead of showing the raw error to the user.
         if tool_error_message:
             logger.info(f"[handle_function_call] Tool '{function_name}' error, triggering AI second-pass: {tool_error_message[:200]}")
+
+            if billing_reservation_id and billing_followup_hold_amount > 0:
+                try:
+                    await extend_ai_reservation(
+                        reservation_id=billing_reservation_id,
+                        user_id=current_user.id,
+                        additional_amount=billing_followup_hold_amount,
+                    )
+                except InsufficientBalanceError:
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance for the tool follow-up'}).decode()}\n\n"
+                    return
+                except BillingReservationError:
+                    logger.exception("Could not extend failed-tool follow-up billing")
+                    yield f"data: {orjson.dumps({'error': 'AI billing is temporarily unavailable'}).decode()}\n\n"
+                    return
 
             # Build tool response messages: the AI sees its own tool call + the error result
             _build_tool_response_messages(
@@ -527,6 +659,8 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 "llm_id": llm_id,
                 "byok": byok,
                 "pending_attachment_refs": pending_attachment_refs,
+                "strip_device_action_blocks": strip_device_action_blocks,
+                "billing_reservation_id": billing_reservation_id,
             }
 
             if user_api_key:
@@ -542,6 +676,12 @@ async def handle_function_call(function_name, function_arguments, messages, mode
                 if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
                     messages.pop(0)
 
+            if not await revalidate_user_billing(
+                current_user.id,
+                billing_preflight_amount,
+            ):
+                yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                return
             async for chunk in api_func(**second_kwargs):
                 yield chunk
             # api_func handles save_to_db internally
@@ -572,7 +712,39 @@ async def handle_function_call(function_name, function_arguments, messages, mode
 
                 save_to_db = False
 
-                async for function_answer_chunk in atFieldActivate(suspicious_text, messages, model, temperature, max_tokens, prompt, conversation_id, current_user, request, client):
+                if not await revalidate_user_billing(
+                    current_user.id,
+                    billing_preflight_amount,
+                ):
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                    return
+                async for function_answer_chunk in atFieldActivate(
+                    suspicious_text,
+                    messages,
+                    model,
+                    temperature,
+                    max_tokens,
+                    prompt,
+                    conversation_id,
+                    current_user,
+                    request,
+                    client,
+                    user_message=user_message,
+                    input_token_fallback=input_token_fallback,
+                    user_api_key=user_api_key,
+                    api_model=api_model,
+                    pdf_error_metadata=pdf_error_metadata,
+                    prompt_id=prompt_id,
+                    watchdog_config=watchdog_config,
+                    watchdog_hint_active=watchdog_hint_active,
+                    watchdog_hint_eval_id=watchdog_hint_eval_id,
+                    llm_id=llm_id,
+                    byok=byok,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    pending_attachment_refs=pending_attachment_refs,
+                    strip_device_action_blocks=strip_device_action_blocks,
+                    billing_reservation_id=billing_reservation_id,
+                ):
                     yield function_answer_chunk
 
             except (orjson.JSONDecodeError, KeyError) as e:
@@ -828,8 +1000,27 @@ async def handle_function_call(function_name, function_arguments, messages, mode
         user_message_id, bot_message_id = await save_content_to_db(content_to_save, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=user_message,
                                                                     input_token_fallback=input_token_fallback,
                                                                     prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                    llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs)
+                                                                    llm_id=llm_id, byok=byok, pending_attachment_refs=pending_attachment_refs,
+                                                                    strip_device_action_blocks=strip_device_action_blocks,
+                                                                    billing_reservation_id=billing_reservation_id,
+                                                                    billing_only_accumulated_usage=billing_first_call_accumulated,
+                                                                    fixed_billing_reservation_id=(
+                                                                        delivery_ack.get("reservation_id")
+                                                                        if delivery_ack else None
+                                                                    ))
         if user_message_id and bot_message_id:
+            if delivery_ack:
+                ack_channel = str(delivery_ack.get("channel") or "")
+                ack_token = str(delivery_ack.get("token") or "")
+                if ack_channel and ack_token:
+                    try:
+                        await redis_client.publish(ack_channel, ack_token)
+                    except Exception:
+                        logger.exception(
+                            "Could not acknowledge persisted tool delivery"
+                        )
+            for deferred_chunk in deferred_delivery_chunks:
+                yield deferred_chunk
             yield f"data: {orjson.dumps({'message_ids': {'user': user_message_id, 'bot': bot_message_id}}).decode()}\n\n"
 
 

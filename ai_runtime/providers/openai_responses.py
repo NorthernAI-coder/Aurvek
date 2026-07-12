@@ -3,6 +3,7 @@ from ai_runtime.config import _is_gpt5_model, _log_truncated_response
 from ai_runtime.errors import _extract_human_error_message, _human_exception_error, _provider_error_payload
 from ai_runtime.persistence.messages import save_content_to_db
 from ai_runtime.provider_health import record_provider_error_for_label, record_provider_success_for_label
+from billing.usage_reservations import accumulate_ai_provider_call_usage
 
 def _convert_messages_for_responses_api(messages: list) -> list:
     """Convert Chat Completions message content blocks to Responses API format.
@@ -98,7 +99,9 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
                                   prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                                   llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False,
                                   pending_attachment_refs: Optional[list[str]] = None,
-                                  perf_trace=None):
+                                  perf_trace=None,
+                                  strip_device_action_blocks: bool = False,
+                                  billing_reservation_id: str | None = None):
     """
     OpenAI Responses API call function. Replaces call_gpt_api for all OpenAI calls.
     Uses /v1/responses endpoint with semantic SSE events instead of Chat Completions.
@@ -421,6 +424,30 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
     if citations:
         yield f"data: {orjson.dumps({'type': 'web_search_citations', 'citations': citations}).decode()}\n\n"
 
+    billing_input_tokens = input_tokens
+    billing_output_tokens = output_tokens
+    if (
+        billing_reservation_id
+        and save_to_db
+        and (content or function_name or input_tokens or output_tokens)
+    ):
+        billing_input_tokens, billing_output_tokens = (
+            await accumulate_ai_provider_call_usage(
+                reservation_id=billing_reservation_id,
+                user_id=current_user.id,
+                reported_input_tokens=input_tokens,
+                reported_output_tokens=output_tokens,
+                input_payload=(prompt, messages),
+                output_payload=(content, function_name, function_arguments),
+                input_token_fallback=input_token_fallback,
+                output_token_cap=max_tokens,
+                llm_id=llm_id,
+                model=model,
+                prompt_id=prompt_id,
+                byok=byok,
+            )
+        )
+
     # If a tool call was detected, emit it and return without saving to DB
     if function_name and save_to_db:
         try:
@@ -433,7 +460,7 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
         logger.debug(f"[call_gpt_responses_api] Tool call args: {parsed_args}")
 
         await record_provider_success_for_label("OpenAI (GPT)", model=model, byok=byok)
-        yield f"data: {orjson.dumps({'tool_call': {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id}}).decode()}\n\n"
+        yield f"data: {orjson.dumps({'tool_call': {'name': function_name, 'arguments': parsed_args, 'id': tool_call_id, '_billing_usage': {'input_tokens': billing_input_tokens, 'output_tokens': billing_output_tokens}}}).decode()}\n\n"
         yield f"data: {orjson.dumps({'tool_call_pending': True}).decode()}\n\n"
         return
 
@@ -461,7 +488,10 @@ async def call_gpt_responses_api(messages, model, temperature, max_tokens, promp
             user_message_id, bot_message_id = await save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, current_user.id, model, user_message=user_message,
                                                                         input_token_fallback=input_token_fallback,
                                                                         prompt_id=prompt_id, watchdog_config=watchdog_config, watchdog_hint_active=watchdog_hint_active, watchdog_hint_eval_id=watchdog_hint_eval_id,
-                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs)
+                                                                        llm_id=llm_id, citations_json=citations_data, byok=byok, pending_attachment_refs=pending_attachment_refs,
+                                                                        strip_device_action_blocks=strip_device_action_blocks,
+                                                                        billing_reservation_id=billing_reservation_id,
+                                                                        billing_only_accumulated_usage=bool(billing_reservation_id))
             if perf_trace:
                 event = perf_trace.sse(
                     "db_save_done",

@@ -10,6 +10,10 @@ let allConversationsLoaded = false;
 let oldestLoadedActivity = null;
 let oldestLoadedId = null;
 let currentAbortController = null;
+let conversationViewGeneration = 0;
+let activeMessageLoad = null;
+let activeBookmarksLoad = null;
+let conversationDetailsController = null;
 let controller = null;
 let currentTimer = null;
 let lastSelectedConversationId = null;
@@ -22,6 +26,68 @@ let currentConversationIncognito = false;
 let userStopped = false;
 let currentProviderHealth = null;
 let currentMemoryHealth = null;
+
+function conversationIdsMatch(left, right) {
+    return left !== null && left !== undefined &&
+        right !== null && right !== undefined &&
+        String(left) === String(right);
+}
+
+function isCurrentConversationView(conversationId, generation) {
+    return generation === conversationViewGeneration &&
+        conversationIdsMatch(currentConversationId, conversationId);
+}
+
+function abortActiveMessageLoad() {
+    if (activeMessageLoad?.controller) {
+        activeMessageLoad.controller.abort();
+    } else if (currentAbortController) {
+        currentAbortController.abort();
+    }
+    activeMessageLoad = null;
+    currentAbortController = null;
+    isLoading = false;
+}
+
+function releaseActiveMessageLoad(loadState, enableControls = false) {
+    if (activeMessageLoad !== loadState) {
+        return false;
+    }
+    activeMessageLoad = null;
+    if (currentAbortController === loadState.controller) {
+        currentAbortController = null;
+    }
+    isLoading = false;
+    if (enableControls &&
+        isCurrentConversationView(loadState.conversationId, loadState.generation)) {
+        enableInputControls();
+    }
+    return true;
+}
+
+function abortActiveBookmarksLoad() {
+    if (activeBookmarksLoad?.controller) {
+        activeBookmarksLoad.controller.abort();
+    }
+    activeBookmarksLoad = null;
+}
+
+function beginConversationViewTransition() {
+    conversationViewGeneration += 1;
+    abortActiveMessageLoad();
+    abortActiveBookmarksLoad();
+    if (conversationDetailsController) {
+        conversationDetailsController.abort();
+        conversationDetailsController = null;
+    }
+    if (window.modelSelector?.cancelPendingRequest) {
+        window.modelSelector.cancelPendingRequest();
+    }
+    if (window.extensionSelector?.cancelPendingRequest) {
+        window.extensionSelector.cancelPendingRequest();
+    }
+    return conversationViewGeneration;
+}
 
 // Auto-scroll state management
 let isUserScrolledUp = false;
@@ -1169,7 +1235,9 @@ function sendMessage(messageText, options = {}) {
         return false;
     }
 
-    const outgoingFiles = Array.isArray(options.filesOverride) ? options.filesOverride : attachedFiles;
+    const outgoingFiles = Object.freeze(Array.from(
+        Array.isArray(options.filesOverride) ? options.filesOverride : attachedFiles
+    ));
 
     if (!messageText.trim() && (!outgoingFiles || outgoingFiles.length === 0)) {
         return false;
@@ -1249,10 +1317,7 @@ function sendMessage(messageText, options = {}) {
         formData.append('multi_ai_models', JSON.stringify(selectedMultiAiModels.map((model) => model.llm_id)));
     }
 
-    var imagePreviews = document.getElementById('image-previews');
-    imagePreviews.innerHTML = '';
-
-    const filesForRetry = Array.from(outgoingFiles || []);
+    const filesForRetry = outgoingFiles;
     const hadOutgoingAttachments = filesForRetry.length > 0;
     const retryRangeBaseStart = Number.isInteger(parseInt(options.pdfPageStart, 10))
         ? parseInt(options.pdfPageStart, 10)
@@ -1581,8 +1646,9 @@ function sendMessage(messageText, options = {}) {
             error.uploadFailed = true;
             throw error;
         }
-        if (!options.filesOverride) {
-            attachedFiles = [];
+        if (!options.filesOverride && hadOutgoingAttachments &&
+            typeof window.removeAttachedFileBatch === 'function') {
+            window.removeAttachedFileBatch(filesForRetry);
         }
         markChatPerf('client_fetch_start');
         const fetchHeaders = chatPerfTrace ? {
@@ -2180,7 +2246,10 @@ function sendMessage(messageText, options = {}) {
 
                             // Handle extension level change from server
                             if (parsedData.extension_changed && window.extensionSelector) {
-                                window.extensionSelector.updateFromSSE(parsedData.extension_changed);
+                                window.extensionSelector.updateFromSSE(
+                                    parsedData.extension_changed,
+                                    sendConversationId
+                                );
                             }
 
                         } catch (error) {
@@ -2221,7 +2290,6 @@ function sendMessage(messageText, options = {}) {
 
             if (streamSucceeded) {
                 isCurrentConversationEmpty = false;
-                attachedFiles = [];
                 if (endConversation) {
                     document.getElementById('message-text').disabled = true;
                     document.getElementById('send-button').disabled = true;
@@ -2552,6 +2620,7 @@ function addConversationElement(conversation, chatName, currentConversationId, i
     if (conversation.id === currentConversationId) {
         conversationElement.classList.add('active-chat');
     }
+    conversationElement._conversationData = conversation;
 
     // Create conversation element content
     const nameSpan = document.createElement('span');
@@ -2565,6 +2634,12 @@ function addConversationElement(conversation, chatName, currentConversationId, i
         nameSpan.textContent = chatName;
     }
     conversationElement.appendChild(nameSpan);
+
+    const externalDeviceBadge = createExternalDeviceBadge(conversation);
+    if (externalDeviceBadge) {
+        conversationElement.classList.add('external-device-row');
+        conversationElement.appendChild(externalDeviceBadge);
+    }
 
     // Create and add menu
     const chatMenu = createChatMenu(conversation);
@@ -2663,6 +2738,11 @@ function createChatMenu(conversation) {
     // Telegram option
     const telegramLink = createPlatformLink('telegram', conversation);
     chatMenuContent.appendChild(telegramLink);
+
+    if (!conversation.external_platform) {
+        const externalAccessLink = createMenuLink('fa-plug', 'External access', () => openExternalAccessModal(conversation.id));
+        chatMenuContent.appendChild(externalAccessLink);
+    }
 
     // Click handler for the chat-menu-content div
     chatMenu.addEventListener('click', (e) => {
@@ -2844,6 +2924,373 @@ function getExternalPlatformIcon(platform) {
         default:
             return 'fas fa-external-link-alt';
     }
+}
+
+function getConversationExternalBindings(conversation) {
+    if (!conversation || conversation.external_platform) {
+        return null;
+    }
+    const bindings = conversation.external_bindings;
+    if (!bindings || typeof bindings !== 'object') {
+        return null;
+    }
+    return bindings;
+}
+
+function createExternalDeviceBadge(conversation) {
+    const bindings = getConversationExternalBindings(conversation);
+    const count = bindings ? parseInt(bindings.effective_count || 0, 10) : 0;
+    if (!count || count < 1) {
+        return null;
+    }
+
+    const badge = document.createElement('button');
+    badge.type = 'button';
+    badge.className = 'external-device-badge';
+    badge.title = bindings.tooltip || `${count} external device${count === 1 ? '' : 's'}`;
+    badge.setAttribute('aria-label', 'External access');
+    badge.innerHTML = `<i class="fas fa-microchip"></i><span>${count}</span>`;
+    badge.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openExternalAccessModal(conversation.id);
+    });
+    return badge;
+}
+
+function ensureExternalAccessStyles() {
+    if (document.getElementById('external-access-styles')) {
+        return;
+    }
+    const style = document.createElement('style');
+    style.id = 'external-access-styles';
+    style.textContent = `
+        .external-device-row {
+            display: flex !important;
+            align-items: center;
+            gap: 0.35rem;
+        }
+        .external-device-row .chat-name {
+            min-width: 0;
+            flex: 1 1 auto;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .external-device-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.25rem;
+            min-width: 2.15rem;
+            height: 1.45rem;
+            margin-left: auto;
+            border: 1px solid var(--border-color, rgba(128, 128, 128, 0.35));
+            border-radius: 999px;
+            background: var(--input-bg, rgba(128, 128, 128, 0.12));
+            color: inherit;
+            font-size: 0.78rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .external-device-badge:hover {
+            background: var(--hover-bg, rgba(128, 128, 128, 0.22));
+        }
+        .external-device-badge i {
+            font-size: 0.78rem;
+        }
+        .external-access-list {
+            display: grid;
+            gap: 0.5rem;
+        }
+        .external-access-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.65rem;
+            padding: 0.65rem 0;
+            border-bottom: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
+        }
+        .external-access-option:last-child {
+            border-bottom: 0;
+        }
+        .external-access-icon {
+            width: 1.25rem;
+            text-align: center;
+            opacity: 0.85;
+            margin-top: 0.15rem;
+        }
+        .external-access-title {
+            display: block;
+            font-weight: 600;
+        }
+        .external-access-meta {
+            display: block;
+            font-size: 0.82rem;
+            opacity: 0.78;
+        }
+        .external-access-section-title {
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: uppercase;
+            opacity: 0.72;
+            margin: 0.8rem 0 0.35rem;
+        }
+        .external-access-empty {
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+            align-items: flex-start;
+            padding: 0.5rem 0;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function ensureExternalAccessModal() {
+    ensureExternalAccessStyles();
+    let modal = document.getElementById('externalAccessModal');
+    if (modal) {
+        return modal;
+    }
+    modal = document.createElement('div');
+    modal.className = 'modal fade';
+    modal.id = 'externalAccessModal';
+    modal.tabIndex = -1;
+    modal.setAttribute('aria-labelledby', 'externalAccessModalLabel');
+    modal.setAttribute('aria-hidden', 'true');
+    modal.innerHTML = `
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="externalAccessModalLabel">External access</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="externalAccessModalBody"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="externalAccessSaveBtn">Save</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    modal.querySelector('#externalAccessSaveBtn').addEventListener('click', () => saveExternalAccessBindings());
+    return modal;
+}
+
+function externalAccessIcon(iconClass, fallbackClass) {
+    const icon = document.createElement('i');
+    (iconClass || fallbackClass).split(/\s+/).filter(Boolean).forEach(className => icon.classList.add(className));
+    icon.classList.add('external-access-icon');
+    return icon;
+}
+
+function createExternalAccessOption(kind, item) {
+    const label = document.createElement('label');
+    label.className = 'external-access-option';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.className = 'form-check-input';
+    input.value = item.id;
+    input.dataset.kind = kind;
+    input.checked = !!item.assigned;
+    label.appendChild(input);
+
+    label.appendChild(externalAccessIcon(item.icon_class, kind === 'device' ? 'fas fa-microchip' : 'fas fa-layer-group'));
+
+    const content = document.createElement('span');
+    const title = document.createElement('span');
+    title.className = 'external-access-title';
+    title.textContent = kind === 'device' ? item.display_name : item.name;
+    content.appendChild(title);
+
+    const metaParts = [];
+    if (kind === 'device') {
+        metaParts.push(item.slug);
+        metaParts.push(item.device_type);
+        if (!item.enabled) {
+            metaParts.push('disabled');
+        }
+    } else {
+        metaParts.push(item.slug);
+        metaParts.push(`${item.member_count || 0} member${item.member_count === 1 ? '' : 's'}`);
+    }
+    if (item.bound_conversation_id && !item.assigned && item.bound_conversation_name) {
+        metaParts.push(`currently: ${item.bound_conversation_name}`);
+    }
+
+    const meta = document.createElement('span');
+    meta.className = 'external-access-meta';
+    meta.textContent = metaParts.filter(Boolean).join(' · ');
+    content.appendChild(meta);
+    label.appendChild(content);
+    return label;
+}
+
+function appendExternalAccessSection(body, titleText, items, kind) {
+    if (!items || items.length === 0) {
+        return;
+    }
+    const title = document.createElement('div');
+    title.className = 'external-access-section-title';
+    title.textContent = titleText;
+    body.appendChild(title);
+
+    const list = document.createElement('div');
+    list.className = 'external-access-list';
+    items.forEach(item => list.appendChild(createExternalAccessOption(kind, item)));
+    body.appendChild(list);
+}
+
+function renderExternalAccessModal(data) {
+    const modal = ensureExternalAccessModal();
+    modal.dataset.conversationId = data.conversation_id;
+    const body = modal.querySelector('#externalAccessModalBody');
+    const saveButton = modal.querySelector('#externalAccessSaveBtn');
+    body.innerHTML = '';
+
+    if (data.external_platform) {
+        const message = document.createElement('p');
+        message.textContent = 'External devices are not available on WhatsApp or Telegram conversations.';
+        body.appendChild(message);
+        saveButton.style.display = 'none';
+        return modal;
+    }
+
+    const devices = Array.isArray(data.devices) ? data.devices : [];
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    if (devices.length === 0 && groups.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'external-access-empty';
+        const text = document.createElement('span');
+        text.textContent = 'No devices yet.';
+        const link = document.createElement('a');
+        link.href = '/admin/devices';
+        link.textContent = 'Open Devices';
+        empty.appendChild(text);
+        empty.appendChild(link);
+        body.appendChild(empty);
+        saveButton.style.display = 'none';
+        return modal;
+    }
+
+    const summary = data.external_bindings || {};
+    const summaryLine = document.createElement('p');
+    summaryLine.className = 'external-access-meta';
+    summaryLine.textContent = `${summary.effective_count || 0} effective device${summary.effective_count === 1 ? '' : 's'}`;
+    body.appendChild(summaryLine);
+
+    appendExternalAccessSection(body, 'Devices', devices, 'device');
+    appendExternalAccessSection(body, 'Groups', groups, 'group');
+    saveButton.style.display = '';
+    return modal;
+}
+
+const openExternalAccessModal = withSession(async function(conversationId) {
+    try {
+        const response = await secureFetch(`/api/conversations/${conversationId}/external-bindings`);
+        if (!response) return;
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            NotificationModal.error('External Access', data.message || 'Could not load external access.');
+            return;
+        }
+        const modal = renderExternalAccessModal(data);
+        bootstrap.Modal.getOrCreateInstance(modal).show();
+    } catch (error) {
+        console.error('External access load failed:', error);
+        NotificationModal.error('External Access', 'Could not load external access.');
+    }
+});
+
+const saveExternalAccessBindings = withSession(async function() {
+    const modal = ensureExternalAccessModal();
+    const conversationId = modal.dataset.conversationId;
+    const body = modal.querySelector('#externalAccessModalBody');
+    const deviceIds = Array.from(body.querySelectorAll('input[data-kind="device"]:checked')).map(input => parseInt(input.value, 10));
+    const groupIds = Array.from(body.querySelectorAll('input[data-kind="group"]:checked')).map(input => parseInt(input.value, 10));
+
+    try {
+        const response = await secureFetch(`/api/conversations/${conversationId}/external-bindings`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                device_ids: deviceIds,
+                group_ids: groupIds,
+            }),
+        });
+        if (!response) return;
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            NotificationModal.error('External Access', data.message || 'Could not save external access.');
+            return;
+        }
+        updateConversationExternalBindings(conversationId, data);
+        bootstrap.Modal.getOrCreateInstance(modal).hide();
+        NotificationModal.toast('External access updated', 'success');
+    } catch (error) {
+        console.error('External access save failed:', error);
+        NotificationModal.error('External Access', 'Could not save external access.');
+    }
+});
+
+function updateConversationExternalBindings(conversationId, data) {
+    const externalChatsContainer = document.querySelector('#external-chats-container');
+    const dynamicChatsContainer = document.querySelector('#dynamic-chats-container');
+    const affected = data.affected_conversations && typeof data.affected_conversations === 'object'
+        ? data.affected_conversations
+        : {};
+    const affectedIds = new Set(Object.keys(affected));
+    affectedIds.add(String(conversationId));
+
+    affectedIds.forEach((affectedId) => {
+        const updatedBindings = String(affectedId) === String(conversationId)
+            ? data.external_bindings || affected[affectedId] || null
+            : affected[affectedId] || null;
+        document.querySelectorAll(
+            `#dynamic-chats-container [data-conversation-id="${affectedId}"], ` +
+            `#external-chats-container [data-conversation-id="${affectedId}"]`
+        ).forEach(element => {
+            const currentData = element._conversationData || {
+                id: parseInt(affectedId, 10),
+                chat_name: element.querySelector('.chat-name')?.textContent?.trim() || `Chat ${affectedId}`,
+            };
+            currentData.external_bindings = updatedBindings;
+            currentData.external_platform = String(affectedId) === String(conversationId)
+                ? data.external_platform || currentData.external_platform || element.dataset.externalPlatform || null
+                : currentData.external_platform || element.dataset.externalPlatform || null;
+            updateSingleConversation(element, currentData, externalChatsContainer, dynamicChatsContainer);
+        });
+        updateFolderConversationExternalBindings(affectedId, updatedBindings);
+    });
+    sortDynamicChats();
+}
+
+function updateFolderConversationExternalBindings(conversationId, externalBindings) {
+    document.querySelectorAll(`.folder-chat-item[data-conversation-id="${conversationId}"]`).forEach(element => {
+        const currentData = element._conversationData || {
+            id: parseInt(conversationId, 10),
+            chat_name: element.querySelector('.chat-name')?.textContent?.trim() || `Chat ${conversationId}`,
+        };
+        currentData.external_bindings = externalBindings;
+        element._conversationData = currentData;
+        element.querySelectorAll('.external-device-badge').forEach(badge => badge.remove());
+        const badge = createExternalDeviceBadge(currentData);
+        if (badge) {
+            element.classList.add('external-device-row');
+            const chatContent = element.querySelector('.chat-content-container');
+            const chatMenu = element.querySelector('.chat-menu');
+            if (chatContent && chatMenu) {
+                chatContent.insertBefore(badge, chatMenu);
+            }
+        } else {
+            element.classList.remove('external-device-row');
+        }
+    });
 }
 
 function createPlatformLink(platform, conversation) {
@@ -3077,7 +3524,31 @@ function updateSingleConversation(element, conversationData, externalContainer, 
     element.dataset.conversationId = conversationData.id;
     element.dataset.lastActivity = conversationData.last_activity || '';
     element.dataset.machine = conversationData.machine || 'undefined';
+    element.dataset.llmModel = conversationData.llm_model || '';
+    element.dataset.locked = conversationData.locked ? 'true' : 'false';
+    element.dataset.webSearchAllowed = conversationData.web_search_allowed !== false ? 'true' : 'false';
+    element.dataset.webSearchForced = conversationData.web_search_forced === true ? 'true' : 'false';
     element.dataset.isIncognito = conversationData.is_incognito ? 'true' : 'false';
+    element.dataset.isPaid = conversationData.is_paid ? '1' : '0';
+    if (conversationData.locked) {
+        element.classList.add('conversation-locked');
+    }
+    if (conversationData.forced_llm_id) {
+        element.dataset.forcedLlmId = conversationData.forced_llm_id;
+    } else {
+        delete element.dataset.forcedLlmId;
+    }
+    if (conversationData.hide_llm_name) {
+        element.dataset.hideLlmName = 'true';
+    } else {
+        delete element.dataset.hideLlmName;
+    }
+    if (conversationData.allowed_llms) {
+        element.dataset.allowedLlms = JSON.stringify(conversationData.allowed_llms);
+    } else {
+        delete element.dataset.allowedLlms;
+    }
+    element._conversationData = conversationData;
     if (conversationData.external_platform) {
         element.dataset.externalPlatform = conversationData.external_platform;
     } else {
@@ -3097,6 +3568,14 @@ function updateSingleConversation(element, conversationData, externalContainer, 
     }
     element.innerHTML = '';
     element.appendChild(nameSpan);
+
+    const externalDeviceBadge = createExternalDeviceBadge(conversationData);
+    if (externalDeviceBadge) {
+        element.classList.add('external-device-row');
+        element.appendChild(externalDeviceBadge);
+    } else {
+        element.classList.remove('external-device-row');
+    }
 
     const chatMenu = createChatMenu(conversationData);
     element.appendChild(chatMenu);
@@ -3126,13 +3605,16 @@ function setupConversationElementListeners(element) {
 }
 
 function conversationClickHandler(e) {
-    if (!e.target.closest('.chat-menu')) {
+    if (!e.target.closest('.chat-menu') && !e.target.closest('.external-device-badge')) {
         var conversationId = this.getAttribute('data-conversation-id');
         var chatNameElement = this.querySelector('.chat-name');
         var chatName = chatNameElement ? chatNameElement.textContent.trim() : `Chat ${conversationId}`;
         var machine = this.getAttribute('data-machine');
         
         if (conversationId) {
+            if (typeof ws !== 'undefined' && ws && ws.readyState === WebSocket.OPEN) {
+                stopAudioAndCloseWebSocket();
+            }
             
             // Remove active-chat class from ALL chats everywhere
             document.querySelectorAll('.active-chat').forEach(el => {
@@ -3144,6 +3626,7 @@ function conversationClickHandler(e) {
             
             // Update global selectedChat variable
             window.selectedChat = this;
+            document.getElementById('my-bookmarks-btn')?.classList.remove('active-bookmarks');
             
             continueConversation(conversationId, chatName, machine);
         }
@@ -3173,6 +3656,7 @@ function deactivateChat() {
     overlay.style.display = 'block';
 
     // Update global state
+    beginConversationViewTransition();
     currentConversationId = null;
     setCurrentProviderHealth(null);
 }
@@ -3298,13 +3782,15 @@ function loadMoreConversations() {
     loadConversations(true);
 }
 
-function continueConversation(conversationId, chatName, machine, isInit = false, targetMessageId = null, conversationData = null) {
-    removeOverlay();
-
-    if (window.ChatWarmup && typeof window.ChatWarmup.resetForConversation === 'function') {
-        window.ChatWarmup.resetForConversation(conversationId);
-    }
-
+function continueConversation(
+    conversationId,
+    chatName,
+    machine,
+    isInit = false,
+    targetMessageId = null,
+    conversationData = null,
+    requestedGeneration = null
+) {
     // Check if this conversation is already loaded (compare with current conversation ID)
     if (currentConversationId &&
         currentConversationId.toString() === conversationId.toString() &&
@@ -3312,13 +3798,41 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
         return Promise.resolve();
     }
 
+    const viewGeneration = requestedGeneration === null
+        ? beginConversationViewTransition()
+        : requestedGeneration;
+    if (viewGeneration !== conversationViewGeneration) {
+        return Promise.resolve();
+    }
+
     if (currentConversationIncognito &&
         currentConversationId &&
         currentConversationId.toString() !== conversationId.toString()) {
         return maybeCloseCurrentIncognitoBeforeLeaving().then(canContinue => {
-            if (!canContinue) return Promise.resolve();
-            return continueConversation(conversationId, chatName, machine, isInit, targetMessageId, conversationData);
+            if (!canContinue) {
+                if (viewGeneration === conversationViewGeneration) {
+                    enableInputControls();
+                }
+                return Promise.resolve();
+            }
+            if (viewGeneration !== conversationViewGeneration) {
+                return Promise.resolve();
+            }
+            return continueConversation(
+                conversationId,
+                chatName,
+                machine,
+                isInit,
+                targetMessageId,
+                conversationData,
+                viewGeneration
+            );
         });
+    }
+
+    removeOverlay();
+    if (window.ChatWarmup && typeof window.ChatWarmup.resetForConversation === 'function') {
+        window.ChatWarmup.resetForConversation(conversationId);
     }
 
     // Same conversation but jumping to a specific message: reset state and reload
@@ -3327,14 +3841,9 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
         targetMessageId) {
         oldestLoadedMessageId = null;
         allMessagesLoaded = false;
-        if (currentAbortController) {
-            currentAbortController.abort();
-            currentAbortController = null;
-        }
-        isLoading = false;
         processedMessageIds.clear();
         document.getElementById('chat-messages-container').innerHTML = '';
-        return loadMessages(conversationId, false, targetMessageId, 0);
+        return loadMessages(conversationId, false, targetMessageId, 0, viewGeneration);
     }
 
     const selectedChat = document.querySelector(`[data-conversation-id="${conversationId}"]`);   
@@ -3342,13 +3851,6 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
     hideScrollNavButtons();
     oldestLoadedMessageId = null;
     allMessagesLoaded = false;
-    // Abort any in-flight request before resetting the loading flag
-    // to prevent the old request's finally block from racing with us
-    if (currentAbortController) {
-        currentAbortController.abort();
-        currentAbortController = null;
-    }
-    isLoading = false;
     processedMessageIds.clear();
     currentConversationId = conversationId;
     const isIncognitoConversation = isConversationIncognitoData(conversationData, selectedChat);
@@ -3383,8 +3885,14 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
     disableInputControls();
 
     return new Promise((resolve) => {
-        loadMessages(conversationId, false, targetMessageId).then(() => {
-            setupInfiniteScroll(conversationId);
+        loadMessages(conversationId, false, targetMessageId, 0, viewGeneration).then(loadResult => {
+            if (!loadResult ||
+                !isCurrentConversationView(conversationId, viewGeneration)) {
+                resolve();
+                return;
+            }
+
+            setupInfiniteScroll(conversationId, viewGeneration);
 
             // Show and correctly configure the input box and other chat-related elements
             const messageInputContainer = document.getElementById('message-input-container');
@@ -3406,7 +3914,7 @@ function continueConversation(conversationId, chatName, machine, isInit = false,
 
             // Get llm_model from conversation element or passed data
             const llmModel = selectedChat?.dataset?.llmModel || conversationData?.llm_model || null;
-            updateChatHeader(conversationId, chatTitleText, llmModel);
+            updateChatHeader(conversationId, chatTitleText, llmModel, viewGeneration);
 
             // Apply model restrictions from conversation data
             const forcedLlmId = selectedChat?.dataset?.forcedLlmId || conversationData?.forced_llm_id || null;
@@ -3512,7 +4020,15 @@ function isMyBookmarksView() {
     return document.querySelector('.chatbot-info h4').textContent === "My Bookmarks";
 }
 
-function updateChatHeader(conversationId, chatName, llmModel = null) {
+function updateChatHeader(
+    conversationId,
+    chatName,
+    llmModel = null,
+    viewGeneration = conversationViewGeneration
+) {
+    if (!isCurrentConversationView(conversationId, viewGeneration)) {
+        return;
+    }
     const chatTitle = document.getElementById('chat-title');
     const chatModel = document.getElementById('chat-model');
     const chatTitleAvatar = document.getElementById('chat-title-avatar');
@@ -3541,9 +4057,24 @@ function updateChatHeader(conversationId, chatName, llmModel = null) {
         }
     } else {
         // Fallback: fetch from API (for new conversations without cached data)
-        fetch(`/api/conversations/${conversationId}/details`)
-            .then(response => response.json())
+        if (conversationDetailsController) {
+            conversationDetailsController.abort();
+        }
+        const detailsController = new AbortController();
+        conversationDetailsController = detailsController;
+        fetch(`/api/conversations/${conversationId}/details`, {
+            signal: detailsController.signal
+        })
+            .then(response => {
+                if (!isCurrentConversationView(conversationId, viewGeneration)) {
+                    return null;
+                }
+                return response.json();
+            })
             .then(data => {
+                if (!data || !isCurrentConversationView(conversationId, viewGeneration)) {
+                    return;
+                }
                 const modelInfo = data.model || 'Unknown Model';
                 chatModel.textContent = modelInfo;
 
@@ -3571,8 +4102,17 @@ function updateChatHeader(conversationId, chatName, llmModel = null) {
                 }
             })
             .catch(error => {
+                if (error.name === 'AbortError' ||
+                    !isCurrentConversationView(conversationId, viewGeneration)) {
+                    return;
+                }
                 console.error('Error fetching conversation details:', error);
                 chatModel.textContent = '';
+            })
+            .finally(() => {
+                if (conversationDetailsController === detailsController) {
+                    conversationDetailsController = null;
+                }
             });
     }
 }
@@ -3601,8 +4141,13 @@ function convertToLocalTime(utcTimestamp) {
     };
 }
 
-function processMessage(message, container, prepend = false) {
-    if (processedMessageIds.has(message.id)) return;
+function processMessage(
+    message,
+    container,
+    prepend = false,
+    processedIds = processedMessageIds
+) {
+    if (processedIds.has(message.id)) return;
     const timestamps = convertToLocalTime(message.date);
     let messageObj;
 
@@ -3633,7 +4178,7 @@ function processMessage(message, container, prepend = false) {
                 message.id,
                 message.citations
             );
-            processedMessageIds.add(message.id);
+            processedIds.add(message.id);
             return;
         }
 
@@ -3745,46 +4290,64 @@ function processMessage(message, container, prepend = false) {
     }
 
     // Mark the message as processed
-    processedMessageIds.add(message.id);
+    processedIds.add(message.id);
 }
 
-async function loadMessages(conversationId, prepend = false, targetMessageId = null, attempt = 0) {
-    if (isLoading || allMessagesLoaded) return Promise.resolve();
-    if (currentAbortController) {
-        currentAbortController.abort();
+async function loadMessages(
+    conversationId,
+    prepend = false,
+    targetMessageId = null,
+    attempt = 0,
+    viewGeneration = conversationViewGeneration
+) {
+    if (!isCurrentConversationView(conversationId, viewGeneration) ||
+        isLoading || allMessagesLoaded) {
+        return null;
     }
 
-    currentAbortController = new AbortController();
-    const signal = currentAbortController.signal;
+    const requestController = new AbortController();
+    const loadState = {
+        conversationId,
+        generation: viewGeneration,
+        controller: requestController
+    };
+    activeMessageLoad = loadState;
+    currentAbortController = requestController;
     isLoading = true;
-
     disableInputControls();
 
     const chatWindow = document.getElementById('chat-window');
     const chatMessagesContainer = document.getElementById('chat-messages-container');
+    let recurse = false;
 
-    let didRecurse = false;
     try {
         let url = `/api/conversations/${conversationId}/messages?limit=${limitMessage}`;
         if (oldestLoadedMessageId !== null && prepend) {
             url += `&before_id=${oldestLoadedMessageId}`;
         }
-        const response = await secureFetch(url, { signal });
-        if (!response) {
-            isLoading = false;
-            enableInputControls();
+
+        const response = await secureFetch(url, {
+            signal: requestController.signal
+        });
+        if (!response ||
+            activeMessageLoad !== loadState ||
+            !isCurrentConversationView(conversationId, viewGeneration)) {
             return null;
         }
-
         if (!response.ok) {
             throw new Error('Network response was not ok');
         }
+
         const data = await response.json();
-        const messages = data.messages;
-        const conversationInfo = data.conversation_info;
+        if (activeMessageLoad !== loadState ||
+            !isCurrentConversationView(conversationId, viewGeneration)) {
+            return null;
+        }
+
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        const conversationInfo = data.conversation_info || {};
         setIncognitoUiState(isConversationIncognitoData(conversationInfo));
         setCurrentProviderHealth(conversationInfo.provider_health || null);
-
         allMessagesLoaded = !data.has_more;
 
         if (!prepend) {
@@ -3792,23 +4355,18 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
         }
 
         const tempDiv = document.createElement('div');
-
-		// name of the prompt (bot)
         botname = conversationInfo.prompt_name;
+        promptDescription = conversationInfo.prompt_description;
+        botProfilePicture = conversationInfo.bot_profile_picture || '';
+        botProfilePicture128 = conversationInfo.bot_profile_picture_128 || botProfilePicture;
+        botProfilePictureFullsize = conversationInfo.bot_profile_picture_fullsize ||
+            botProfilePicture128 || botProfilePicture;
 
-		// prompt description (bot)
-		promptDescription = conversationInfo.prompt_description
-
-        // Update the bot's profile picture
-        botProfilePicture = conversationInfo.bot_profile_picture;
-
-        // Sync is_paid flag to sidebar element so continueConversation() can read it
         const sidebarEl = document.querySelector(`[data-conversation-id="${conversationId}"]`);
         if (sidebarEl) {
             sidebarEl.dataset.isPaid = conversationInfo.is_paid ? '1' : '0';
         }
 
-        // Initialize extension selector from message endpoint data
         if (conversationInfo.extensions_enabled && window.extensionSelector) {
             window.extensionSelector.init(
                 conversationInfo.extensions,
@@ -3820,7 +4378,6 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
         }
 
         let targetMessageFound = false;
-
         messages.forEach(message => {
             processMessage(message, tempDiv, prepend);
             if (targetMessageId && message.id === targetMessageId) {
@@ -3828,17 +4385,17 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
             }
         });
 
+        if (!isCurrentConversationView(conversationId, viewGeneration)) {
+            return null;
+        }
+
         if (prepend) {
-            // Anchor to the first currently visible message to prevent scroll jump
             const anchor = chatMessagesContainer.firstElementChild;
             const anchorTop = anchor ? anchor.getBoundingClientRect().top : 0;
-
             chatMessagesContainer.insertBefore(tempDiv, chatMessagesContainer.firstChild);
-
-            // Restore: keep the anchor element at the same visual position
             if (anchor) {
                 const newAnchorTop = anchor.getBoundingClientRect().top;
-                chatWindow.scrollTop += (newAnchorTop - anchorTop);
+                chatWindow.scrollTop += newAnchorTop - anchorTop;
             }
         } else {
             chatMessagesContainer.appendChild(tempDiv);
@@ -3851,26 +4408,33 @@ async function loadMessages(conversationId, prepend = false, targetMessageId = n
         isCurrentConversationEmpty = messages.length === 0 && oldestLoadedMessageId === null;
 
         if (targetMessageId && !targetMessageFound && !allMessagesLoaded && attempt < 200) {
-            didRecurse = true;
-            isLoading = false;
-            return loadMessages(conversationId, true, targetMessageId, attempt + 1);
-        } else if (targetMessageId && targetMessageFound) {
-            setTimeout(() => {
-                highlightAndScrollToMessage(targetMessageId);
-            }, 100);
-        } else if (!targetMessageId) {
-            enableInputControls();
+            recurse = true;
+            releaseActiveMessageLoad(loadState, false);
+            return loadMessages(
+                conversationId,
+                true,
+                targetMessageId,
+                attempt + 1,
+                viewGeneration
+            );
         }
+        if (targetMessageId && targetMessageFound) {
+            setTimeout(() => {
+                if (isCurrentConversationView(conversationId, viewGeneration)) {
+                    highlightAndScrollToMessage(targetMessageId);
+                }
+            }, 100);
+        }
+        return data;
     } catch (error) {
-        if (error.name === 'AbortError') {
-        } else if (error.message === 'Session expired') {
-        } else {
+        if (error.name !== 'AbortError' && error.message !== 'Session expired' &&
+            isCurrentConversationView(conversationId, viewGeneration)) {
             console.error('Error loading messages:', error);
         }
+        return null;
     } finally {
-        if (!didRecurse) {
-            isLoading = false;
-            enableInputControls();
+        if (!recurse) {
+            releaseActiveMessageLoad(loadState, true);
         }
     }
 }
@@ -3880,19 +4444,15 @@ function refreshActiveConversation() {
         return Promise.resolve();
     }
 
+    const conversationId = currentConversationId;
+    const viewGeneration = beginConversationViewTransition();
+
     // Reset pagination so the next fetch pulls fresh messages.
     oldestLoadedMessageId = null;
     allMessagesLoaded = false;
-    isLoading = false;
-
-    if (currentAbortController) {
-        currentAbortController.abort();
-        currentAbortController = null;
-    }
-
     processedMessageIds.clear();
 
-    return loadMessages(currentConversationId, false);
+    return loadMessages(conversationId, false, null, 0, viewGeneration);
 }
 
 window.refreshActiveConversation = refreshActiveConversation;
@@ -3951,12 +4511,15 @@ function disableInputControls() {
 }
 
 
-function setupInfiniteScroll(conversationId) {
+function setupInfiniteScroll(conversationId, viewGeneration = conversationViewGeneration) {
     const chatWindow = document.getElementById('chat-window');
     chatWindow.onscroll = function() {
+        if (!isCurrentConversationView(conversationId, viewGeneration)) {
+            return;
+        }
         // Infinite scroll: load older messages when at top
         if (chatWindow.scrollTop <= 1 && !isLoading && !allMessagesLoaded) {
-            loadMessages(conversationId, true);
+            loadMessages(conversationId, true, null, 0, viewGeneration);
         }
 
         // Auto-scroll management: detect user scroll intent
@@ -4118,6 +4681,7 @@ function startNewConversation(promptId = null, options = {}) {
     if (llmId !== null) {
         body.llm_id = llmId;
     }
+    const requestViewGeneration = conversationViewGeneration;
 
     return maybeCloseCurrentIncognitoBeforeLeaving().then(canContinue => {
         if (!canContinue) {
@@ -4139,13 +4703,20 @@ function startNewConversation(promptId = null, options = {}) {
         return response.json();
     })
     .then(data => {
+        if (requestViewGeneration !== conversationViewGeneration) {
+            return null;
+        }
         startDate = new Date(); 
         if (!data.hidden_from_history && !data.is_incognito) {
             addConversationElement(data, data.name, null, true);
         }
         return continueConversation(data.id, data.name, data.machine, false, null, data);
     })
-    .then(() => {
+    .then(result => {
+        if (result === null ||
+            conversationViewGeneration !== requestViewGeneration + 1) {
+            return;
+        }
         isCurrentConversationEmpty = true; 
         isFirstCall = false;
     })
@@ -4237,18 +4808,42 @@ function toggleBookmark(messageId, conversationId, bookmarkIcon) {
 function loadBookmarkedMessages() {
     const myBookmarksBtn = document.getElementById('my-bookmarks-btn');
     if (myBookmarksBtn.classList.contains('active-bookmarks')) {
-        return;
+        return Promise.resolve();
+    }
+    if (activeBookmarksLoad) {
+        return activeBookmarksLoad.promise;
     }
 
-    // Clear dedup set so messages already loaded in the conversation view
-    // can be rendered again in the bookmarks view
-    processedMessageIds.clear();
+    const viewGeneration = beginConversationViewTransition();
+    currentConversationId = null;
+    const bookmarksController = new AbortController();
+    const loadState = {
+        generation: viewGeneration,
+        controller: bookmarksController,
+        promise: null
+    };
+    activeBookmarksLoad = loadState;
 
-    fetch(`/api/bookmarks`)
-    .then(response => response.json())
+    const isActiveBookmarksRequest = () => (
+        activeBookmarksLoad === loadState &&
+        conversationViewGeneration === viewGeneration &&
+        !bookmarksController.signal.aborted
+    );
+
+    loadState.promise = secureFetch('/api/bookmarks', {
+        signal: bookmarksController.signal
+    })
+    .then(response => {
+        if (!response || !isActiveBookmarksRequest()) return null;
+        if (!response.ok) throw new Error('Could not load bookmarks');
+        return response.json();
+    })
     .then(messages => {
+        if (!Array.isArray(messages) || !isActiveBookmarksRequest()) return;
+
         const chatMessagesContainer = document.getElementById('chat-messages-container');
         chatMessagesContainer.innerHTML = '';
+        const localProcessedMessageIds = new Set();
         
         const chatTitle = document.querySelector('.chatbot-info h4');
         const chatModel = document.getElementById('chat-model');
@@ -4266,10 +4861,6 @@ function loadBookmarkedMessages() {
         const extensionSelector = document.getElementById('extension-selector-container');
         if (extensionSelector) extensionSelector.style.display = 'none';
         
-        // Clear global conversation state so the guard in continueConversation()
-        // won't block reloading the same conversation after leaving bookmarks
-        currentConversationId = null;
-
         // Group messages by conversation (local variable)
         let localConversationId = null;
         messages.forEach(message => {
@@ -4278,13 +4869,21 @@ function loadBookmarkedMessages() {
                 const header = document.createElement('div');
                 header.className = 'bookmark-conversation-header';
                 header.title = 'Click to go to conversation';
-                header.innerHTML = `<span class="bookmark-conversation-name">${message.chat_name || 'Chat ' + message.conversation_id}</span>`;
+                const name = document.createElement('span');
+                name.className = 'bookmark-conversation-name';
+                name.textContent = message.chat_name || `Chat ${message.conversation_id}`;
+                header.appendChild(name);
                 header.addEventListener('click', () => {
                     continueConversation(message.conversation_id, message.chat_name);
                 });
                 chatMessagesContainer.appendChild(header);
             }
-            processMessage(message, chatMessagesContainer);
+            processMessage(
+                message,
+                chatMessagesContainer,
+                false,
+                localProcessedMessageIds
+            );
         });
 
         // Remove all rollback icons
@@ -4311,33 +4910,27 @@ function loadBookmarkedMessages() {
         // Activate My Bookmarks button
         myBookmarksBtn.classList.add('active-bookmarks');
     })
-    .catch(error => console.error('Error loading bookmarked messages:', error));
+    .catch(error => {
+        if (error.name !== 'AbortError' && isActiveBookmarksRequest()) {
+            console.error('Error loading bookmarked messages:', error);
+        }
+    })
+    .finally(() => {
+        if (activeBookmarksLoad === loadState) {
+            activeBookmarksLoad = null;
+        }
+    });
+
+    return loadState.promise;
 }
 
-document.getElementById('my-bookmarks-btn').addEventListener('click', function(e) {
-    e.preventDefault();
-    loadBookmarkedMessages();
-});
-
-document.addEventListener('click', function(e) {
-    if (e.target && e.target.classList.contains('list-group-item-action')) {
-        var conversationId = e.target.getAttribute('data-conversation-id');
-        var chatName = e.target.textContent.trim();
-        var machine = e.target.getAttribute('data-machine'); 
-        if (conversationId) {
-			// Check if there are open websockets before trying to stop the audio
-			if (ws && ws.readyState === WebSocket.OPEN) {
-				stopAudioAndWebSocket();
-			}
-            continueConversation(conversationId, chatName, machine);
-            
-            // Deactivate My Bookmarks
-            document.getElementById('my-bookmarks-btn').classList.remove('active-bookmarks');
-        }
-    } else if (e.target && (e.target.id === 'my-bookmarks-btn' || e.target.closest('#my-bookmarks-btn'))) {
+const myBookmarksButton = document.getElementById('my-bookmarks-btn');
+if (myBookmarksButton) {
+    myBookmarksButton.addEventListener('click', function(e) {
+        e.preventDefault();
         loadBookmarkedMessages();
-    }
-});
+    });
+}
 
 /* Scroll navigation buttons */
 
@@ -4456,9 +5049,18 @@ function showPromptInfo() {
     initialContainer.title = botname || 'Assistant';
     imageSection.appendChild(initialContainer);
 
-    if (botProfilePicture) {
+    const displayAvatarUrl = (
+        typeof botProfilePicture128 !== 'undefined' && botProfilePicture128
+    ) || (
+        typeof botProfilePicture !== 'undefined' && botProfilePicture
+    ) || '';
+    const fullsizeAvatarUrl = (
+        typeof botProfilePictureFullsize !== 'undefined' && botProfilePictureFullsize
+    ) || displayAvatarUrl;
+
+    if (displayAvatarUrl) {
         const img = document.createElement('img');
-        img.src = botProfilePicture.replace('_32', '_128');
+        img.src = displayAvatarUrl;
         img.style.position = 'absolute';
         img.style.top = '0';
         img.style.left = '0';
@@ -4467,7 +5069,7 @@ function showPromptInfo() {
         img.style.objectFit = 'cover';
 
         img.style.cursor = 'pointer';
-        img.dataset.fullsize = botProfilePicture.replace('_32', '_fullsize');
+        img.dataset.fullsize = fullsizeAvatarUrl;
         img.onclick = function() {
             imageHandler.showFullsize(this.dataset.fullsize, null);
         };
@@ -4493,10 +5095,14 @@ function showPromptInfo() {
     if (window.extensionSelector && window.extensionSelector.extensions.length > 0) {
         const pillsDiv = document.createElement('div');
         pillsDiv.className = 'extension-pills-row mt-2';
-        pillsDiv.innerHTML = window.extensionSelector.extensions.map(ext => {
+        window.extensionSelector.extensions.forEach(ext => {
             const isActive = ext.id === window.extensionSelector.currentExtensionId;
-            return `<span class="extension-pill${isActive ? ' active' : ''}">${ext.name}</span>`;
-        }).join('');
+            const pill = document.createElement('span');
+            pill.className = 'extension-pill';
+            if (isActive) pill.classList.add('active');
+            pill.textContent = String(ext.name || '');
+            pillsDiv.appendChild(pill);
+        });
         textSection.appendChild(pillsDiv);
     }
 
@@ -4524,6 +5130,8 @@ class ModelSelector {
         this.forcedLlmId = null;
         this.hideLlmName = false;
         this.allowedLlms = null;
+        this.requestController = null;
+        this.requestGeneration = 0;
 
 
         if (this.dropdownMenu) {
@@ -4652,34 +5260,66 @@ class ModelSelector {
             }
         });
     }
+
+    cancelPendingRequest() {
+        this.requestGeneration += 1;
+        if (this.requestController) {
+            this.requestController.abort();
+            this.requestController = null;
+        }
+    }
+
+    isRequestCurrent(state) {
+        return this.requestGeneration === state.requestGeneration &&
+            this.requestController === state.controller &&
+            !state.controller.signal.aborted &&
+            isCurrentConversationView(state.conversationId, state.viewGeneration);
+    }
     
     async selectModel(llmId, modelName) {
         if (!currentConversationId || llmId === this.currentLlmId) {
             this.closeDropdown();
             return;
         }
-        
+
+        if (this.requestController) {
+            this.requestController.abort();
+        }
+        const state = {
+            conversationId: currentConversationId,
+            viewGeneration: conversationViewGeneration,
+            requestGeneration: ++this.requestGeneration,
+            controller: new AbortController(),
+            previousModel: this.currentModel
+        };
+        this.requestController = state.controller;
+
         try {
             // Show loading state
             this.chatModel.textContent = 'Updating...';
             
-            const response = await fetch(`/api/conversations/${currentConversationId}/model`, {
+            const response = await fetch(`/api/conversations/${state.conversationId}/model`, {
                 method: 'PATCH',
                 headers: {
                     'Content-Type': 'application/json',
                 },
                 credentials: 'include',
+                signal: state.controller.signal,
                 body: JSON.stringify({
                     llm_id: llmId
                 })
             });
+
+            if (!this.isRequestCurrent(state)) return;
             
             if (!response.ok) {
                 const errBody = await response.json().catch(() => ({}));
+                if (!this.isRequestCurrent(state)) return;
                 throw new Error(errBody.detail || `Failed to update model`);
             }
             
             const result = await response.json();
+            if (!this.isRequestCurrent(state)) return;
             
             if (result.success) {
                 // Update local state
@@ -4703,16 +5343,24 @@ class ModelSelector {
             }
             
         } catch (error) {
+            if (error.name === 'AbortError' || !this.isRequestCurrent(state)) {
+                return;
+            }
             console.error('Error updating model:', error);
 
             // Restore original model name
-            this.chatModel.textContent = this.currentModel || 'Unknown Model';
+            this.chatModel.textContent = state.previousModel || 'Unknown Model';
 
             // Show error feedback with message
             this.showError(error.message);
+        } finally {
+            if (this.requestController === state.controller) {
+                this.requestController = null;
+                if (isCurrentConversationView(state.conversationId, state.viewGeneration)) {
+                    this.closeDropdown();
+                }
+            }
         }
-        
-        this.closeDropdown();
     }
     
     showSuccess() {
@@ -4836,6 +5484,8 @@ class ExtensionSelector {
         this.currentExtensionId = null;
         this.freeSelection = true;
         this.isOpen = false;
+        this.requestController = null;
+        this.requestGeneration = 0;
 
         if (this.dropdownIcon) {
             this.dropdownIcon.addEventListener('click', (e) => {
@@ -4901,16 +5551,33 @@ class ExtensionSelector {
 
     renderDropdown() {
         if (!this.dropdownContent) return;
-        this.dropdownContent.innerHTML = this.extensions.map(ext => {
+        this.dropdownContent.innerHTML = '';
+        this.extensions.forEach(ext => {
             const isActive = ext.id === this.currentExtensionId;
             const isDisabled = !this.freeSelection && !isActive && !this._isAdjacentLevel(ext.id);
-            return `<div class="extension-dropdown-item${isActive ? ' active' : ''}${isDisabled ? ' disabled' : ''}"
-                         data-extension-id="${ext.id}"
-                         ${isDisabled ? '' : `onclick="window.extensionSelector.selectExtension(${ext.id})"`}>
-                        <span class="extension-item-name">${escapeHtml(ext.name)}</span>
-                        ${ext.description ? `<span class="extension-item-desc">${escapeHtml(ext.description)}</span>` : ''}
-                    </div>`;
-        }).join('');
+            const item = document.createElement('div');
+            item.className = 'extension-dropdown-item';
+            item.dataset.extensionId = String(ext.id);
+            if (isActive) item.classList.add('active');
+            if (isDisabled) item.classList.add('disabled');
+
+            const name = document.createElement('span');
+            name.className = 'extension-item-name';
+            name.textContent = String(ext.name || '');
+            item.appendChild(name);
+
+            if (ext.description) {
+                const description = document.createElement('span');
+                description.className = 'extension-item-desc';
+                description.textContent = String(ext.description);
+                item.appendChild(description);
+            }
+
+            if (!isDisabled) {
+                item.addEventListener('click', () => this.selectExtension(ext.id));
+            }
+            this.dropdownContent.appendChild(item);
+        });
     }
 
     _isAdjacentLevel(extId) {
@@ -4926,33 +5593,70 @@ class ExtensionSelector {
         this.currentName.textContent = current ? current.name : 'No level';
     }
 
+    cancelPendingRequest() {
+        this.requestGeneration += 1;
+        if (this.requestController) {
+            this.requestController.abort();
+            this.requestController = null;
+        }
+    }
+
+    isRequestCurrent(state) {
+        return this.requestGeneration === state.requestGeneration &&
+            this.requestController === state.controller &&
+            !state.controller.signal.aborted &&
+            isCurrentConversationView(state.conversationId, state.viewGeneration);
+    }
+
     async selectExtension(extensionId) {
         if (extensionId === this.currentExtensionId) {
             this.closeDropdown();
             return;
         }
+        if (!currentConversationId) return;
+        if (this.requestController) {
+            this.requestController.abort();
+        }
+        const state = {
+            conversationId: currentConversationId,
+            viewGeneration: conversationViewGeneration,
+            requestGeneration: ++this.requestGeneration,
+            controller: new AbortController()
+        };
+        this.requestController = state.controller;
+
         try {
-            const resp = await fetch(`/api/conversations/${currentConversationId}/extension`, {
+            const resp = await fetch(`/api/conversations/${state.conversationId}/extension`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
+                signal: state.controller.signal,
                 body: JSON.stringify({ extension_id: extensionId })
             });
+            if (!this.isRequestCurrent(state)) return;
             if (!resp.ok) {
                 const err = await resp.json();
+                if (!this.isRequestCurrent(state)) return;
                 console.error('Extension switch failed:', err.detail);
                 return;
             }
+            await resp.json().catch(() => null);
+            if (!this.isRequestCurrent(state)) return;
             this.currentExtensionId = extensionId;
             this.renderDropdown();
             this.updateCurrentDisplay();
             this.closeDropdown();
         } catch (e) {
+            if (e.name === 'AbortError' || !this.isRequestCurrent(state)) return;
             console.error('Extension switch error:', e);
+        } finally {
+            if (this.requestController === state.controller) {
+                this.requestController = null;
+            }
         }
     }
 
-    updateFromSSE(data) {
-        if (data && data.id) {
+    updateFromSSE(data, sourceConversationId = currentConversationId) {
+        if (data && data.id && conversationIdsMatch(currentConversationId, sourceConversationId)) {
             this.currentExtensionId = data.id;
             this.renderDropdown();
             this.updateCurrentDisplay();

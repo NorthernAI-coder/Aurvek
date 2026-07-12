@@ -113,6 +113,7 @@ class IPReputationManager:
         self._cache: Dict[str, IPReputationRecord] = {}
         self._pending: Dict[str, IPReputationDelta] = {}
         self._lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
         self._last_flush: float = 0.0
         self._last_purge: float = 0.0
         self._initialized = False
@@ -158,10 +159,21 @@ class IPReputationManager:
                 logger.info("REPUTATION: Initialized with %d tracked IPs", len(self._cache))
         except Exception as exc:
             logger.error("REPUTATION: Initialization failed: %s", exc)
+            now = time.time()
+            self._last_flush = now
+            self._last_purge = now
             self._initialized = True  # Continue without cached data
 
     async def shutdown(self):
         """Final flush to SQLite before process exit."""
+        flush_task = self._flush_task
+        if flush_task is not None and not flush_task.done():
+            try:
+                await asyncio.shield(flush_task)
+            except asyncio.CancelledError:
+                pass
+        self._flush_task = None
+
         if self._pending:
             await self._flush()
             logger.info("REPUTATION: Shutdown flush completed")
@@ -234,10 +246,34 @@ class IPReputationManager:
             ban_info = self._evaluate_ban(ip, delta, now)
 
         # Piggyback flush check
-        if now - self._last_flush >= ReputationConfig.FLUSH_INTERVAL:
-            asyncio.create_task(self._maybe_flush())
+        if (
+            self._initialized
+            and self._last_flush > 0
+            and now - self._last_flush >= ReputationConfig.FLUSH_INTERVAL
+        ):
+            self._schedule_flush()
 
         return ban_info
+
+    def _schedule_flush(self) -> None:
+        """Start at most one tracked background flush."""
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+
+        task = asyncio.create_task(self._maybe_flush())
+        self._flush_task = task
+
+        def _clear_finished_task(done_task: asyncio.Task) -> None:
+            if self._flush_task is done_task:
+                self._flush_task = None
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error("REPUTATION: Background flush failed: %s", exc)
+
+        task.add_done_callback(_clear_finished_task)
 
     def check_reputation_ban(self, ip: str) -> Optional[float]:
         """

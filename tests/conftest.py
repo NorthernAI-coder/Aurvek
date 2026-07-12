@@ -16,6 +16,11 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
+# Tests must not inherit production cookie policy or attempt a real Redis
+# backend merely because the developer's .env points at production-like hosts.
+os.environ.setdefault("ENVIRONMENT", "test")
+os.environ.setdefault("SECURITY_REDIS_MODE", "off")
+
 # ---------------------------------------------------------------------------
 # Event loop
 # ---------------------------------------------------------------------------
@@ -96,12 +101,52 @@ CREATE TABLE IF NOT EXISTS USER_DETAILS (
     billing_auto_refill_count INTEGER DEFAULT 0,
     api_key_mode TEXT DEFAULT 'system_only',
     user_api_keys TEXT,
-    allow_file_upload INTEGER DEFAULT 0
+    allow_file_upload INTEGER DEFAULT 0,
+    storage_quota_bytes INTEGER DEFAULT NULL
+        CHECK(storage_quota_bytes IS NULL OR storage_quota_bytes >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS SYSTEM_CONFIG (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS GENERATED_MEDIA_FILES (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('image', 'video', 'pdf', 'mp3', 'wav')),
+    rel_path TEXT NOT NULL UNIQUE,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES USERS(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES CONVERSATIONS(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_generated_media_user ON GENERATED_MEDIA_FILES(user_id);
+CREATE INDEX IF NOT EXISTS idx_generated_media_conversation ON GENERATED_MEDIA_FILES(conversation_id);
+
+CREATE TABLE IF NOT EXISTS BILLING_USAGE_RESERVATIONS (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    billing_account_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL CHECK(purpose IN ('ai', 'image', 'stt', 'video')),
+    service_id INTEGER,
+    usage_quantity REAL CHECK(usage_quantity IS NULL OR usage_quantity > 0),
+    amount REAL NOT NULL CHECK(amount > 0),
+    settled_amount REAL CHECK(settled_amount IS NULL OR settled_amount >= 0),
+    accumulated_input_tokens INTEGER NOT NULL DEFAULT 0,
+    accumulated_output_tokens INTEGER NOT NULL DEFAULT 0,
+    accumulated_components TEXT NOT NULL DEFAULT '[]',
+    billing_limit_delta REAL NOT NULL DEFAULT 0,
+    billing_refill_count_delta INTEGER NOT NULL DEFAULT 0,
+    billing_month TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'settled', 'refunded')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    provider_started_at TIMESTAMP,
+    provider_succeeded_at TIMESTAMP,
+    settled_at TIMESTAMP,
+    refunded_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS USAGE_DAILY (
@@ -203,6 +248,7 @@ def _clean_tables(db_path):
         "FILE_ATTACHMENTS",
         "FILE_BLOB_VARIANTS",
         "FILE_BLOBS",
+        "GENERATED_MEDIA_FILES",
         "MESSAGES",
         "CONVERSATIONS",
         "USERS",
@@ -210,6 +256,7 @@ def _clean_tables(db_path):
         "LLM",
         "USER_DETAILS",
         "SYSTEM_CONFIG",
+        "BILLING_USAGE_RESERVATIONS",
         "USAGE_DAILY",
     ):
         try:
@@ -246,15 +293,28 @@ def mock_db(db_path):
             await conn.close()
 
     patcher = patch("database.get_db_connection", _get_test_conn)
-    # Also patch in the modules that import it directly
+    # Also patch in the modules that import it directly. These modules do
+    # `from database import get_db_connection`, which binds the symbol at import
+    # time; patching only `database.get_db_connection` would not reach them once
+    # they have been imported (which happens at collection time for any test that
+    # imports the chat routes), so each must be patched explicitly.
     patcher2 = patch("tools.watchdog.get_db_connection", _get_test_conn)
     patcher3 = patch("common.get_db_connection", _get_test_conn)
     patcher4 = patch("wellbeing_service.get_db_connection", _get_test_conn)
+    patcher5 = patch("chat.services.deletion.get_db_connection", _get_test_conn)
+    patcher6 = patch(
+        "billing.usage_reservations.get_db_connection",
+        _get_test_conn,
+    )
     patcher.start()
     patcher2.start()
     patcher3.start()
     patcher4.start()
+    patcher5.start()
+    patcher6.start()
     yield _get_test_conn
+    patcher6.stop()
+    patcher5.stop()
     patcher4.stop()
     patcher3.stop()
     patcher2.stop()

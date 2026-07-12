@@ -418,6 +418,9 @@ class BaseSecurityBackend:
     async def unblock_ip(self, ip: str) -> bool:
         raise NotImplementedError
 
+    async def get_active_blocked_ips(self, limit: int) -> List[str]:
+        raise NotImplementedError
+
     async def record_404(self, ip: str) -> None:
         raise NotImplementedError
 
@@ -513,6 +516,18 @@ class InMemorySecurityBackend(BaseSecurityBackend):
             removed = self._blocked_ips.pop(ip, None) is not None
             self._blocked_meta.pop(ip, None)
             return removed
+
+    async def get_active_blocked_ips(self, limit: int) -> List[str]:
+        async with self._lock:
+            now = _now_ts()
+            expired_ips = [
+                ip for ip, unblock_ts in self._blocked_ips.items()
+                if now >= unblock_ts
+            ]
+            for ip in expired_ips:
+                self._blocked_ips.pop(ip, None)
+                self._blocked_meta.pop(ip, None)
+            return sorted(self._blocked_ips)[:max(0, limit)]
 
     async def record_404(self, ip: str) -> None:
         async with self._lock:
@@ -733,6 +748,14 @@ class RedisSecurityBackend(BaseSecurityBackend):
         removed = await self.redis.zrem(self._k_blocked_z(), ip)
         await self.redis.delete(self._k_block_meta(ip))
         return _safe_int(removed) > 0
+
+    async def get_active_blocked_ips(self, limit: int) -> List[str]:
+        blocked_z = self._k_blocked_z()
+        await self.redis.zremrangebyscore(blocked_z, 0, _now_ts())
+        if limit <= 0:
+            return []
+        entries = await self.redis.zrange(blocked_z, 0, max(0, limit - 1))
+        return [str(self._decode(ip)) for ip in (entries or [])]
 
     async def record_404(self, ip: str) -> None:
         now = _now_ts()
@@ -1232,6 +1255,25 @@ class SecurityTracker:
     async def is_blocked(self, ip: str) -> bool:
         return await self._run("is_blocked", ip)
 
+    async def get_active_blocked_ip_snapshot(self, limit: int = 10000) -> Dict[str, Any]:
+        """Return active edge-block candidates and whether the snapshot is complete."""
+        bounded_limit = max(1, int(limit))
+        backend = await self._select_backend()
+        entries = await backend.get_active_blocked_ips(bounded_limit + 1)
+        truncated = len(entries) > bounded_limit
+        ips = entries[:bounded_limit]
+
+        # Redis is authoritative in auto mode. Memory is authoritative only when
+        # explicitly configured; during a Redis outage it must not erase the
+        # last known edge list merely because the fallback starts empty.
+        authoritative_backend = backend.name == "redis" or self.mode == "off"
+        return {
+            "backend": backend.name,
+            "ips": ips,
+            "truncated": truncated,
+            "authoritative": authoritative_backend and not truncated,
+        }
+
     async def block_ip(self, ip: str, hours: int = 24, reason: str = "", source: str = "manual") -> Dict[str, Any]:
         event = await self._run("block_ip", ip, hours, reason, source)
         logger.warning(f"SECURITY: Blocked IP {ip} for {hours}h. Reason: {reason}")
@@ -1665,6 +1707,11 @@ async def get_security_events_async(limit: int = 50) -> List[Dict[str, Any]]:
 async def get_security_blocked_ips_async(limit: int = 200) -> List[Dict[str, Any]]:
     """Get currently blocked IPs with metadata and Cloudflare sync status."""
     return await _tracker.get_blocked_ips(limit=limit)
+
+
+async def get_active_security_block_ips_snapshot_async(limit: int = 10000) -> Dict[str, Any]:
+    """Get the active IP snapshot used to reconcile the nginx edge blocklist."""
+    return await _tracker.get_active_blocked_ip_snapshot(limit=limit)
 
 
 async def manually_block_ip_async(ip: str, hours: int = 24, reason: str = "Manual block") -> Dict[str, Any]:

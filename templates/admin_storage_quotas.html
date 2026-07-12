@@ -1,0 +1,566 @@
+{% extends 'base_admin.html' %}
+
+{% block title %}Storage Quotas - Admin - AURVEK{% endblock %}
+
+{% block styles %}
+<style>
+    .stat-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 1rem;
+        height: 100%;
+        border-left: 3px solid var(--accent);
+    }
+    .stat-card.primary { border-left-color: var(--accent); }
+    .stat-card.info { border-left-color: var(--info); }
+    .stat-card.warning { border-left-color: var(--warning); }
+    .stat-card.danger { border-left-color: var(--danger); }
+    .stat-card.dedupe { border-left-color: var(--success); }
+    .stat-card.dedupe .amount { color: var(--success); }
+    .stat-card .label {
+        color: var(--text-secondary);
+        font-size: 0.82rem;
+    }
+    .stat-card .amount {
+        color: var(--text-primary);
+        font-size: 1.55rem;
+        font-weight: 700;
+    }
+    .stat-card .subtext {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        margin-top: 2px;
+    }
+    .help-text {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+    }
+    .quota-input-group {
+        max-width: 240px;
+    }
+    .filters-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: end;
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    .filter-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .filter-group label {
+        color: var(--text-secondary);
+        font-size: 0.8rem;
+        font-weight: 500;
+    }
+    .filter-group input,
+    .filter-group select {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        color: var(--text-primary);
+        padding: 6px 10px;
+    }
+    .table td {
+        vertical-align: middle;
+    }
+    .user-link {
+        color: var(--text-primary);
+        font-weight: 600;
+        text-decoration: none;
+    }
+    .user-link:hover {
+        color: var(--accent);
+        text-decoration: underline;
+    }
+    .user-id {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+    }
+    .usage-total {
+        color: var(--text-primary);
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .usage-bar {
+        height: 8px;
+        max-width: 320px;
+        margin: 4px 0;
+        border-radius: 4px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+    }
+    .usage-bar-fill {
+        height: 100%;
+        border-radius: 4px;
+        background: var(--success);
+    }
+    .usage-bar-fill.warn { background: var(--warning); }
+    .usage-bar-fill.danger { background: var(--danger); }
+    .usage-split {
+        color: var(--text-muted);
+        font-size: 0.78rem;
+    }
+    .pct-ok { color: var(--success); font-weight: 600; }
+    .pct-warn { color: var(--warning); font-weight: 600; }
+    .pct-danger { color: var(--danger); font-weight: 600; }
+    .override-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 7px;
+        border: 1px solid var(--accent);
+        border-radius: 10px;
+        color: var(--accent);
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        vertical-align: middle;
+    }
+    .override-editor {
+        min-width: 250px;
+        max-width: 330px;
+    }
+</style>
+{% endblock %}
+
+{% block page_title %}Storage Quotas{% endblock %}
+
+{% block page_subtitle %}
+<p class="page-subtitle">Per-user storage usage, quota overrides, and the platform default</p>
+{% endblock %}
+
+{% block page_actions %}
+<button class="btn btn-outline-secondary btn-sm" type="button" onclick="refreshStorageQuotas()">
+    <i class="fas fa-sync-alt me-1"></i> Refresh
+</button>
+{% endblock %}
+
+{% block content %}
+<!-- Overview stat cards -->
+<div class="row mb-4">
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card primary">
+            <div class="label"><i class="fas fa-database me-1"></i>Logical Usage</div>
+            <div class="amount" id="statLogicalTotal">-</div>
+            <div class="subtext">Total charged against user quotas</div>
+        </div>
+    </div>
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card info">
+            <div class="label"><i class="fas fa-file-arrow-up me-1"></i>Physical Uploads</div>
+            <div class="amount" id="statPhysicalBlobs">-</div>
+            <div class="subtext" id="statVariantsSubtext">Deduplicated blobs on disk</div>
+        </div>
+    </div>
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card info">
+            <div class="label"><i class="fas fa-wand-magic-sparkles me-1"></i>Generated Media</div>
+            <div class="amount" id="statGeneratedTotal">-</div>
+            <div class="subtext">Images, videos, exports, recordings</div>
+        </div>
+    </div>
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card dedupe">
+            <div class="label"><i class="fas fa-compress me-1"></i>Dedupe Savings</div>
+            <div class="amount" id="statDedupeSavings">-</div>
+            <div class="subtext">Disk saved by upload deduplication</div>
+        </div>
+    </div>
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card warning">
+            <div class="label"><i class="fas fa-triangle-exclamation me-1"></i>Users Over 80%</div>
+            <div class="amount" id="statUsersOver80">-</div>
+            <div class="subtext">Of their effective quota</div>
+        </div>
+    </div>
+    <div class="col-xl-2 col-md-4 col-6 mb-3">
+        <div class="stat-card danger">
+            <div class="label"><i class="fas fa-ban me-1"></i>Users Over 100%</div>
+            <div class="amount" id="statUsersOver100">-</div>
+            <div class="subtext">At or above their quota</div>
+        </div>
+    </div>
+</div>
+
+<!-- Global default quota -->
+<div class="section-container mb-4">
+    <div class="section-title"><i class="fas fa-globe me-2"></i>Default Quota</div>
+    <p class="help-text mb-3">Applies to every user without a per-user override. Changes take effect immediately.</p>
+    <form id="defaultQuotaForm" data-form-guard>
+        <div class="mb-3">
+            <label for="defaultQuotaGb" class="form-label">Default storage quota (GB)</label>
+            <div class="input-group quota-input-group">
+                <input type="number" class="form-control" id="defaultQuotaGb" name="default_quota_gb"
+                       min="0" step="any" required>
+                <span class="input-group-text">GB</span>
+            </div>
+            <small class="help-text">Binary GB (1 GB = 1024^3 bytes). 0 = unlimited.</small>
+        </div>
+        <button type="submit" class="btn btn-primary" id="saveDefaultBtn">
+            <i class="fas fa-save me-1"></i> Save Default
+        </button>
+    </form>
+</div>
+
+<!-- Per-user usage table -->
+<div class="section-container">
+    <div class="section-title"><i class="fas fa-users me-2"></i>Per-User Usage</div>
+    <div class="filters-row">
+        <div class="filter-group">
+            <label for="userSearch">Search user</label>
+            <input type="text" id="userSearch" placeholder="Username" autocomplete="off">
+        </div>
+        <div class="filter-group">
+            <label for="userLimit">Show</label>
+            <select id="userLimit">
+                <option value="50" selected>Top 50</option>
+                <option value="100">Top 100</option>
+                <option value="250">Top 250</option>
+                <option value="500">Top 500</option>
+            </select>
+        </div>
+    </div>
+    <div class="table-wrapper">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>User</th>
+                    <th>Usage</th>
+                    <th class="text-end">Quota</th>
+                    <th class="text-end">Used</th>
+                    <th>Override (GB)</th>
+                </tr>
+            </thead>
+            <tbody id="usersTable">
+                <tr><td colspan="5" class="text-center text-muted py-4">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+    const GB_BYTES = 1024 * 1024 * 1024;
+    const SEARCH_DEBOUNCE_MS = 300;
+
+    let defaultQuotaBytes = 0;
+    let usersById = new Map();
+    let searchDebounceTimer = null;
+    let overridePutInFlight = false;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        loadConfig();
+        loadStats();
+        loadUsers();
+        document.getElementById('defaultQuotaForm').addEventListener('submit', saveDefaultQuota);
+        const searchInput = document.getElementById('userSearch');
+        searchInput.addEventListener('input', function() {
+            clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(loadUsers, SEARCH_DEBOUNCE_MS);
+        });
+        searchInput.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                clearTimeout(searchDebounceTimer);
+                loadUsers();
+            }
+        });
+        document.getElementById('userLimit').addEventListener('change', loadUsers);
+        document.getElementById('usersTable').addEventListener('click', onUsersTableClick);
+    });
+
+    async function apiFetch(url, options) {
+        return secureFetch(url, {
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...(options && options.headers ? options.headers : {})
+            }
+        });
+    }
+
+    // ---------- Formatting ----------
+
+    // Adaptive binary units for usage amounts; quotas always display as GB.
+    function formatBytes(bytes) {
+        const value = Number(bytes) || 0;
+        if (value >= 1024 * GB_BYTES) return (value / (1024 * GB_BYTES)).toFixed(1) + ' TB';
+        if (value >= GB_BYTES) return (value / GB_BYTES).toFixed(1) + ' GB';
+        if (value >= 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + ' MB';
+        if (value >= 1024) return (value / 1024).toFixed(1) + ' KB';
+        return Math.round(value) + ' B';
+    }
+
+    function formatGb(bytes) {
+        return ((Number(bytes) || 0) / GB_BYTES).toFixed(1) + ' GB';
+    }
+
+    function formatQuota(bytes) {
+        return bytes === 0 ? 'Unlimited' : formatGb(bytes);
+    }
+
+    // Compact GB value for prefilling number inputs ("30", "1.5").
+    function bytesToGbInputValue(bytes) {
+        const gb = (Number(bytes) || 0) / GB_BYTES;
+        return Number.isInteger(gb) ? String(gb) : String(parseFloat(gb.toFixed(2)));
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    }
+
+    // ---------- Default quota ----------
+
+    async function loadConfig() {
+        try {
+            const response = await apiFetch('/api/admin/storage-quotas/config');
+            if (!response || !response.ok) throw new Error('Failed to load config');
+            const data = await response.json();
+            defaultQuotaBytes = data.default_quota_bytes || 0;
+            const input = document.getElementById('defaultQuotaGb');
+            input.value = bytesToGbInputValue(defaultQuotaBytes);
+            FormGuard.markClean(document.getElementById('defaultQuotaForm'));
+        } catch (error) {
+            console.error('Error loading storage quota config:', error);
+            NotificationModal.error('Load Failed', 'Could not load the default storage quota.');
+        }
+    }
+
+    async function saveDefaultQuota(event) {
+        event.preventDefault();
+
+        const input = document.getElementById('defaultQuotaGb');
+        const gb = parseFloat(input.value);
+        if (!Number.isFinite(gb) || gb < 0) {
+            NotificationModal.warning('Invalid Value', 'The default quota must be a number of GB, 0 or greater.');
+            return;
+        }
+
+        const saveBtn = document.getElementById('saveDefaultBtn');
+        const originalText = saveBtn.innerHTML;
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Saving...';
+
+        try {
+            const response = await apiFetch('/api/admin/storage-quotas/config', {
+                method: 'PUT',
+                body: JSON.stringify({ default_quota_bytes: Math.round(gb * GB_BYTES) })
+            });
+            if (!response) return;
+            const result = await response.json();
+
+            if (response.ok && result.success) {
+                defaultQuotaBytes = result.default_quota_bytes;
+                input.value = bytesToGbInputValue(defaultQuotaBytes);
+                FormGuard.markClean(document.getElementById('defaultQuotaForm'));
+                saveBtn.innerHTML = '<i class="fas fa-check me-1"></i> Saved!';
+                saveBtn.classList.remove('btn-primary');
+                saveBtn.classList.add('btn-success');
+                setTimeout(() => {
+                    saveBtn.innerHTML = originalText;
+                    saveBtn.classList.remove('btn-success');
+                    saveBtn.classList.add('btn-primary');
+                    saveBtn.disabled = false;
+                }, 2000);
+                // The default applies to every non-override user: refresh derived views.
+                loadUsers();
+                loadStats();
+                return;
+            }
+            NotificationModal.error('Save Failed', result.message || 'Error saving the default quota');
+        } catch (error) {
+            console.error('Error saving storage quota config:', error);
+            NotificationModal.error('Save Error', 'An error occurred while saving the default quota.');
+        }
+        saveBtn.innerHTML = originalText;
+        saveBtn.disabled = false;
+    }
+
+    // ---------- Overview stats ----------
+
+    async function loadStats() {
+        try {
+            const response = await apiFetch('/api/admin/storage-quotas/stats');
+            if (!response || !response.ok) throw new Error('Failed to load stats');
+            const data = await response.json();
+            setText('statLogicalTotal', formatBytes(data.logical_total));
+            setText('statPhysicalBlobs', formatBytes(data.physical_blob_total));
+            setText('statVariantsSubtext', 'Plus ' + formatBytes(data.physical_variants_total) + ' in thumbnails');
+            setText('statGeneratedTotal', formatBytes(data.generated_total));
+            setText('statDedupeSavings', formatBytes(Math.max(0, data.dedupe_savings)));
+            setText('statUsersOver80', String(data.users_over_80));
+            setText('statUsersOver100', String(data.users_over_100));
+        } catch (error) {
+            console.error('Error loading storage stats:', error);
+            NotificationModal.error('Load Failed', 'Could not load storage statistics.');
+        }
+    }
+
+    // ---------- User table ----------
+
+    async function loadUsers() {
+        const params = new URLSearchParams();
+        const search = document.getElementById('userSearch').value.trim();
+        if (search) params.set('search', search);
+        params.set('limit', document.getElementById('userLimit').value);
+
+        try {
+            const response = await apiFetch('/api/admin/storage-quotas/users?' + params.toString());
+            if (!response || !response.ok) throw new Error('Failed to load users');
+            const data = await response.json();
+            renderUsers(data.users || []);
+        } catch (error) {
+            console.error('Error loading storage quota users:', error);
+            document.getElementById('usersTable').innerHTML =
+                '<tr><td colspan="5" class="text-center text-danger py-4">Failed to load users</td></tr>';
+        }
+    }
+
+    function thresholdLevel(percent) {
+        if (percent >= 95) return 'danger';
+        if (percent >= 80) return 'warn';
+        return 'ok';
+    }
+
+    function renderUsers(users) {
+        usersById = new Map(users.map(user => [user.user_id, user]));
+        const tbody = document.getElementById('usersTable');
+        if (!users.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">No users found</td></tr>';
+            return;
+        }
+        tbody.innerHTML = users.map(renderUserRow).join('');
+    }
+
+    function renderUserRow(user) {
+        const safeName = escapeHtml(user.username);
+        const unlimited = user.quota_bytes === 0;
+
+        let usageBar = '';
+        let usedCell = '<span class="text-muted">-</span>';
+        if (!unlimited && user.percent !== null && user.percent !== undefined) {
+            const level = thresholdLevel(user.percent);
+            const width = Math.max(0, Math.min(100, user.percent));
+            const fillClass = level === 'ok' ? '' : ' ' + level;
+            usageBar = `
+                <div class="usage-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                     aria-valuenow="${Math.round(width)}"
+                     aria-label="${safeName} storage usage ${user.percent.toFixed(1)}%">
+                    <div class="usage-bar-fill${fillClass}" style="width: ${width}%;"></div>
+                </div>`;
+            const pctClass = level === 'danger' ? 'pct-danger' : (level === 'warn' ? 'pct-warn' : 'pct-ok');
+            usedCell = `<span class="${pctClass}">${user.percent.toFixed(1)}%</span>`;
+        }
+
+        const quotaCell = unlimited
+            ? 'Unlimited'
+            : formatGb(user.quota_bytes);
+        const overrideBadge = user.is_override ? '<span class="override-badge">Override</span>' : '';
+        const overrideValue = user.is_override ? escapeHtml(bytesToGbInputValue(user.quota_bytes)) : '';
+
+        return `
+            <tr>
+                <td>
+                    <a class="user-link" href="/edit-user/${encodeURIComponent(user.username)}">${safeName}</a>
+                    <div class="user-id">#${user.user_id}</div>
+                </td>
+                <td>
+                    <div class="usage-total">${formatBytes(user.total_bytes)}</div>
+                    ${usageBar}
+                    <div class="usage-split">Uploads ${formatBytes(user.uploads_bytes)} - Generated ${formatBytes(user.generated_bytes)}</div>
+                </td>
+                <td class="text-end">${quotaCell}${overrideBadge}</td>
+                <td class="text-end">${usedCell}</td>
+                <td>
+                    <div class="input-group input-group-sm override-editor">
+                        <input type="number" class="form-control override-input" min="0" step="any"
+                               data-user-id="${user.user_id}" value="${overrideValue}"
+                               placeholder="System default" aria-label="Quota override in GB for ${safeName}">
+                        <span class="input-group-text">GB</span>
+                        <button type="button" class="btn btn-outline-primary" data-action="set" data-user-id="${user.user_id}">Set</button>
+                        <button type="button" class="btn btn-outline-secondary" data-action="clear" data-user-id="${user.user_id}"${user.is_override ? '' : ' disabled'}>Clear</button>
+                    </div>
+                </td>
+            </tr>`;
+    }
+
+    function onUsersTableClick(event) {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const userId = parseInt(button.dataset.userId, 10);
+        const user = usersById.get(userId);
+        if (!user) return;
+
+        if (button.dataset.action === 'clear') {
+            putUserQuota(user, null);
+            return;
+        }
+
+        const input = document.querySelector(`.override-input[data-user-id="${userId}"]`);
+        const raw = input ? input.value.trim() : '';
+        if (raw === '') {
+            NotificationModal.warning('Storage Quotas', 'Enter a quota in GB, or use Clear to return the user to the system default.');
+            return;
+        }
+        const gb = parseFloat(raw);
+        if (!Number.isFinite(gb) || gb < 0) {
+            NotificationModal.warning('Invalid Value', 'The quota override must be a number of GB, 0 or greater.');
+            return;
+        }
+        putUserQuota(user, Math.round(gb * GB_BYTES));
+    }
+
+    async function putUserQuota(user, quotaBytes) {
+        if (overridePutInFlight) return;
+        overridePutInFlight = true;
+        try {
+            const response = await apiFetch('/api/admin/storage-quotas/users/' + user.user_id, {
+                method: 'PUT',
+                body: JSON.stringify({ quota_bytes: quotaBytes })
+            });
+            if (!response) return;
+            const result = await response.json();
+            if (response.ok && result.success) {
+                const summary = quotaBytes === null
+                    ? 'Override cleared for ' + user.username + ' (back to system default)'
+                    : 'Quota set to ' + formatQuota(quotaBytes) + ' for ' + user.username;
+                NotificationModal.toast(summary, 'success');
+                // Refetch: quota changes shift per-user percents and the over-threshold tallies.
+                loadUsers();
+                loadStats();
+            } else {
+                NotificationModal.error('Save Failed', result.message || 'Error saving the quota override');
+            }
+        } catch (error) {
+            console.error('Error saving storage quota override:', error);
+            NotificationModal.error('Save Error', 'An error occurred while saving the quota override.');
+        } finally {
+            overridePutInFlight = false;
+        }
+    }
+
+    // ---------- Page actions ----------
+
+    function refreshStorageQuotas() {
+        loadConfig();
+        loadStats();
+        loadUsers();
+    }
+</script>
+{% endblock %}

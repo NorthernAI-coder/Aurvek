@@ -23,6 +23,7 @@ from chat.services.privacy import (
     mark_conversation_incognito,
 )
 from chat.services.stop_signals import stop_signals
+from integrations.devices.service import get_conversation_binding_summaries
 
 router = APIRouter()
 
@@ -42,6 +43,11 @@ async def is_admin(user_id):
         except Exception as exc:
             logger.error("Error verifying if user is admin: %s", exc)
             return False
+
+
+def _conversation_not_found() -> HTTPException:
+    """Use one response for missing and inaccessible conversation metadata."""
+    return HTTPException(status_code=404, detail="Conversation not found")
 
 
 @router.get("/api/conversations")
@@ -152,6 +158,10 @@ async def get_conversations(
             await cursor.execute(query, params)
             conversations = await cursor.fetchall()
             all_conversations = list(external_conversations) + list(conversations)
+            binding_summaries = await get_conversation_binding_summaries(
+                user_id,
+                [conv[0] for conv in all_conversations if not conv[4]],
+            )
 
             return JSONResponse(content=[
                 {
@@ -169,6 +179,9 @@ async def get_conversations(
                     "allowed_llms": orjson.loads(conv[11]) if conv[11] else None,
                     "is_paid": bool(conv[12]),
                     "last_activity": conv[13],
+                    "external_bindings": (
+                        None if conv[4] else binding_summaries.get(int(conv[0]))
+                    ),
                 }
                 for conv in all_conversations
             ])
@@ -496,18 +509,27 @@ async def get_last_message_id(conversation_id: int, current_user: User = Depends
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    admin_access = await is_admin(current_user.id)
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.execute(
             """
-            SELECT id FROM messages
-            WHERE conversation_id = ?
-            ORDER BY date DESC, id DESC LIMIT 1
+            SELECT (
+                SELECT m.id
+                FROM MESSAGES m
+                WHERE m.conversation_id = c.id
+                ORDER BY m.date DESC, m.id DESC
+                LIMIT 1
+            ) AS message_id
+            FROM CONVERSATIONS c
+            WHERE c.id = ? AND (c.user_id = ? OR ? = 1)
             """,
-            (conversation_id,),
+            (conversation_id, current_user.id, int(admin_access)),
         )
         result = await cursor.fetchone()
 
-    return {"message_id": result[0] if result else None}
+    if not result:
+        raise _conversation_not_found()
+    return {"message_id": result[0]}
 
 
 @router.get("/api/conversations/{conversation_id}/status")
@@ -515,13 +537,21 @@ async def conversation_status(conversation_id: int, current_user: User = Depends
     if current_user is None:
         return unauthenticated_response()
 
+    admin_access = await is_admin(current_user.id)
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
-        await cursor.execute("SELECT id FROM conversations WHERE id = ?", (conversation_id,))
+        await cursor.execute(
+            """
+            SELECT id FROM CONVERSATIONS
+            WHERE id = ? AND (user_id = ? OR ? = 1)
+            """,
+            (conversation_id, current_user.id, int(admin_access)),
+        )
         conversation = await cursor.fetchone()
-        await conn.close()
 
-    return JSONResponse(content={"isActive": bool(conversation)}, status_code=200)
+    if not conversation:
+        raise _conversation_not_found()
+    return JSONResponse(content={"isActive": True}, status_code=200)
 
 
 @router.get("/api/conversations/{conversation_id}/web-search-status")

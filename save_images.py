@@ -4,12 +4,13 @@ import os
 import io
 import asyncio
 import hashlib
+import posixpath
 import redis
 import aiosqlite
 from typing import Optional
 import jwt
 from jwt import PyJWTError as JWTError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from datetime import date, datetime, timezone, timedelta
 from PIL import Image as PilImage, UnidentifiedImageError
 from fastapi import FastAPI, Response, HTTPException, Depends, Request, Form, status, UploadFile, File
@@ -22,6 +23,8 @@ from auth import hash_password, verify_password, get_user_by_username, get_curre
 from auth import get_current_user_from_websocket, get_user_id_from_conversation, get_user_by_token, create_user_info, create_login_response, generate_magic_link
 from common import CLOUDFLARE_FOR_IMAGES, CLOUDFLARE_IMAGE_SUBDOMAIN, CLOUDFLARE_BASE_URL, generate_signed_url_cloudflare
 from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, elevenlabs_key, openai_key, tts_engine, get_balance, deduct_balance, load_service_costs, SECRET_KEY, ALGORITHM, MEDIA_TOKEN_EXPIRE_HOURS
+from database import get_db_connection
+from storage_quota import record_generated_file
 
 # Load environment variables
 load_dotenv()
@@ -45,7 +48,7 @@ if USE_REDIS:
 def _save_image_to_disk(
     image_data: bytes, username: str, conversation_id: int,
     source: str, format: str = 'webp', pre_compressed_webp: bool = False
-) -> tuple[str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, int, int]:
     """Sync helper: hash, create dirs, open/resize/save image to disk.
 
     Args:
@@ -53,7 +56,8 @@ def _save_image_to_disk(
             directly to disk without Pillow re-encode. Only thumbnail uses Pillow.
 
     Returns:
-        (file_hash, ext, base_url_256, base_url_fullsize)
+        (file_hash, ext, base_url_256, base_url_fullsize,
+         file_path_256, file_path_fullsize, size_256, size_fullsize)
     """
     # User hash-based path
     hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
@@ -102,11 +106,18 @@ def _save_image_to_disk(
     else:
         image.save(file_path_fullsize, ext.upper())
 
+    # File sizes on disk feed the storage-quota ledger (one row per file).
+    size_256 = os.path.getsize(file_path_256)
+    size_fullsize = os.path.getsize(file_path_fullsize)
+
     # Return base URLs for token/Cloudflare URL generation
     base_url_256 = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_256}"
     base_url_fullsize = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/img/{source}/{filename_fullsize}"
 
-    return file_hash, ext, base_url_256, base_url_fullsize
+    return (
+        file_hash, ext, base_url_256, base_url_fullsize,
+        file_path_256, file_path_fullsize, size_256, size_fullsize,
+    )
 
 
 async def save_image_locally(
@@ -128,11 +139,34 @@ async def save_image_locally(
         pre_compressed_webp: If True, skip Pillow re-encode for fullsize (write bytes directly).
     """
     # All Pillow + filesystem work runs in a thread
-    file_hash, ext, base_url_256, base_url_fullsize = await asyncio.to_thread(
+    (
+        file_hash, ext, base_url_256, base_url_fullsize,
+        file_path_256, file_path_fullsize, size_256, size_fullsize,
+    ) = await asyncio.to_thread(
         _save_image_to_disk,
         image_data, current_user.username, conversation_id, source, format,
         pre_compressed_webp
     )
+
+    # Ledger both files (thumbnail + fullsize) so generated images count against
+    # the owner's storage quota -- ONE row per file on disk. This same hook also
+    # covers QR codes (qr_code.py) and map renders (execution.py): those are tiny
+    # chat-tool byproducts and are NOT pre-check-gated, but they ARE ledgered
+    # here. Fail fast: the files were written first, so we ledger them
+    # immediately after; if the ledger insert fails we delete both files and
+    # re-raise -- an artifact that cannot be accounted must not exist.
+    try:
+        async with get_db_connection() as conn:
+            await record_generated_file(conn, conversation_id, 'image', base_url_256, size_256)
+            await record_generated_file(conn, conversation_id, 'image', base_url_fullsize, size_fullsize)
+            await conn.commit()
+    except Exception:
+        for orphan_path in (file_path_256, file_path_fullsize):
+            try:
+                os.remove(orphan_path)
+            except OSError:
+                pass
+        raise
 
     # URL generation (lightweight, stays on event loop)
     if CLOUDFLARE_FOR_IMAGES:
@@ -171,14 +205,34 @@ async def save_image_locally(
     return image_link_base_256, image_link_token_256, image_link_base_fullsize, image_link_token_fullsize
 
 
+def normalize_image_path(path_or_url: str) -> str:
+    """Return a canonical URL path suitable for binding an image token."""
+    if not isinstance(path_or_url, str):
+        raise TypeError(f"path_or_url must be a string, got {type(path_or_url)}")
+    if "\x00" in path_or_url:
+        raise ValueError("Invalid image path")
+
+    parsed = urlparse(path_or_url)
+    raw_path = unquote(parsed.path).replace("\\", "/").lstrip("/")
+    normalized = posixpath.normpath(raw_path)
+    if normalized in ("", "."):
+        return ""
+    if normalized == ".." or normalized.startswith("../"):
+        raise ValueError("Invalid image path")
+    return normalized
+
+
 def generate_img_token(string_to_use: str, expiration: datetime, current_user: User = Depends(get_current_user)) -> str:
     if not isinstance(string_to_use, str):
         raise TypeError(f"string_to_use must be a string, got {type(string_to_use)}")
-    
+
     payload = {
         "exp": expiration,
         "username": current_user.username
     }
+    media_path = normalize_image_path(string_to_use)
+    if media_path.startswith("users/"):
+        payload["media_path"] = media_path
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
     return token
 

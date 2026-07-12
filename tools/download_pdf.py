@@ -40,6 +40,7 @@ from dotenv import load_dotenv
 
 # Own libraries
 from database import get_db_connection
+from storage_quota import record_generated_file
 from common import generate_user_hash, text_file_block_to_text
 from file_storage import get_attachment_local_path_sync, read_attachment_bytes_sync
 
@@ -757,3 +758,23 @@ async def generate_and_save_pdf(conversation_id: int, user_id: int, is_admin: bo
         logger.debug(f"PDF saved successfully at {pdf_file_path} for conversation_id: {conversation_id}")
     except Exception as e:
         logger.error(f"Error saving PDF: {e}")
+        return
+
+    # Ledger the export so it counts against the owner's storage quota (one row
+    # per file on disk). Fail fast: written first, ledgered immediately after --
+    # if the ledger insert fails we delete the file and re-raise so an
+    # unaccounted artifact never exists. BASE_DIR carries a ".." segment, so the
+    # path is resolved before it reaches the ledger normalizer.
+    try:
+        async with get_db_connection() as conn:
+            await record_generated_file(
+                conn, conversation_id, 'pdf', os.path.abspath(pdf_file_path), len(pdf_bytes)
+            )
+            await conn.commit()
+    except Exception as e:
+        if os.path.exists(pdf_file_path):
+            try:
+                os.remove(pdf_file_path)
+            except OSError:
+                logger.warning("Could not remove unaccounted PDF file at %s", pdf_file_path)
+        raise

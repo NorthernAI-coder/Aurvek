@@ -7,8 +7,10 @@ import aiohttp
 import dramatiq
 import time
 import re
+import secrets
 import base64
 import io
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, Union
 from dotenv import load_dotenv
@@ -18,15 +20,27 @@ from fastapi import FastAPI, Response, HTTPException, Depends, Request, Form, st
 from urllib.parse import urlparse
 
 # Own libraries
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    claim_fixed_usage_provider,
+    mark_fixed_usage_provider_succeeded,
+    refund_fixed_usage,
+    reserve_fixed_usage,
+    settle_fixed_usage,
+)
 from rediscfg import redis_client, broker
-from common import estimate_message_tokens, Cost
+from common import Cost
+from database import get_db_connection
+from storage_quota import StorageQuotaExceededError, ensure_generation_headroom
+from log_config import logger
 from models import User, ConnectionManager
 from integrations.conversations import is_whatsapp_conversation
 from tools import register_tool, register_dramatiq_task, register_function_handler
+from tools.delivery_ack import publish_result_with_ack
 from save_images import save_image_locally, get_or_generate_img_token, resize_image
 from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id, get_user_from_phone_number
 from auth import get_current_user_from_websocket, get_user_id_from_conversation, get_user_by_token, create_user_info, create_login_response, generate_magic_link
-from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, elevenlabs_key, openai_key, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, ALGORITHM, estimate_message_tokens
 
 load_dotenv()
 
@@ -48,6 +62,39 @@ IMAGE_GENERATION_TIMEOUT = int(os.getenv('IMAGE_GENERATION_TIMEOUT', 120))
 GEMINI_IMAGE_MODEL = os.getenv('GEMINI_IMAGE_MODEL', 'gemini-2.5-flash-image')
 OPENAI_IMAGE_MODEL = os.getenv('OPENAI_IMAGE_MODEL', 'gpt-image-1')
 POE_IMAGE_MODEL = os.getenv('POE_IMAGE_MODEL', 'flux2pro')
+
+_IMAGE_SERVICE_BY_ENGINE = {
+    'ideogram': 'IMAGE-IDEOGRAM-V2',
+    'poe': 'IMAGE-POE',
+    'openai': 'IMAGE-OPENAI-GPT-IMAGE',
+}
+
+_active_image_billing: ContextVar[dict | None] = ContextVar(
+    "active_image_billing",
+    default=None,
+)
+
+
+async def _mark_active_image_provider_succeeded() -> None:
+    """Mark remote success before fallible local image processing."""
+    billing = _active_image_billing.get()
+    if not billing:
+        return
+    # Set this first: if durable marking itself fails after a billable response,
+    # the task must not refund known external work.
+    billing["provider_completed"] = True
+    if billing.get("provider_marked"):
+        return
+    marked = await mark_fixed_usage_provider_succeeded(
+        billing["reservation_id"],
+        purpose="image",
+        user_id=billing["user_id"],
+    )
+    if not marked:
+        raise BillingReservationError(
+            "Image billing reservation is no longer active"
+        )
+    billing["provider_marked"] = True
 
 # =============================================================================
 # MODEL CAPABILITIES (max reference images supported)
@@ -72,6 +119,42 @@ OPENAI_MODEL_MAX_REFS = {
     "gpt-image-1-mini": 16,
     "dall-e-3": 0,  # Does NOT support references
 }
+
+
+def _extract_image_ratio(prompt: str) -> str:
+    ratio_match = re.search(r'\b(\d+:\d+)\b', prompt or '')
+    return ratio_match.group(1) if ratio_match else '1:1'
+
+
+def _dalle_size_for_ratio(ratio: str) -> str:
+    if ratio in {'16:9', '4:3'}:
+        return '1792x1024'
+    if ratio in {'9:16', '3:4'}:
+        return '1024x1792'
+    return '1024x1024'
+
+
+def _image_billing_service_name(prompt: str) -> str:
+    """Resolve the configured service that matches the provider call."""
+    selected_engine = IMAGE_GENERATION_ENGINE
+    if selected_engine == 'dall-e':
+        dalle_size = _dalle_size_for_ratio(_extract_image_ratio(prompt))
+        if dalle_size != '1024x1024':
+            return 'IMAGE-DALL-E-3-STANDARD-WIDE'
+        return 'IMAGE-DALL-E-3-STANDARD-SQUARE'
+    if selected_engine in ('nano-banana', 'gemini'):
+        if GEMINI_IMAGE_MODEL == 'gemini-2.5-flash-image':
+            return 'IMAGE-GEMINI-2.5-FLASH'
+        model_component = re.sub(
+            r'[^A-Z0-9]+',
+            '-',
+            GEMINI_IMAGE_MODEL.upper(),
+        ).strip('-')
+        return f'IMAGE-GEMINI-{model_component}'
+    return _IMAGE_SERVICE_BY_ENGINE.get(
+        selected_engine,
+        f'IMAGE-{selected_engine.upper()}',
+    )
 
 
 # =============================================================================
@@ -135,14 +218,8 @@ def _prepare_reference_image(image_source: Union[bytes, str, Path], max_size: in
 
 async def generate_image_dalle(prompt: str, ratio: str = "1:1") -> tuple:
     """Generate image using DALL-E 3 (no reference support)"""
-    if ratio == "1:1":
-        size = "1024x1024"
-    elif ratio == "16:9" or ratio == "9:16":
-        size = "1792x1024" if ratio == "16:9" else "1024x1792"
-    elif ratio == "4:3" or ratio == "3:4":
-        size = "1024x768" if ratio == "4:3" else "768x1024"
-    else:
-        size = "1024x1024"
+    # DALL-E 3 only accepts these native square/landscape/portrait sizes.
+    size = _dalle_size_for_ratio(ratio)
 
     headers = {
         "Content-Type": "application/json",
@@ -160,6 +237,7 @@ async def generate_image_dalle(prompt: str, ratio: str = "1:1") -> tuple:
                 if response.status == 200:
                     result = await response.json()
                     image_url = result['data'][0]['url']
+                    await _mark_active_image_provider_succeeded()
                     revised_prompt = result['data'][0].get('revised_prompt', prompt)
                     async with session.get(image_url, timeout=IMAGE_GENERATION_TIMEOUT) as img_response:
                         return await img_response.read(), revised_prompt, ratio
@@ -205,6 +283,7 @@ async def generate_image_ideogram(prompt: str, ratio: str = "1:1") -> tuple:
                 if response.status == 200:
                     result = await response.json()
                     image_url = result['data'][0]['url']
+                    await _mark_active_image_provider_succeeded()
                     print(f"image url: {image_url}")
                     async with session.get(image_url, timeout=IMAGE_GENERATION_TIMEOUT) as img_response:
                         return await img_response.read(), prompt, ratio
@@ -320,7 +399,11 @@ Preserve the identity and appearance of any people shown in the references."""
                             raise Exception(f"Image generation stopped unexpectedly. Reason: {finish_reason}")
                         raise Exception("No image data returned from Gemini model")
 
-                    image_data = base64.b64decode(image_part['data'])
+                    encoded_image = image_part.get('data')
+                    if not encoded_image:
+                        raise Exception("No image data returned from Gemini model")
+                    await _mark_active_image_provider_succeeded()
+                    image_data = base64.b64decode(encoded_image)
                     return image_data, prompt, ratio
 
                 else:
@@ -447,6 +530,7 @@ Requirements:
         )
     except Exception as e:
         raise Exception(f"POE API call failed: {e}")
+    await _mark_active_image_provider_succeeded()
 
     # Extract image from response
     if response.choices and len(response.choices) > 0:
@@ -576,7 +660,10 @@ Preserve the appearance and style from the references."""
                     prompt=full_prompt,
                     size=size,
                 )
+                await _mark_active_image_provider_succeeded()
                 print(f"OpenAI edit API called with {len(image_files)} reference images")
+        except BillingReservationError:
+            raise
         except Exception as e:
             print(f"OpenAI edit with references failed, falling back to generate: {e}")
             response = None
@@ -590,6 +677,7 @@ Preserve the appearance and style from the references."""
             quality="high" if is_gpt_image else "hd",
             n=1,
         )
+        await _mark_active_image_provider_succeeded()
 
     # Extract image
     image_data = response.data[0]
@@ -700,10 +788,42 @@ async def generate_image_with_references(
 # DRAMATIQ TASK FOR BACKGROUND PROCESSING
 # =============================================================================
 
-async def generate_image_task(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str):
+async def generate_image_task(
+    channel_name: str,
+    prompt: str,
+    conversation_id: int,
+    user_id: int,
+    is_whatsapp: bool,
+    request_url: str,
+    reservation_id: str,
+):
+    billing_context = {
+        "reservation_id": reservation_id,
+        "user_id": int(user_id),
+        "provider_completed": False,
+        "provider_marked": False,
+    }
+    billing_token = _active_image_billing.set(billing_context)
     try:
         print("Entering generate_image_task")
+        if not reservation_id:
+            raise BillingReservationError("Image billing reservation is required")
+        if not await claim_fixed_usage_provider(
+            reservation_id,
+            purpose="image",
+            user_id=user_id,
+        ):
+            return
         image_bytes, revised_prompt, ratio = await generate_image(prompt)
+        # Compatibility fallback for direct/mocked generators that return the
+        # final bytes without calling one of the provider-specific adapters.
+        if not billing_context["provider_completed"]:
+            await _mark_active_image_provider_succeeded()
+        settled = await settle_fixed_usage(reservation_id)
+        if not settled:
+            raise BillingReservationError(
+                "Image billing reservation was not active"
+            )
 
         filename = f"generated_image_{conversation_id}_{int(time.time())}.png"
         source = "bot"
@@ -742,42 +862,120 @@ async def generate_image_task(channel_name: str, prompt: str, conversation_id: i
             }
         ]).decode()
 
-        await redis_client.publish(channel_name, orjson.dumps({
-            'content_to_show': content_to_show,
-            'content_to_save': content_to_save
-        }).decode())
-
-        await redis_client.publish(channel_name, 'END')
+        await publish_result_with_ack(
+            redis_client,
+            channel_name=channel_name,
+            payload={
+                'content_to_show': content_to_show,
+                'content_to_save': content_to_save,
+            },
+            reservation_id=reservation_id,
+        )
 
     except Exception as e:
         print(f"Error in generate_image_task: {e}")
+        if reservation_id and not billing_context["provider_completed"]:
+            try:
+                await refund_fixed_usage(reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not refund image reservation %s",
+                    reservation_id,
+                )
         await redis_client.publish(channel_name, orjson.dumps({'error': str(e)}).decode())
         await redis_client.publish(channel_name, 'END')
+    finally:
+        _active_image_billing.reset(billing_token)
 
-@dramatiq.actor
-def generate_image_task_actor(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str):
-    asyncio.run(generate_image_task(channel_name, prompt, conversation_id, user_id, is_whatsapp, request_url))
+@dramatiq.actor(max_age=None, max_retries=0, time_limit=600_000)
+def generate_image_task_actor(
+    channel_name: str,
+    prompt: str,
+    conversation_id: int,
+    user_id: int,
+    is_whatsapp: bool,
+    request_url: str,
+    reservation_id: str,
+):
+    asyncio.run(
+        generate_image_task(
+            channel_name,
+            prompt,
+            conversation_id,
+            user_id,
+            is_whatsapp,
+            request_url,
+            reservation_id,
+        )
+    )
 
 async def handle_generate_image(function_arguments, messages, model, temperature, max_tokens, content, conversation_id, current_user, request, input_tokens, output_tokens, total_tokens, message_id, user_id, client, prompt, user_message=None):
+    reservation_id = None
+    reservation_transferred = False
     try:
         print("Entering handle_generate_image")
+        if (
+            current_user is None
+            or int(getattr(current_user, "id", -1)) != int(user_id)
+            or not bool(getattr(current_user, "can_generate_images", False))
+        ):
+            yield f"data: {orjson.dumps({'content': 'Image generation is not enabled for this account.', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+            return
         image_prompt = function_arguments['prompt']
-        channel_name = f"generate_image_response_{conversation_id}_{user_id}_{int(time.time())}"
+        channel_name = (
+            f"generate_image_response_{conversation_id}_{user_id}_"
+            f"{secrets.token_urlsafe(12)}"
+        )
 
         is_whatsapp = await is_whatsapp_conversation(conversation_id)
         request_url = str(request.url)
 
-        if not await has_sufficient_balance(user_id, Cost.IMAGE_GENERATION_COST):
-            yield f"data: {orjson.dumps({'content': 'Insufficient balance to generate image.', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+        # Storage-quota soft pre-check: a generation may START only while the
+        # owner is strictly under quota. Runs BEFORE any billing reservation so
+        # we never charge for an operation the quota check then kills. The
+        # requester is verified to be the conversation owner (user_id) above.
+        try:
+            async with get_db_connection(readonly=True) as quota_conn:
+                await ensure_generation_headroom(quota_conn, user_id)
+        except StorageQuotaExceededError as quota_exc:
+            yield f"data: {orjson.dumps({'content': quota_exc.message, 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
             return
 
-        generate_image_task_actor.send(channel_name, image_prompt, conversation_id, user_id, is_whatsapp, request_url)
+        try:
+            image_service_name = _image_billing_service_name(image_prompt)
+            image_cost, image_service_id = Cost.get_media_generation_service(
+                image_service_name
+            )
+            reservation_id = await reserve_fixed_usage(
+                user_id=user_id,
+                purpose="image",
+                amount=image_cost,
+                service_id=image_service_id,
+                usage_quantity=1,
+            )
+        except InsufficientBalanceError:
+            yield f"data: {orjson.dumps({'content': 'Insufficient balance to generate image.', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+            return
+        except BillingReservationError:
+            logger.exception("Could not reserve image generation usage")
+            yield f"data: {orjson.dumps({'content': 'Image billing is temporarily unavailable.', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+            return
 
-        yield f"data: {orjson.dumps({'content': 'Generating image...', 'save_to_db': False, 'yield': True}).decode()}\n\n"
-
-        image_success = False
         async with redis_client.pubsub() as pubsub:
             await pubsub.subscribe(channel_name)
+            generate_image_task_actor.send(
+                channel_name,
+                image_prompt,
+                conversation_id,
+                user_id,
+                is_whatsapp,
+                request_url,
+                reservation_id,
+            )
+            reservation_transferred = True
+
+            yield f"data: {orjson.dumps({'content': 'Generating image...', 'save_to_db': False, 'yield': True}).decode()}\n\n"
+
             start_time = time.time()
             while True:
                 if time.time() - start_time > IMAGE_GENERATION_TIMEOUT:
@@ -795,27 +993,22 @@ async def handle_generate_image(function_arguments, messages, model, temperature
                     if 'error' in json_data:
                         yield f"data: {orjson.dumps({'content': json_data['error'], 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
                     elif 'content_to_show' in json_data and 'content_to_save' in json_data:
-                        image_success = True
-                        yield f"data: {orjson.dumps({'content': json_data['content_to_show'], 'save_to_db': False, 'yield': True}).decode()}\n\n"
-                        yield f"data: {orjson.dumps({'content': json_data['content_to_save'], 'save_to_db': True, 'yield': False}).decode()}\n\n"
+                        yield f"data: {orjson.dumps({'content': json_data['content_to_show'], 'save_to_db': False, 'yield': True, '_delivery_ack': json_data.get('_delivery_ack')}).decode()}\n\n"
+                        yield f"data: {orjson.dumps({'content': json_data['content_to_save'], 'save_to_db': True, 'yield': False, '_delivery_ack': json_data.get('_delivery_ack')}).decode()}\n\n"
                 else:
                     await asyncio.sleep(0.1)
-
-        # Only charge when image was successfully generated
-        if image_success:
-            deducted = await deduct_balance(user_id, Cost.IMAGE_GENERATION_COST)
-            if not deducted:
-                print(f"WARNING: Failed to deduct image generation cost for user {user_id} - insufficient balance")
-            await record_daily_usage(
-                user_id=user_id,
-                usage_type='image',
-                cost=Cost.IMAGE_GENERATION_COST,
-                units=1
-            )
 
     except Exception as e:
         print(f"Error in handle_generate_image: {e}")
         yield f"data: {orjson.dumps({'content': f'Error generating image: {str(e)}', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+    finally:
+        if reservation_id and not reservation_transferred:
+            try:
+                await refund_fixed_usage(reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not refund image reservation before task handoff"
+                )
 
 # Tool definition for the semantic router
 register_tool({

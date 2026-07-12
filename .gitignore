@@ -4,6 +4,8 @@ CLAUDE.md
 data/cache/
 # User data (runtime-generated attachments, prompt exports, and profiles)
 data/users/
+# Content-addressed blob storage (runtime-generated attachments and variants)
+data/file_blobs/
 __pycache__/
 tst/
 

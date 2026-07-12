@@ -7,9 +7,12 @@ let isWaiting = false;
 let sourceNode;
 let audioQueue = [];
 let bufferSize = 1;
-let stopTimer = null;
+let bufferTimer = null;
 let isRecording = false;
 let isCanceled = false;
+let ttsGeneration = 0;
+let ttsFetchController = null;
+let currentAudioObjectUrl = null;
 
 // Ensure currentAudioIcon is initialized
 Config.currentAudioIcon = null;
@@ -22,15 +25,16 @@ function getWebSocketURL() {
 }
 
 // WebSocket and AudioContext initialization
-function connect() {
+function connect(generation) {
     const wsURL = getWebSocketURL();
 
-    ws = new WebSocket(wsURL);
-    ws.binaryType = "arraybuffer";
+    const socket = new WebSocket(wsURL);
+    socket.binaryType = "arraybuffer";
+    ws = socket;
     initAudio();
 
-    ws.onmessage = function(event) {
-        if (ws.readyState !== WebSocket.OPEN) {
+    socket.onmessage = function(event) {
+        if (socket !== ws || generation !== ttsGeneration || socket.readyState !== WebSocket.OPEN) {
             return;
         }
 
@@ -54,11 +58,12 @@ function connect() {
                     break;
             }
         } else {
-            queueAudioChunk(event.data);
+            queueAudioChunk(event.data, generation);
         }
     };
 
-    ws.onerror = function(event) {
+    socket.onerror = function(event) {
+        if (socket !== ws || generation !== ttsGeneration) return;
         console.error('WebSocket connection error', event);
         isPlaying = false;
         isWaiting = false;
@@ -67,11 +72,14 @@ function connect() {
         }
     };
 
-    ws.onclose = function() {
+    socket.onclose = function() {
+        if (socket !== ws || generation !== ttsGeneration) return;
         if (audioQueue.length > 0 && !isPlaying) {
-            playNextInQueue();
+            playNextInQueue(generation);
         }
     };
+
+    return socket;
 }
 
 function handleStoppedMessage() {
@@ -79,9 +87,7 @@ function handleStoppedMessage() {
 }
 
 function handleNoContentMessage() {
-    isPlaying = false;
-    isWaiting = false;
-    toggleIcons(Config.currentAudioIcon, 'stopped'); // Change the icon to 'stopped'
+    stopAudioAndCloseWebSocket();
 }
 
 function handleFinishedMessage() {
@@ -97,24 +103,19 @@ function initAudio() {
     }
 }
 
-function queueAudioChunk(arrayBuffer) {
-    // Cancel timer if audio chunk is received
-    if (stopTimer) {
-        clearTimeout(stopTimer);
-        stopTimer = null;
-    }
-    
+function queueAudioChunk(arrayBuffer, generation = ttsGeneration) {
     audioContext.decodeAudioData(arrayBuffer, (audioBuffer) => {
+        if (generation !== ttsGeneration) return;
         audioQueue.push(audioBuffer);
         if (!isPlaying && !isBuffering) {
             if (audioQueue.length >= bufferSize) {
                 isWaiting = false;
-                playNextInQueue();
+                playNextInQueue(generation);
             } else {
                 isBuffering = true;
                 isWaiting = true;
                 toggleIcons(Config.currentAudioIcon, 'waiting');
-                setTimeout(checkBuffer, 100);
+                scheduleBufferCheck(generation);
             }
         }
     }, (error) => {
@@ -122,17 +123,25 @@ function queueAudioChunk(arrayBuffer) {
     });
 }
 
-function checkBuffer() {
+function scheduleBufferCheck(generation) {
+    if (bufferTimer) clearTimeout(bufferTimer);
+    bufferTimer = setTimeout(() => checkBuffer(generation), 100);
+}
+
+function checkBuffer(generation = ttsGeneration) {
+    bufferTimer = null;
+    if (generation !== ttsGeneration) return;
     if (audioQueue.length >= bufferSize || isFinished) {
         isBuffering = false;
         isWaiting = false;
-        playNextInQueue();
+        playNextInQueue(generation);
     } else {
-        setTimeout(checkBuffer, 100);
+        scheduleBufferCheck(generation);
     }
 }
 
-function playNextInQueue() {
+function playNextInQueue(generation = ttsGeneration) {
+    if (generation !== ttsGeneration) return;
     if (audioQueue.length === 0) {
         if (isFinished) {
             stopAudioAndCloseWebSocket();
@@ -140,7 +149,7 @@ function playNextInQueue() {
             isBuffering = true;
             isWaiting = true;
             toggleIcons(Config.currentAudioIcon, 'waiting');
-            setTimeout(checkBuffer, 100);
+            scheduleBufferCheck(generation);
         }
         return;
     }
@@ -151,137 +160,162 @@ function playNextInQueue() {
     sourceNode = audioContext.createBufferSource();
     sourceNode.buffer = audioBuffer;
     sourceNode.connect(audioContext.destination);
-    sourceNode.onended = playNextInQueue;
+    sourceNode.onended = () => playNextInQueue(generation);
     sourceNode.start();
     toggleIcons(Config.currentAudioIcon, 'playing');
 }
 
-function ensureWebSocketConnection() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                if (ws) ws.close();
-                reject(new Error('WebSocket connection timeout'));
-            }, 10000);
-
-            connect();
-
-            ws.onopen = () => {
-                clearTimeout(timeout);
-                resolve();
-            };
-        });
+function ensureWebSocketConnection(generation) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        return Promise.resolve(ws);
     }
-    return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+        const socket = connect(generation);
+        let settled = false;
+        const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            if (socket === ws) ws = null;
+            try { socket.close(); } catch (error) { /* already closed */ }
+            reject(new Error('WebSocket connection timeout'));
+        }, 10000);
+
+        socket.onopen = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            resolve(socket);
+        };
+
+        const handleSocketFailure = socket.onerror;
+        socket.onerror = event => {
+            if (typeof handleSocketFailure === 'function') {
+                handleSocketFailure.call(socket, event);
+            }
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            reject(new Error('WebSocket connection failed'));
+        };
+
+        const handleSocketClose = socket.onclose;
+        socket.onclose = event => {
+            if (typeof handleSocketClose === 'function') {
+                handleSocketClose.call(socket, event);
+            }
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            reject(new Error('WebSocket closed before opening'));
+        };
+    });
 }
 
-function start_tts(text, audioIcon, author, conversationId) {
-    ensureWebSocketConnection().then(() => {
+function start_tts(text, audioIcon, author, conversationId, generation = ttsGeneration) {
+    Config.currentAudioIcon = audioIcon;
+    isWaiting = true;
+    toggleIcons(audioIcon, 'waiting');
+
+    ensureWebSocketConnection(generation).then(socket => {
+        if (generation !== ttsGeneration || socket !== ws) return;
+
         audioQueue = [];
         isFinished = false;
-        isWaiting = true;
-        toggleIcons(audioIcon, 'waiting');
-
-        ws.send(JSON.stringify({
+        socket.send(JSON.stringify({
             action: 'start_tts_ws',
             text: text,
             author: author,
             conversationId: conversationId,
         }));
-
-        Config.currentAudioIcon = audioIcon;
-    }).catch((error) => {
+    }).catch(error => {
+        if (generation !== ttsGeneration) return;
         console.error('TTS connection failed:', error);
         toggleIcons(audioIcon, 'stopped');
         isWaiting = false;
     });
 }
 
+function revokeAudioObjectUrl(url) {
+    if (!url) return;
+    URL.revokeObjectURL(url);
+    if (currentAudioObjectUrl === url) currentAudioObjectUrl = null;
+}
+
+function disposeCachedAudio(audio = Config.currentAudio, objectUrl = currentAudioObjectUrl) {
+    if (audio) {
+        audio.onended = null;
+        audio.onerror = null;
+        try { audio.pause(); } catch (error) { /* no-op */ }
+        try { audio.currentTime = 0; } catch (error) { /* not seekable yet */ }
+        audio.src = '';
+    }
+    if (Config.currentAudio === audio) Config.currentAudio = null;
+    revokeAudioObjectUrl(objectUrl);
+}
+
+function closeTtsSocket(sendStop) {
+    const socket = ws;
+    ws = null;
+    if (!socket) return;
+
+    if (sendStop && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify({ action: 'stop' })); } catch (error) { /* closing */ }
+    }
+    try { socket.close(); } catch (error) { /* already closed */ }
+}
+
 function stopAudio(audioIcon) {
-    if (Config.currentAudio) {
-        // If cached audio is playing, stop it
-        Config.currentAudio.pause();
-        Config.currentAudio.currentTime = 0;
-        Config.currentAudio = null;
-        isPlaying = false;
-        if (Config.currentAudioIcon) {
-            toggleIcons(Config.currentAudioIcon, 'stopped');
-        }
-        return; // Exit function to not stop audio via WebSocket
-    }
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: 'stop' }));
-    }
-    
-    if (sourceNode) {
-        sourceNode.stop();
-    }
-    
-    isPlaying = false;
-    isWaiting = false;
-    isBuffering = false;
-    audioQueue = [];
-    
-    if (audioIcon) {
-        toggleIcons(audioIcon, 'stopped');
-    }
-
-    if (stopTimer) clearTimeout(stopTimer);
-    stopTimer = setTimeout(() => stopAudioAndCloseWebSocket(), 3000);
+    stopAllAudio();
+    if (audioIcon) toggleIcons(audioIcon, 'stopped');
 }
 
 function stopAudioAndCloseWebSocket() {
-    if (Config.currentAudio) {
-        Config.currentAudio.pause();
-        Config.currentAudio.currentTime = 0;
-        Config.currentAudio = null;
-    }
-    isPlaying = false;
-    isWaiting = false;
-    toggleIcons(Config.currentAudioIcon, 'stopped');
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-    }
-    
-    if (stopTimer) {
-        clearTimeout(stopTimer);
-        stopTimer = null;
-    }
+    stopAllAudio({ sendStop: false });
 }
 
-function stopAllAudio() {
-    // Stop cached Audio element (if playing from cache hit)
-    if (Config.currentAudio) {
-        Config.currentAudio.pause();
-        Config.currentAudio.currentTime = 0;
-        Config.currentAudio = null;
+function stopAllAudio(options = {}) {
+    ttsGeneration += 1;
+
+    if (ttsFetchController) {
+        ttsFetchController.abort();
+        ttsFetchController = null;
     }
 
-    // Stop WebSocket streaming (if playing from generator)
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: 'stop' }));
-    }
+    disposeCachedAudio();
+    closeTtsSocket(options.sendStop !== false);
+
     if (sourceNode) {
-        try { sourceNode.stop(); } catch (e) { /* may already be stopped */ }
+        sourceNode.onended = null;
+        try { sourceNode.stop(); } catch (error) { /* may already be stopped */ }
+        sourceNode = null;
     }
 
-    // Reset state
+    if (bufferTimer) {
+        clearTimeout(bufferTimer);
+        bufferTimer = null;
+    }
     isPlaying = false;
     isWaiting = false;
     isBuffering = false;
+    isFinished = false;
     audioQueue = [];
 
-    // Reset icon of whichever button was active
     if (Config.currentAudioIcon) {
         toggleIcons(Config.currentAudioIcon, 'stopped');
     }
+    Config.currentAudioIcon = null;
+}
 
-    if (stopTimer) {
-        clearTimeout(stopTimer);
-        stopTimer = null;
-    }
+function finishCachedAudio(audio, objectUrl, generation, audioIcon) {
+    const isCurrent = generation === ttsGeneration && Config.currentAudio === audio;
+    disposeCachedAudio(audio, objectUrl);
+    if (!isCurrent) return;
+
+    isPlaying = false;
+    isWaiting = false;
+    toggleIcons(audioIcon, 'stopped');
+    Config.currentAudioIcon = null;
 }
 
 function textToSpeech(text, userId, conversationId, audioIcon, author) {
@@ -289,8 +323,9 @@ function textToSpeech(text, userId, conversationId, audioIcon, author) {
         stopAllAudio();
         return;
     }
-    stopAllAudio();  // Clean any residual state
+    stopAllAudio();
 
+    const generation = ttsGeneration;
     const selectedConversation = document.querySelector(
         '.list-group-item-action.active-chat'
     );
@@ -298,9 +333,13 @@ function textToSpeech(text, userId, conversationId, audioIcon, author) {
         (selectedConversation ? selectedConversation.dataset.conversationId : null)
         || conversationId;
 
+    isWaiting = true;
+    Config.currentAudioIcon = audioIcon;
     toggleIcons(audioIcon, 'waiting');
 
-    // Same cache check as existing button (shared cache)
+    const controller = new AbortController();
+    ttsFetchController = controller;
+
     fetch('/api/get-tts-audio', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -309,32 +348,64 @@ function textToSpeech(text, userId, conversationId, audioIcon, author) {
             conversationId: finalConversationId,
             author: author,
         }),
+        signal: controller.signal,
     })
     .then(response => {
+        if (generation !== ttsGeneration) return null;
         if (response.ok && response.status !== 204) return response.blob();
-        if (response.status === 204) throw new Error('Audio not found in cache');
-        throw new Error('Server error');
+        if (response.status === 204) {
+            const cacheMiss = new Error('TTS cache miss');
+            cacheMiss.name = 'TTSCacheMiss';
+            throw cacheMiss;
+        }
+        throw new Error('TTS cache request failed');
     })
     .then(blob => {
-        const url = URL.createObjectURL(blob);
-        Config.currentAudio = new Audio(url);
-        Config.currentAudio.play();
+        if (!blob || generation !== ttsGeneration || controller.signal.aborted) return;
+        if (ttsFetchController === controller) ttsFetchController = null;
+
+        const objectUrl = URL.createObjectURL(blob);
+        currentAudioObjectUrl = objectUrl;
+        let audio;
+        try {
+            audio = new Audio(objectUrl);
+        } catch (error) {
+            revokeAudioObjectUrl(objectUrl);
+            throw error;
+        }
+        Config.currentAudio = audio;
+        Config.currentAudioIcon = audioIcon;
+        isWaiting = false;
         isPlaying = true;
         toggleIcons(audioIcon, 'playing');
-        Config.currentAudioIcon = audioIcon;
-        Config.currentAudio.onended = function() {
-            toggleIcons(audioIcon, 'stopped');
-            Config.currentAudio = null;
-            isPlaying = false;
-        };
+
+        audio.onended = () => finishCachedAudio(audio, objectUrl, generation, audioIcon);
+        audio.onerror = () => finishCachedAudio(audio, objectUrl, generation, audioIcon);
+
+        const playPromise = audio.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(error => {
+                if (generation === ttsGeneration) {
+                    console.error('Error playing TTS audio:', error);
+                }
+                finishCachedAudio(audio, objectUrl, generation, audioIcon);
+            });
+        }
     })
     .catch(error => {
-        if (error.message === 'Audio not found in cache') {
-            start_tts(text, audioIcon, author, finalConversationId);
-        } else {
-            console.error('Error fetching audio:', error);
-            toggleIcons(audioIcon, 'stopped');
+        if (ttsFetchController === controller) ttsFetchController = null;
+        if (controller.signal.aborted || generation !== ttsGeneration) return;
+
+        if (error.name === 'TTSCacheMiss') {
+            start_tts(text, audioIcon, author, finalConversationId, generation);
+            return;
         }
+
+        console.error('Error fetching audio:', error);
+        isWaiting = false;
+        isPlaying = false;
+        toggleIcons(audioIcon, 'stopped');
+        if (Config.currentAudioIcon === audioIcon) Config.currentAudioIcon = null;
     });
 }
 
@@ -363,160 +434,243 @@ function toggleIcons(audioIcon, state) {
 }
 
 // From here are the functions to record audio with microphone and convert to text
-const audioControl = document.getElementById('audio-control');
 const audioIcon = document.getElementById('audio-button');
+const cancelAudioButton = document.getElementById('cancel-audio');
+const sendAudioButton = document.getElementById('send-audio');
+let recordingGeneration = 0;
+let recordingStatus = 'idle';
+let recordingSession = null;
 
-document.getElementById('audio-button').addEventListener('click', async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        NotificationModal.error('Browser Not Supported', 'Your browser does not support audio recording.');
-        return;
-    }
+function releaseMediaStream(stream) {
+    if (!stream || typeof stream.getTracks !== 'function') return;
+    stream.getTracks().forEach(track => {
+        try { track.stop(); } catch (error) { /* already stopped */ }
+    });
+}
 
-    if (Config.mediaRecorder && Config.mediaRecorder.state !== 'inactive') {
-        addLoadingIndicator();
-        Config.mediaRecorder.stop();
-        return;
-    }
-
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        Config.mediaRecorder = new MediaRecorder(stream);
-
-        Config.mediaRecorder.onstart = () => {
-            Config.audioChunks = [];
-            audioIcon.classList.remove('fa-microphone');
-            audioIcon.classList.add('fa-stop');
-        };
-		
-        Config.mediaRecorder.ondataavailable = event => Config.audioChunks.push(event.data);
-
-        Config.mediaRecorder.onstop = () => {
-            handleAudioStop();
-            audioIcon.classList.remove('fa-stop');
-            audioIcon.classList.add('fa-microphone');
-        };
-
-        Config.mediaRecorder.start();
-
-    } catch (err) {
-        console.error('Error accessing microphone', err);
-    }
-});
+function recordingIsCurrent(session) {
+    return recordingSession === session && session.generation === recordingGeneration;
+}
 
 async function toggleAudioRecording() {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach(track => track.stop());
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        NotificationModal.error(
+            'Browser Not Supported',
+            'Your browser does not support audio recording.'
+        );
+        return;
+    }
 
-        if (!isRecording) {
-            startAudioRecording();
-        } else {
-            stopAudioRecording();
-        }
-    } catch (err) {
-        console.error('Error accessing microphone', err);
-        NotificationModal.error('Microphone Access Denied', 'Could not access microphone. Make sure you have granted permissions and have a microphone connected.');
+    if (recordingStatus === 'idle') {
+        await startAudioRecording();
+    } else if (recordingStatus === 'recording') {
+        sendAudioRecording();
     }
 }
 
-function startAudioRecording() {
-    navigator.mediaDevices.getUserMedia({ audio: true })
-        .then(stream => {
-            Config.mediaRecorder = new MediaRecorder(stream);
-            Config.mediaRecorder.ondataavailable = event => Config.audioChunks.push(event.data);
-            Config.mediaRecorder.onstart = () => {
-                Config.audioChunks = [];
-                showAudioRecordingControls();
-                startRecording();
-                isCanceled = false;
-                if (window.ChatWarmup && typeof window.ChatWarmup.signal === 'function') {
-                    window.ChatWarmup.signal('audio_recording', {});
-                }
-            };
-            Config.mediaRecorder.onstop = handleAudioStop;
+async function startAudioRecording() {
+    if (recordingStatus !== 'idle') return;
 
-            Config.mediaRecorder.start();
+    const session = {
+        generation: ++recordingGeneration,
+        recorder: null,
+        stream: null,
+        chunks: [],
+        action: null,
+        conversationId: null,
+        finalized: false,
+    };
+    recordingSession = session;
+    recordingStatus = 'starting';
+    isCanceled = false;
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (!recordingIsCurrent(session) || recordingStatus !== 'starting') {
+            releaseMediaStream(stream);
+            return;
+        }
+
+        session.stream = stream;
+        session.recorder = new MediaRecorder(stream);
+        Config.mediaRecorder = session.recorder;
+        Config.audioChunks = session.chunks;
+
+        session.recorder.ondataavailable = event => {
+            if (recordingIsCurrent(session) && event.data && event.data.size > 0) {
+                session.chunks.push(event.data);
+            }
+        };
+        session.recorder.onstart = () => {
+            if (!recordingIsCurrent(session)) return;
+            recordingStatus = 'recording';
             isRecording = true;
-        })
-        .catch(err => {
-            console.error('Error accessing microphone', err);
-            NotificationModal.error('Microphone Error', 'Error accessing microphone. Make sure you have a microphone connected and have granted permissions to use it.');
-        });
+            showAudioRecordingControls();
+            startRecording();
+            if (window.ChatWarmup && typeof window.ChatWarmup.signal === 'function') {
+                window.ChatWarmup.signal('audio_recording', {});
+            }
+        };
+        session.recorder.onstop = () => handleAudioStop(session);
+        session.recorder.onerror = event => {
+            if (!recordingIsCurrent(session)) return;
+            console.error('MediaRecorder error', event.error || event);
+            releaseMediaStream(session.stream);
+            requestRecordingStop('cancel');
+        };
+
+        session.recorder.start();
+    } catch (error) {
+        releaseMediaStream(session.stream);
+        if (!recordingIsCurrent(session)) return;
+
+        recordingSession = null;
+        recordingStatus = 'idle';
+        Config.mediaRecorder = null;
+        Config.audioChunks = [];
+        console.error('Error accessing microphone', error);
+        NotificationModal.error(
+            'Microphone Access Denied',
+            'Could not access the microphone. Check the browser permission and device.'
+        );
+    }
+}
+
+function requestRecordingStop(action) {
+    const session = recordingSession;
+    if (!session || !recordingIsCurrent(session)) return;
+
+    session.action = action;
+    session.conversationId = currentConversationId;
+    isCanceled = action === 'cancel';
+    isRecording = false;
+
+    if (recordingStatus === 'starting') {
+        if (session.recorder && session.recorder.state !== 'inactive') {
+            try { session.recorder.stop(); } catch (error) { /* still starting */ }
+        }
+        releaseMediaStream(session.stream);
+        recordingGeneration += 1;
+        recordingSession = null;
+        recordingStatus = 'idle';
+        Config.mediaRecorder = null;
+        Config.audioChunks = [];
+        stopRecording();
+        hideAudioRecordingControls();
+        return;
+    }
+
+    if (recordingStatus !== 'recording') return;
+    recordingStatus = 'stopping';
+    stopRecording();
+    if (action === 'send') addLoadingIndicator();
+
+    if (session.recorder && session.recorder.state !== 'inactive') {
+        session.recorder.stop();
+    }
 }
 
 function stopAudioRecording() {
-    if (Config.mediaRecorder && Config.mediaRecorder.state !== 'inactive') {
-        Config.mediaRecorder.stop();
-    }
-    isRecording = false;
-    stopRecording();
+    requestRecordingStop('send');
 }
 
 function showAudioRecordingControls() {
-    document.getElementById('form-message').classList.add('hidden');
-    document.getElementById('audio-recording-controls').classList.remove('hidden');
-    document.getElementById('audio-button').classList.remove('fa-microphone');
-    document.getElementById('audio-button').classList.add('fa-stop');
+    document.getElementById('form-message')?.classList.add('hidden');
+    document.getElementById('audio-recording-controls')?.classList.remove('hidden');
+    audioIcon?.classList.remove('fa-microphone');
+    audioIcon?.classList.add('fa-stop');
 }
 
 function hideAudioRecordingControls() {
-    document.getElementById('form-message').classList.remove('hidden');
-    document.getElementById('audio-recording-controls').classList.add('hidden');
-    document.getElementById('audio-button').classList.remove('fa-stop');
-    document.getElementById('audio-button').classList.add('fa-microphone');
+    document.getElementById('form-message')?.classList.remove('hidden');
+    document.getElementById('audio-recording-controls')?.classList.add('hidden');
+    audioIcon?.classList.remove('fa-stop');
+    audioIcon?.classList.add('fa-microphone');
 }
 
 function cancelAudioRecording() {
-    if (Config.mediaRecorder && Config.mediaRecorder.state !== 'inactive') {
-        Config.mediaRecorder.stop();
-    }
-    isRecording = false;
-    isCanceled = true;
-    stopRecording();
-    Config.audioChunks = [];
-    hideAudioRecordingControls();
+    requestRecordingStop('cancel');
 }
 
 function sendAudioRecording() {
-    stopAudioRecording();
-    handleAudioStop();
+    requestRecordingStop('send');
 }
 
-async function handleAudioStop() {
-    if (isCanceled) {
-        return;
+async function getRecordingDuration(audioBlob) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const durationContext = new AudioContextClass();
+    try {
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const audioBuffer = await durationContext.decodeAudioData(arrayBuffer);
+        return audioBuffer.duration;
+    } finally {
+        if (typeof durationContext.close === 'function') {
+            await durationContext.close();
+        }
+    }
+}
+
+async function handleAudioStop(session) {
+    if (!session || session.finalized) return;
+    session.finalized = true;
+    releaseMediaStream(session.stream);
+
+    const shouldSend = session.action === 'send';
+    if (recordingIsCurrent(session)) {
+        recordingStatus = shouldSend ? 'processing' : 'idle';
     }
 
-    const audioBlob = new Blob(Config.audioChunks, { type: 'audio/webm;codecs=opus' });
-    Config.audioChunks = [];
+    try {
+        if (!shouldSend) return;
 
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const response = await fetch(audioUrl);
-    const arrayBuffer = await response.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    const duration = audioBuffer.duration;
+        const mimeType = session.recorder?.mimeType || 'audio/webm;codecs=opus';
+        const audioBlob = new Blob(session.chunks, { type: mimeType });
+        if (!audioBlob.size) {
+            throw new Error('The recording did not contain audio data.');
+        }
 
-    const formData = new FormData();
-    formData.append("audio", audioBlob);
-    formData.append("conversation_id", currentConversationId);
-    formData.append("duration", duration);
+        const duration = await getRecordingDuration(audioBlob);
+        const formData = new FormData();
+        formData.append('audio', audioBlob);
+        formData.append('conversation_id', session.conversationId);
+        formData.append('duration', duration);
+        await sendFormData(formData);
+    } catch (error) {
+        removeLoadingIndicator();
+        console.error('Error processing audio recording:', error);
+        NotificationModal.error(
+            'Audio Error',
+            'The audio recording could not be processed. Please try again.'
+        );
+    } finally {
+        releaseMediaStream(session.stream);
+        session.chunks = [];
+        if (session.recorder) {
+            session.recorder.ondataavailable = null;
+            session.recorder.onstart = null;
+            session.recorder.onstop = null;
+            session.recorder.onerror = null;
+        }
 
-    sendFormData(formData);
-    hideAudioRecordingControls();
+        if (recordingIsCurrent(session)) {
+            recordingSession = null;
+            recordingStatus = 'idle';
+            Config.mediaRecorder = null;
+            Config.audioChunks = [];
+            isRecording = false;
+            isCanceled = false;
+            stopRecording();
+            hideAudioRecordingControls();
+        }
+    }
 }
 
 async function sendFormData(formData) {
-    try {
-        const response = await fetch("/api/transcribe-web", {
-            method: "POST",
-            body: formData
-        });
-
-        handleResponse(response);
-    } catch (error) {
-        console.error("Error sending audio:", error);
-    }
+    const response = await fetch('/api/transcribe-web', {
+        method: 'POST',
+        body: formData,
+    });
+    await handleResponse(response);
 }
 
 async function handleResponse(response) {
@@ -549,22 +703,19 @@ let recordingInterval;
 
 // Function to start recording and counter
 function startRecording() {
+    if (recordingInterval) clearInterval(recordingInterval);
     recordingStartTime = Date.now();
     recordingInterval = setInterval(updateRecordingTime, 1000);
-    document.getElementById('audio-recording-controls').classList.remove('hidden');
+    document.getElementById('audio-recording-controls')?.classList.remove('hidden');
 }
 function stopRecording() {
-    clearInterval(recordingInterval);
-    document.getElementById('time-counter').innerText = '00:00';
-    document.getElementById('audio-recording-controls').classList.add('hidden');
-}
-// Function to stop recording and counter
-function stopAudioRecording() {
-    if (Config.mediaRecorder && Config.mediaRecorder.state !== 'inactive') {
-        Config.mediaRecorder.stop();
+    if (recordingInterval) {
+        clearInterval(recordingInterval);
+        recordingInterval = null;
     }
-    isRecording = false;
-    stopRecording(); // Stop the counter
+    const counter = document.getElementById('time-counter');
+    if (counter) counter.innerText = '00:00';
+    document.getElementById('audio-recording-controls')?.classList.add('hidden');
 }
 
 // Function to update time counter
@@ -572,10 +723,31 @@ function updateRecordingTime() {
     const elapsedTime = Date.now() - recordingStartTime;
     const seconds = Math.floor(elapsedTime / 1000) % 60;
     const minutes = Math.floor(elapsedTime / 60000);
-    document.getElementById('time-counter').innerText = 
-        (minutes < 10 ? '0' : '') + minutes + ':' + 
-        (seconds < 10 ? '0' : '') + seconds;
+    const counter = document.getElementById('time-counter');
+    if (counter) {
+        counter.innerText =
+            (minutes < 10 ? '0' : '') + minutes + ':' +
+            (seconds < 10 ? '0' : '') + seconds;
+    }
 }
-document.getElementById('audio-button').addEventListener('click', toggleAudioRecording);
-document.getElementById('cancel-audio').addEventListener('click', cancelAudioRecording);
-document.getElementById('send-audio').addEventListener('click', sendAudioRecording);
+
+function discardActiveRecording() {
+    const session = recordingSession;
+    if (!session) return;
+    session.finalized = true;
+    session.action = 'cancel';
+    if (session.recorder && session.recorder.state !== 'inactive') {
+        try { session.recorder.stop(); } catch (error) { /* page is unloading */ }
+    }
+    releaseMediaStream(session.stream);
+    recordingGeneration += 1;
+    recordingSession = null;
+    recordingStatus = 'idle';
+    Config.mediaRecorder = null;
+    Config.audioChunks = [];
+}
+
+audioIcon?.addEventListener('click', toggleAudioRecording);
+cancelAudioButton?.addEventListener('click', cancelAudioRecording);
+sendAudioButton?.addEventListener('click', sendAudioRecording);
+window.addEventListener('pagehide', discardActiveRecording);

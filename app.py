@@ -43,7 +43,6 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
-from twilio_async import TwilioAPIError
 import jwt
 from jwt import PyJWTError as JWTError
 from pydantic import BaseModel
@@ -66,7 +65,7 @@ from fastapi import UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from fastapi.templating import Jinja2Templates
-from typing import Any, Union, Optional, List, Dict, Tuple
+from typing import Annotated, Any, Union, Optional, List, Dict, Tuple
 from starlette.background import BackgroundTask
 from starlette.status import HTTP_401_UNAUTHORIZED
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,14 +88,36 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Stre
 # Librerias propias
 from tools import *
 from admin_audit import log_admin_action
+import storage_quota
 from log_config import logger
+from maintenance_tasks import (
+    MaintenanceTaskBusy,
+    MaintenanceTaskTimedOut,
+    clear_audio_cache as run_audio_cache_cleanup,
+    disable_cloudflare_cache as run_cloudflare_cache_disable,
+)
 from tools import dramatiq_tasks
 from database import get_db_connection, DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, is_lock_error
 from models import User, ConnectionManager
 from tasks import generate_pdf_task, generate_mp3_task
 from rediscfg import broker, redis_client, add_revoked_user, remove_revoked_user, RedisManager, get_metrics, get_active_users_count
-from save_images import save_image_locally, generate_img_token, resize_image, get_or_generate_img_token
-from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id
+from save_images import (
+    generate_img_token,
+    get_or_generate_img_token,
+    normalize_image_path,
+    resize_image,
+    save_image_locally,
+)
+from auth import (
+    bump_session_version,
+    create_access_token,
+    get_current_user,
+    get_user_by_id,
+    get_user_by_username,
+    has_recent_authentication,
+    hash_password,
+    verify_password,
+)
 from auth import get_current_user_from_websocket, get_user_id_from_conversation, get_user_by_token, create_user_info, create_login_response, generate_magic_link
 from auth import get_user_by_google_id, get_user_by_email, update_user_google_id
 from auth_flows import (
@@ -113,9 +134,29 @@ from ultra_admin import (
     generate_elevation_code, verify_elevation_code, is_elevated,
     revoke_elevation, get_elevation_ttl, get_active_lock_owner, ELEVATION_TTL
 )
-from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, sanitize_name, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags, get_auth_base_url, get_request_base_url, _get_marketplace_template_flags
+from user_accounts import (
+    InitialBalanceError,
+    InsufficientInitialBalanceError,
+    InvalidInitialBalanceError,
+    apply_initial_balance,
+    get_live_user_role,
+    get_user_management_access,
+    validate_managed_balance,
+)
+from billing.usage_reservations import reconcile_stale_usage_reservations
+from phone_verification import (
+    PURPOSE_CREATE_USER,
+    PURPOSE_PROFILE_PHONE_CHANGE,
+    PhoneVerificationError,
+    PhoneVerificationRateLimitError,
+    consume_phone_verification,
+    normalize_phone_number,
+    request_phone_verification,
+    verify_phone_code,
+)
+from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, estimate_message_tokens, custom_unescape, templates, validate_path_within_directory, slugify, is_internal_ip, generate_public_id, get_template_context, fix_landing_seo_tags, get_auth_base_url, get_request_base_url, _get_marketplace_template_flags
 from common import SCRIPT_DIR, DATA_DIR, CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL, CLOUDFLARE_ZONE_ID, CLOUDFLARE_API_URL, CLOUDFLARE_FOR_IMAGES, CLOUDFLARE_SECRET, CLOUDFLARE_IMAGE_SUBDOMAIN, CLOUDFLARE_BASE_URL, generate_cloudflare_signature, generate_signed_url_cloudflare, CLOUDFLARE_DOMAIN, CLOUDFLARE_CNAME_TARGET
-from common import ALGORITHM, MAX_TOKENS, MAX_MESSAGE_SIZE, MAX_IMAGE_UPLOAD_SIZE, MAX_IMAGE_PIXELS, PERPLEXITY_API_KEY, elevenlabs_key, openai_key, claude_key, gemini_key, openrouter_key, service_sid, twilio_sid, twilio_auth, decode_jwt_cached, verify_token_expiration, AVATAR_TOKEN_EXPIRE_HOURS, MEDIA_TOKEN_EXPIRE_HOURS
+from common import ALGORITHM, MAX_TOKENS, MAX_MESSAGE_SIZE, MAX_IMAGE_UPLOAD_SIZE, MAX_IMAGE_PIXELS, PERPLEXITY_API_KEY, elevenlabs_key, openai_key, claude_key, gemini_key, openrouter_key, service_sid, decode_jwt_cached, verify_token_expiration, AVATAR_TOKEN_EXPIRE_HOURS, MEDIA_TOKEN_EXPIRE_HOURS
 from common import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from common import encrypt_api_key, decrypt_api_key, mask_api_key
 from common import CDN_FILES_URL, ENABLE_CDN
@@ -123,6 +164,7 @@ from common import SECURE_COOKIES
 from common import READONLY_MODE
 from common import MAX_API_IMAGE_SIZE_MB, MAX_CHAT_IMAGE_DIMENSION
 from common import compute_static_hashes
+from common import upsert_creator_relationship
 import nh3
 from chat.registration import router as chat_router
 from chat.services.attachment_uploads import (
@@ -268,6 +310,7 @@ from marketplace.runtime import load_marketplace_config_from_db, refresh_marketp
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _marketplace_refresh_task = None
+    _nginx_blocklist_reconcile_task = None
     # Check which system to use based on configuration
     use_redis = os.getenv('REDIS_IMG_TOKEN', '0') == '1'
 
@@ -342,6 +385,13 @@ async def lifespan(app: FastAPI):
     # Initialize nginx blocklist sync
     from middleware.nginx_blocklist import nginx_blocklist_manager
     await nginx_blocklist_manager.initialize()
+    try:
+        await nginx_blocklist_manager.reconcile_once()
+    except Exception:
+        logger.exception("Initial nginx blocklist reconciliation failed")
+    _nginx_blocklist_reconcile_task = asyncio.create_task(
+        nginx_blocklist_manager.reconciliation_loop()
+    )
 
     await ensure_integration_schema()
 
@@ -419,6 +469,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown nginx blocklist sync
     from middleware.nginx_blocklist import nginx_blocklist_manager
+    if _nginx_blocklist_reconcile_task:
+        _nginx_blocklist_reconcile_task.cancel()
+        try:
+            await _nginx_blocklist_reconcile_task
+        except asyncio.CancelledError:
+            pass
     await nginx_blocklist_manager.shutdown()
 
     # Cleanup ranking leader lock file
@@ -538,7 +594,13 @@ PEPPER = os.getenv('PEPPER')
 rol = "santa"
 role_file_path = f"rols/{rol}.txt"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="_oauth_state")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    session_cookie="_oauth_state",
+    https_only=SECURE_COOKIES,
+    same_site="lax",
+)
 
 # Custom Domain Middleware - configure primary domains that skip DB lookup
 PRIMARY_APP_DOMAIN = os.getenv("PRIMARY_APP_DOMAIN", "")
@@ -569,8 +631,6 @@ _PUBLIC_PREFIXES = ("/p/", "/store/", "/pack/", "/static/", "/.well-known/")
 if READONLY_MODE:
     _READONLY_WHITELIST = frozenset((
         "/magic-link-recovery",
-        "/api/verify-code",
-        "/api/send-verification-code",
         "/api/refresh-session",
         "/api/ultra-admin/request-code",
         "/api/ultra-admin/verify",
@@ -640,11 +700,15 @@ async def add_noindex_header(request: Request, call_next):
     return response
 
 
-class PhoneNumberRequest(BaseModel):
+class PhoneVerificationRequest(BaseModel):
     phone: str
+    purpose: str
+
 
 class VerificationCodeRequest(BaseModel):
+    challenge_id: str
     phone: str
+    purpose: str
     code: str
 class Token(BaseModel):
     access_token: str
@@ -783,9 +847,39 @@ async def have_vision(user_id):
 app.include_router(create_marketplace_admin_router(log_admin_action))
 
 
-async def add_user(username, prompt_id, all_prompts_access, public_prompts_access, llm_id, allow_file_upload, allow_image_generation, balance, phone, role_name, authentication_mode="magic_link_only", initial_password=None, can_change_password=False, email=None, company_id=None, current_user=None, api_key_mode="both_prefer_own", category_access=None, billing_account_id=None, billing_limit=None, billing_limit_action='block', billing_auto_refill_amount=10.0, billing_max_limit=None):
+async def add_user(
+    username,
+    prompt_id,
+    all_prompts_access,
+    public_prompts_access,
+    llm_id,
+    allow_file_upload,
+    allow_image_generation,
+    balance,
+    phone,
+    role_name,
+    authentication_mode="magic_link_only",
+    initial_password=None,
+    can_change_password=False,
+    email=None,
+    company_id=None,
+    current_user=None,
+    api_key_mode="both_prefer_own",
+    category_access=None,
+    billing_account_id=None,
+    billing_limit=None,
+    billing_limit_action="block",
+    billing_auto_refill_amount=10.0,
+    billing_max_limit=None,
+    initial_balance_funder_id=None,
+    allow_platform_balance_grant=False,
+    phone_verification_id=None,
+    phone_verification_actor_id=None,
+    allow_unverified_phone=False,
+):
     try:
         async with get_db_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
             async with conn.cursor() as c:
                 # Get the role_ids
                 await c.execute("SELECT id, role_name FROM USER_ROLES")
@@ -799,7 +893,11 @@ async def add_user(username, prompt_id, all_prompts_access, public_prompts_acces
 
                 # Check if the current user has permission to create this type of user
                 if current_user:
-                    if not (await current_user.is_admin or (await current_user.is_user and role_name.lower() == 'customer')):
+                    actor_role = await get_live_user_role(conn, current_user.id)
+                    if not (
+                        actor_role == "admin"
+                        or (actor_role == "user" and role_name.lower() == "customer")
+                    ):
                         logger.info("User does not have permission to create this type of user")
                         return None
 
@@ -808,12 +906,55 @@ async def add_user(username, prompt_id, all_prompts_access, public_prompts_acces
                 if initial_password:
                     hashed_password = hash_password(initial_password)
 
+                phone_verified = False
+                if phone:
+                    phone = normalize_phone_number(phone)
+                    await c.execute(
+                        "SELECT id FROM USERS WHERE phone_number = ?",
+                        (phone,),
+                    )
+                    if await c.fetchone():
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Phone number already in use.",
+                        )
+
+                    if phone_verification_id:
+                        if not phone_verification_actor_id:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Phone verification is required.",
+                            )
+                        await consume_phone_verification(
+                            conn,
+                            actor_user_id=phone_verification_actor_id,
+                            challenge_id=phone_verification_id,
+                            phone_number=phone,
+                            purpose=PURPOSE_CREATE_USER,
+                        )
+                        phone_verified = True
+                    elif not allow_unverified_phone:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Phone verification is required.",
+                        )
+
                 # Insert user
                 await c.execute("""
-                    INSERT INTO USERS (username, password, role_id, is_enabled, phone_number, email)
-                    VALUES (?, ?, ?, 1, ?, ?)
+                    INSERT INTO USERS (
+                        username, password, role_id, is_enabled,
+                        phone_number, phone_verified, email
+                    )
+                    VALUES (?, ?, ?, 1, ?, ?, ?)
                     RETURNING id
-                """, (username, hashed_password, role_id, phone, email))
+                """, (
+                    username,
+                    hashed_password,
+                    role_id,
+                    phone,
+                    phone_verified,
+                    email,
+                ))
 
                 user_id = await c.fetchone()
                 user_id = user_id[0] if user_id else None
@@ -850,7 +991,7 @@ async def add_user(username, prompt_id, all_prompts_access, public_prompts_acces
                         llm_id,
                         allow_file_upload,
                         allow_image_generation,
-                        balance,
+                        0.0,
                         current_user.id if current_user else None,
                         authentication_mode,
                         can_change_password,
@@ -863,8 +1004,28 @@ async def add_user(username, prompt_id, all_prompts_access, public_prompts_acces
                         billing_max_limit
                     ))
 
+                    await apply_initial_balance(
+                        conn,
+                        user_id=user_id,
+                        amount=balance,
+                        funder_user_id=initial_balance_funder_id,
+                        allow_platform_grant=allow_platform_balance_grant,
+                        granted_by_user_id=current_user.id if current_user else None,
+                    )
+
+                    if current_user:
+                        await upsert_creator_relationship(
+                            c,
+                            user_id,
+                            current_user.id,
+                            "assigned_by",
+                            "manual",
+                        )
+
                     await conn.commit()
                 return user_id
+    except InitialBalanceError:
+        raise
     except sqlite3.Error as e:
         logger.error(f"Error adding user: {e}")
         return None
@@ -983,8 +1144,10 @@ async def change_password(
         raise HTTPException(status_code=403, detail="You don't have permission to change your password")
 
     # Validate new password
-    if len(new_password) < 6:
-        return JSONResponse(status_code=400, content={"detail": "New password must be at least 6 characters"})
+    if len(new_password) < 8:
+        return JSONResponse(status_code=400, content={"detail": "New password must be at least 8 characters"})
+    if new_password == old_password:
+        return JSONResponse(status_code=400, content={"detail": "New password must be different from the current password"})
 
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
@@ -996,14 +1159,23 @@ async def change_password(
 
         stored_password = row[0]
 
-        if not verify_password(stored_password, old_password):
+        if not stored_password or not verify_password(stored_password, old_password):
             return JSONResponse(status_code=400, content={"detail": "Current password is incorrect"})
 
         hashed_new_password = hash_password(new_password)
         await cursor.execute("UPDATE USERS SET password = ? WHERE id = ?", (hashed_new_password, user_id))
+        await bump_session_version(conn, user_id)
         await conn.commit()
 
-    return JSONResponse(status_code=200, content={"detail": "Password changed successfully"})
+    response = JSONResponse(
+        status_code=200,
+        content={
+            "detail": "Password changed successfully. Please log in again.",
+            "reauthenticate": True,
+        },
+    )
+    response.delete_cookie("session")
+    return response
 
 @app.post("/api/set-password")
 async def set_initial_password(
@@ -1017,6 +1189,11 @@ async def set_initial_password(
 
     if not current_user.can_change_password:
         raise HTTPException(status_code=403, detail="You don't have permission to set a password")
+    if not has_recent_authentication(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Please sign in again before setting a password",
+        )
 
     async with get_db_connection() as conn:
         cursor = await conn.execute(
@@ -1045,11 +1222,19 @@ async def set_initial_password(
             "UPDATE USERS SET password = ? WHERE id = ?",
             (hashed, current_user.id)
         )
+        await bump_session_version(conn, current_user.id)
         await conn.commit()
 
         logger.info(f"User {current_user.username} (ID={current_user.id}) set initial password via Google OAuth flow")
 
-    return JSONResponse(content={"detail": "Password set successfully"})
+    response = JSONResponse(
+        content={
+            "detail": "Password set successfully. Please log in again.",
+            "reauthenticate": True,
+        }
+    )
+    response.delete_cookie("session")
+    return response
 
 @app.get("/edit-profile")
 async def show_edit_profile_form(request: Request, current_user: User = Depends(get_current_user)):
@@ -1416,8 +1601,8 @@ async def test_api_key(request: Request, current_user: User = Depends(get_curren
         elif provider == "anthropic":
             import anthropic as anthropic_test
             test_client = anthropic_test.Anthropic(api_key=key)
-            # Make a simple API call - count tokens is a lightweight operation
-            test_client.count_tokens("test")
+            # Make an authenticated, read-only request without consuming tokens.
+            test_client.models.list(limit=1)
             return JSONResponse(content={"success": True, "message": "Anthropic API key is valid"})
 
         elif provider == "google":
@@ -2481,6 +2666,17 @@ async def get_my_usage_data(
             for row in rows
         ]
 
+        # Storage quota usage (bytes; quota_bytes 0 = unlimited).
+        uploads_bytes = await storage_quota.get_uploads_usage_bytes(conn, current_user.id)
+        generated_bytes = await storage_quota.get_generated_usage_bytes(conn, current_user.id)
+        quota_bytes = await storage_quota.get_effective_quota_bytes(conn, current_user.id)
+        storage = {
+            "used_bytes": uploads_bytes + generated_bytes,
+            "uploads_bytes": uploads_bytes,
+            "generated_bytes": generated_bytes,
+            "quota_bytes": quota_bytes,
+        }
+
     wellbeing_days = days if days and days > 0 else 3650
     wellbeing = await get_user_wellbeing_summary(current_user.id, wellbeing_days)
 
@@ -2489,7 +2685,8 @@ async def get_my_usage_data(
         "stats": stats,
         "by_type": by_type,
         "daily": daily,
-        "wellbeing": wellbeing
+        "wellbeing": wellbeing,
+        "storage": storage
     })
 
 
@@ -3114,7 +3311,7 @@ async def edit_profile(
     phone_number: Optional[str] = Form(None),
     email: Optional[str] = Form(None),
     new_password: Optional[str] = Form(None),
-    verification_code: Optional[str] = Form(None),
+    phone_verification_id: Optional[str] = Form(None),
     sample_voice_id: Optional[str] = Form(None),
     user_info: Optional[str] = Form(None),
     profile_picture: Optional[UploadFile] = File(None),
@@ -3126,78 +3323,108 @@ async def edit_profile(
 
     user_id = current_user.id
     is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    phone_number_changed = False
 
     try:
         async with get_db_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.cursor()
 
-            await cursor.execute("SELECT username, phone_number, email, user_info, profile_picture FROM USERS WHERE id = ?", (user_id,))
+            await cursor.execute(
+                """
+                SELECT username, phone_number, email, user_info, profile_picture
+                FROM USERS
+                WHERE id = ?
+                """,
+                (user_id,),
+            )
             current_user_data = await cursor.fetchone()
-            current_username, current_phone_number, current_email, current_user_info, current_profile_picture = current_user_data
+            if not current_user_data:
+                raise HTTPException(status_code=404, detail="User not found.")
 
-            if username.lower() != current_username.lower():
-                await cursor.execute(
-                    "SELECT id FROM USERS WHERE LOWER(username) = LOWER(?) AND id != ?",
-                    (username, user_id)
+            (
+                current_username,
+                current_phone_number,
+                current_email,
+                current_user_info,
+                _current_profile_picture,
+            ) = current_user_data
+
+            # Username is an immutable account identifier. It is also part of the
+            # current storage layout, so accepting even a case-only rename would
+            # orphan user assets.
+            if username != current_username:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Username cannot be changed after account creation.",
                 )
-                existing_user = await cursor.fetchone()
-                if existing_user:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Username already exists. Please choose a different username."
-                    )
 
-            if phone_number:
-                phone_number = phone_number.strip()
-                if phone_number[:1] != '+':
-                    phone_number = f"+{phone_number}"
-
-            phone_number_changed = phone_number and phone_number != current_phone_number
+            submitted_phone = current_phone_number
+            if phone_number is not None:
+                raw_phone = phone_number.strip()
+                if raw_phone:
+                    submitted_phone = normalize_phone_number(raw_phone)
+                else:
+                    submitted_phone = None
+                phone_number_changed = submitted_phone != current_phone_number
 
             if phone_number_changed:
-                await cursor.execute("SELECT id FROM USERS WHERE phone_number = ? AND id != ?", (phone_number, user_id))
-                existing_user = await cursor.fetchone()
-                if existing_user:
-                    raise HTTPException(status_code=400, detail="Phone number already in use. Please use a different number.")
+                if not has_recent_authentication(current_user):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Please sign in again before changing your phone number.",
+                    )
+                if not phone_verification_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Use phone verification to change your phone number.",
+                    )
+                await cursor.execute(
+                    "SELECT id FROM USERS WHERE phone_number = ? AND id != ?",
+                    (submitted_phone, user_id),
+                )
+                if await cursor.fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Phone number already in use.",
+                    )
+                await consume_phone_verification(
+                    conn,
+                    actor_user_id=user_id,
+                    challenge_id=phone_verification_id,
+                    phone_number=submitted_phone,
+                    purpose=PURPOSE_PROFILE_PHONE_CHANGE,
+                )
 
-            # Email validation and checking
-            email_changed = False
-            if email is not None:
-                email = email.strip().lower()
-                if email != current_email:
-                    # Basic email validation
-                    import re
-                    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-                    if email and not re.match(email_pattern, email):
-                        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+            submitted_email = email.strip().lower() if email is not None else None
+            submitted_email = submitted_email or None
+            normalized_current_email = (
+                current_email.strip().lower() if current_email else None
+            )
+            if email is not None and submitted_email != normalized_current_email:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email changes require a dedicated verification flow.",
+                )
 
-                    # Check if email is already in use
-                    if email:
-                        await cursor.execute("SELECT id FROM USERS WHERE email = ? AND id != ?", (email, user_id))
-                        existing_user = await cursor.fetchone()
-                        if existing_user:
-                            raise HTTPException(status_code=400, detail="Email address already in use. Please use a different email.")
-
-                    email_changed = True
+            if new_password:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Use the password form to change your password.",
+                )
 
             update_fields = []
             update_values = []
 
-            if username != current_username:
-                update_fields.append("username = ?")
-                update_values.append(username)
-
             if phone_number_changed:
-                update_fields.append("phone_number = ?")
-                update_values.append(phone_number)
-
-            if email_changed:
-                update_fields.append("email = ?")
-                update_values.append(email or None)
-
-            if new_password:
-                update_fields.append("password = ?")
-                update_values.append(hash_password(new_password))
+                update_fields.extend(
+                    [
+                        "phone_number = ?",
+                        "phone_verified = 1",
+                        "session_version = COALESCE(session_version, 1) + 1",
+                    ]
+                )
+                update_values.append(submitted_phone)
 
             if user_info is not None and user_info != current_user_info:
                 update_fields.append("user_info = ?")
@@ -3233,8 +3460,6 @@ async def edit_profile(
                 else:
                     logger.info(f"No voice_id found for voice_code: {sample_voice_id}")
 
-            await conn.commit()
-
             if alter_ego_id == "" or alter_ego_id == "0":
                 await cursor.execute("UPDATE USER_DETAILS SET current_alter_ego_id = 0 WHERE user_id = ?", (user_id,))
             elif alter_ego_id:
@@ -3243,9 +3468,39 @@ async def edit_profile(
             await conn.commit()
 
         if is_ajax:
-            return JSONResponse(content={"success": True, "message": "Profile updated successfully"}, status_code=200)
+            response = JSONResponse(
+                content={
+                    "success": True,
+                    "message": "Profile updated successfully",
+                    "reauthenticate": phone_number_changed,
+                },
+                status_code=200,
+            )
+            if phone_number_changed:
+                response.delete_cookie("session")
+            return response
         else:
-            return RedirectResponse(url="/edit-profile", status_code=303)
+            redirect_url = "/login" if phone_number_changed else "/edit-profile"
+            response = RedirectResponse(url=redirect_url, status_code=303)
+            if phone_number_changed:
+                response.delete_cookie("session")
+            return response
+
+    except PhoneVerificationError as e:
+        headers = None
+        if isinstance(e, PhoneVerificationRateLimitError):
+            headers = {"Retry-After": str(e.retry_after)}
+        if is_ajax:
+            return JSONResponse(
+                content={"success": False, "message": e.detail},
+                status_code=e.status_code,
+                headers=headers,
+            )
+        return RedirectResponse(
+            url=f"/edit-profile?error={quote(e.detail)}",
+            status_code=303,
+            headers=headers,
+        )
 
     except HTTPException as e:
         if is_ajax:
@@ -3744,20 +3999,28 @@ def generate_random_username(length=8):
     return ''.join(random.choice(chars) for i in range(length))
 
 @app.post("/api/check-phone-number")
-async def check_phone_number(request: Request):
+async def check_phone_number(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+
     data = await request.json()
-    phone_number = data.get('phone')
-    current_user_id = data.get('user_id')
+    try:
+        phone_number = normalize_phone_number(data.get("phone"))
+    except PhoneVerificationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
-        await cursor.execute("SELECT id FROM USERS WHERE phone_number = ? AND id != ?", (phone_number, current_user_id))
+        await cursor.execute(
+            "SELECT id FROM USERS WHERE phone_number = ? AND id != ?",
+            (phone_number, current_user.id),
+        )
         existing_user = await cursor.fetchone()
 
-    if existing_user:
-        return JSONResponse(content={"exists": True}, status_code=200)
-    else:
-        return JSONResponse(content={"exists": False}, status_code=200)
+    return JSONResponse(content={"exists": bool(existing_user)}, status_code=200)
 
 async def check_prompts_access(user_id, conn):
     cursor = await conn.cursor()
@@ -4256,7 +4519,7 @@ async def create_user_post(
     balance: float = Form(...),
     phone: str = Form(default=None),
     skip_verification: bool = Form(default=False),
-    verification_code: str = Form(default=None),
+    phone_verification_id: str = Form(default=None),
     user_type: str = Form(...),
     username: str = Form(default=None),
     use_random_username: bool = Form(default=False),
@@ -4275,25 +4538,36 @@ async def create_user_post(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_user:
+    async with get_db_connection(readonly=True) as conn:
+        actor_role = await get_live_user_role(conn, current_user.id)
+
+    if actor_role not in {"admin", "user"}:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
 
+    if skip_verification and actor_role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can bypass phone verification.",
+        )
+
     # Validate that users can only create regular customers
-    if await current_user.is_user and user_type != "customer":
+    if actor_role == "user" and user_type != "customer":
         raise HTTPException(status_code=403, detail="Users can only create regular customer accounts.")
 
     # Users cannot give access to all prompts
-    if await current_user.is_user and all_prompts_access:
+    if actor_role == "user" and all_prompts_access:
         raise HTTPException(status_code=403, detail="Users cannot give access to all prompts.")
 
     # Validate that the prompt is accessible to the user
-    if await current_user.is_user:
+    if actor_role == "user":
         accessible_prompts = await get_user_role_accessible_prompts(current_user.id)
         if prompt_id not in accessible_prompts:
             raise HTTPException(status_code=403, detail="You can only create users with prompts that you have access to.")
 
-    if balance < 0 or balance > 500:
-        raise HTTPException(status_code=400, detail="Balance must be between $0 and $500.")
+    try:
+        balance = validate_managed_balance(balance)
+    except InvalidInitialBalanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Validate authentication mode
     valid_auth_modes = ["magic_link_only", "magic_link_password", "password_only"]
@@ -4301,11 +4575,11 @@ async def create_user_post(
         raise HTTPException(status_code=400, detail="Invalid authentication mode.")
 
     # Validate password requirements based on authentication mode
-    if authentication_mode == "password_only" and (not initial_password or len(initial_password) < 6):
-        raise HTTPException(status_code=400, detail="Password is required and must be at least 6 characters for password-only mode.")
+    if authentication_mode == "password_only" and (not initial_password or len(initial_password) < 8):
+        raise HTTPException(status_code=400, detail="Password is required and must be at least 8 characters for password-only mode.")
 
-    if authentication_mode == "magic_link_password" and initial_password and len(initial_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters when provided.")
+    if authentication_mode == "magic_link_password" and initial_password and len(initial_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters when provided.")
 
     # Only allow can_change_password for password modes
     if can_change_password and authentication_mode == "magic_link_only":
@@ -4330,6 +4604,14 @@ async def create_user_post(
                 raise HTTPException(status_code=400, detail="Selected LLM is not available.")
 
     if phone:
+        try:
+            phone = normalize_phone_number(phone)
+        except PhoneVerificationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+            ) from exc
+
         async with get_db_connection(readonly=True) as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT id FROM USERS WHERE phone_number = ?", (phone,))
@@ -4337,12 +4619,11 @@ async def create_user_post(
                 if existing_user:
                     raise HTTPException(status_code=400, detail="Phone number already in use. Please use a different number.")
 
-    if phone and not skip_verification:
-        if not verification_code:
-            raise HTTPException(status_code=400, detail="Verification code is required.")
-
-        verification_request = VerificationCodeRequest(phone=phone, code=verification_code)
-        await verify_code(verification_request)
+        if not skip_verification and not phone_verification_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Phone verification is required.",
+            )
 
     if use_random_username or not username:
         username = generate_random_username()
@@ -4384,7 +4665,7 @@ async def create_user_post(
     processed_max_limit = None
     if billing_mode == "user_pays":
         # Only users can set themselves as billing account
-        if await current_user.is_user or await current_user.is_admin:
+        if actor_role in {"user", "admin"}:
             billing_account_id = current_user.id
             processed_billing_limit = billing_limit if billing_limit and billing_limit > 0 else None
             processed_auto_refill_amount = billing_auto_refill_amount if billing_auto_refill_amount and billing_auto_refill_amount > 0 else 10.0
@@ -4392,64 +4673,66 @@ async def create_user_post(
         # Validate billing_limit_action
         if billing_limit_action not in ['block', 'notify', 'auto_refill']:
             billing_limit_action = 'block'
+        if (
+            billing_limit_action == 'auto_refill'
+            and processed_billing_limit is not None
+            and processed_max_limit is not None
+            and processed_max_limit < processed_billing_limit
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Maximum billing limit cannot be lower than the billing limit.",
+            )
 
-    user_id = await add_user(
-        username,
-        prompt_id,
-        all_prompts_access,
-        public_prompts_access,
-        machine,
-        allow_file_upload,
-        allow_image_generation,
-        balance,
-        phone,
-        role_name=user_type,
-        authentication_mode=authentication_mode,
-        initial_password=initial_password,
-        can_change_password=can_change_password,
-        email=email,
-        current_user=current_user,
-        api_key_mode=api_key_mode,
-        category_access=category_access,
-        billing_account_id=billing_account_id,
-        billing_limit=processed_billing_limit,
-        billing_limit_action=billing_limit_action,
-        billing_auto_refill_amount=processed_auto_refill_amount,
-        billing_max_limit=processed_max_limit
-    )
+    try:
+        user_id = await add_user(
+            username,
+            prompt_id,
+            all_prompts_access,
+            public_prompts_access,
+            machine,
+            allow_file_upload,
+            allow_image_generation,
+            balance,
+            phone,
+            role_name=user_type,
+            authentication_mode=authentication_mode,
+            initial_password=initial_password,
+            can_change_password=can_change_password,
+            email=email,
+            current_user=current_user,
+            api_key_mode=api_key_mode,
+            category_access=category_access,
+            billing_account_id=billing_account_id,
+            billing_limit=processed_billing_limit,
+            billing_limit_action=billing_limit_action,
+            billing_auto_refill_amount=processed_auto_refill_amount,
+            billing_max_limit=processed_max_limit,
+            initial_balance_funder_id=(
+                current_user.id if actor_role == "user" and balance > 0 else None
+            ),
+            allow_platform_balance_grant=(actor_role == "admin" and balance > 0),
+            phone_verification_id=(
+                phone_verification_id if phone and not skip_verification else None
+            ),
+            phone_verification_actor_id=current_user.id,
+            allow_unverified_phone=(actor_role == "admin" and skip_verification),
+        )
+    except InsufficientInitialBalanceError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail="Insufficient balance to fund the customer's initial balance.",
+        ) from exc
+    except InitialBalanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PhoneVerificationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
+
     if not user_id:
         raise HTTPException(status_code=500, detail="Failed to create user.")
-
-    # Record creator relationship
-    try:
-        async with get_db_connection() as ucr_conn:
-            ucr_cursor = await ucr_conn.cursor()
-            from common import upsert_creator_relationship
-            await upsert_creator_relationship(ucr_cursor, user_id, current_user.id, 'assigned_by', 'manual')
-            await ucr_conn.commit()
-    except Exception as ucr_err:
-        logger.warning(f"Could not record creator relationship for user {user_id}: {ucr_err}")
-
-    # Record initial balance as TRANSACTION for audit trail
-    if balance > 0:
-        try:
-            nonce = secrets.token_hex(4)
-            async with get_db_connection() as txn_conn:
-                await txn_conn.execute('''
-                    INSERT INTO TRANSACTIONS
-                    (user_id, type, amount, balance_before, balance_after,
-                     description, reference_id)
-                    VALUES (?, 'balance_credit', ?, 0, ?, ?, ?)
-                ''', (
-                    user_id,
-                    balance,
-                    balance,
-                    'Welcome credit from admin',
-                    f'admin_welcome_{user_id}_{nonce}'
-                ))
-                await txn_conn.commit()
-        except Exception as txn_err:
-            logger.warning(f"Could not record admin welcome transaction for user {user_id}: {txn_err}")
 
     # Generate magic link only for modes that support it
     magic_link = None
@@ -4483,11 +4766,28 @@ async def edit_user_form(
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_user:
-        raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
-
     async with get_db_connection(readonly=True) as conn:
         cursor = await conn.cursor()
+
+        username = username.strip()
+        await cursor.execute(
+            "SELECT id FROM USERS WHERE LOWER(username) = LOWER(?)",
+            (username,),
+        )
+        target_row = await cursor.fetchone()
+        if not target_row:
+            raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+
+        management_access = await get_user_management_access(
+            conn,
+            current_user.id,
+            target_row[0],
+        )
+        if not management_access.can_manage:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to manage this user.",
+            )
 
         # Get all prompts
         prompts = await get_user_accessible_prompts(current_user, cursor)
@@ -4500,8 +4800,6 @@ async def edit_user_form(
         await cursor.execute("SELECT id, role_name FROM USER_ROLES ORDER BY id")
         user_roles = [{'id': row[0], 'name': row[1]} for row in await cursor.fetchall()]
 
-        username = username.strip()
-
         # Get user data
         await cursor.execute("""
                 SELECT u.id, u.username, u.role_id, ud.current_prompt_id, ud.llm_id,
@@ -4510,12 +4808,13 @@ async def edit_user_form(
                        ud.can_change_password, u.email, ud.api_key_mode, ud.user_api_keys,
                        ud.category_access, ud.billing_account_id, ud.billing_limit,
                        ud.billing_limit_action, ur.role_name, ud.billing_auto_refill_amount,
-                       ud.billing_max_limit, ud.authentication_mode, u.is_enabled, u.auth_provider
+                       ud.billing_max_limit, ud.authentication_mode, u.is_enabled, u.auth_provider,
+                       ud.storage_quota_bytes
                 FROM USERS u
                 JOIN USER_DETAILS ud ON u.id = ud.user_id
                 JOIN USER_ROLES ur ON u.role_id = ur.id
-                WHERE LOWER(u.username) = LOWER(?)
-            """, (username,))
+                WHERE u.id = ?
+            """, (target_row[0],))
 
         user_row = await cursor.fetchone()
 
@@ -4550,10 +4849,15 @@ async def edit_user_form(
                 'billing_max_limit': user_row[21],
                 'authentication_mode': user_row[22] or 'magic_link_only',
                 'is_enabled': bool(user_row[23]),
-                'auth_provider': user_row[24]
+                'auth_provider': user_row[24],
+                # Per-user storage quota override in bytes (NULL = use system default).
+                'storage_quota_bytes': user_row[25]
             }
         else:
             user_data = None
+
+        # System default quota (bytes; 0 = unlimited) for the field's help text.
+        storage_quota_default_bytes = await storage_quota.get_default_quota_bytes(conn)
 
         await conn.close()
 
@@ -4567,6 +4871,7 @@ async def edit_user_form(
         "user_data": user_data,
         "categories": categories,
         "user_roles": user_roles,
+        "storage_quota_default_bytes": storage_quota_default_bytes,
         "error": None
     })
     return templates.TemplateResponse("edit_user.html", context)
@@ -4597,40 +4902,199 @@ async def update_user(
     billing_auto_refill_amount: Optional[str] = Form(default=None),
     billing_max_limit: Optional[str] = Form(default=None),
     user_role_id: Optional[str] = Form(default=None),
-    authentication_mode: str = Form(default="magic_link_only")
+    authentication_mode: str = Form(default="magic_link_only"),
+    storage_quota_gb: Annotated[Optional[str], Form()] = None
 ):
     if current_user is None:
         return templates.TemplateResponse("login.html", {"request": request, "captcha": get_captcha_config(), "google_oauth_available": bool(GOOGLE_CLIENT_ID)})
 
-    if not await current_user.is_admin and not await current_user.is_user:
-        raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
-
+    pending_admin_role_audit = None
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
 
         # Verify if the user exists
-        await cursor.execute("SELECT id, role_id FROM USERS WHERE LOWER(username) = LOWER(?)", (username,))
+        await cursor.execute(
+            """
+            SELECT id, role_id, username, phone_number, email, password
+            FROM USERS
+            WHERE LOWER(username) = LOWER(?)
+            """,
+            (username,),
+        )
         user = await cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
 
-        user_id, role_id = user
+        (
+            user_id,
+            role_id,
+            current_username,
+            current_phone_number,
+            current_email,
+            current_password_hash,
+        ) = user
+
+        management_access = await get_user_management_access(
+            conn,
+            current_user.id,
+            user_id,
+        )
+        if not management_access.can_manage:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to manage this user.",
+            )
 
         # Get current balance/default LLM for audit trail and disabled-model preservation
-        await cursor.execute("SELECT balance, llm_id FROM USER_DETAILS WHERE user_id = ?", (user_id,))
+        await cursor.execute(
+            """
+            SELECT
+                balance,
+                llm_id,
+                all_prompts_access,
+                can_change_password,
+                authentication_mode,
+                billing_account_id,
+                billing_limit,
+                billing_limit_action,
+                billing_auto_refill_amount,
+                billing_max_limit,
+                storage_quota_bytes
+            FROM USER_DETAILS
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
         balance_row = await cursor.fetchone()
         previous_balance = balance_row[0] if balance_row else 0.0
         current_user_llm_id = balance_row[1] if balance_row else None
-
-        # Verify permissions
-        if await current_user.is_user and role_id == 1:  # Assuming role_id 1 is for admin
-            raise HTTPException(status_code=403, detail="Users cannot edit admin accounts.")
+        current_all_prompts_access = bool(balance_row[2]) if balance_row else False
+        current_can_change_password = bool(balance_row[3]) if balance_row else False
+        current_authentication_mode = (
+            balance_row[4] if balance_row and balance_row[4] else "magic_link_only"
+        )
+        current_billing_account_id = balance_row[5] if balance_row else None
+        if (
+            current_billing_account_id is not None
+            and int(current_billing_account_id) == int(user_id)
+        ):
+            current_billing_account_id = None
+        current_billing_configuration = (
+            current_billing_account_id,
+            float(balance_row[6]) if balance_row and balance_row[6] is not None else None,
+            str(balance_row[7] or 'block') if balance_row else 'block',
+            float(balance_row[8]) if balance_row and balance_row[8] is not None else 10.0,
+            float(balance_row[9]) if balance_row and balance_row[9] is not None else None,
+        )
 
         # Parse optional numeric fields (HTML forms send empty string instead of null)
         billing_limit = parse_optional_float(billing_limit)
         billing_auto_refill_amount = parse_optional_float(billing_auto_refill_amount, default=10.0)
         billing_max_limit = parse_optional_float(billing_max_limit)
         user_role_id = int(user_role_id) if user_role_id and user_role_id.strip() else None
+
+        # Storage quota override (admin-only). Canonical unit is bytes; the form
+        # sends binary GB. Absent field (None) = no change; empty string = clear
+        # the override (NULL -> system default); 0 = unlimited.
+        current_storage_quota_bytes = (
+            int(balance_row[10]) if balance_row and balance_row[10] is not None else None
+        )
+        if storage_quota_gb is None:
+            requested_storage_quota_bytes = current_storage_quota_bytes
+        elif storage_quota_gb.strip() == "":
+            requested_storage_quota_bytes = None
+        else:
+            try:
+                storage_quota_gb_value = float(storage_quota_gb)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Storage quota must be a number of GB.")
+            if (
+                not math.isfinite(storage_quota_gb_value)
+                or storage_quota_gb_value < 0
+                or storage_quota_gb_value * (1024 ** 3) > storage_quota.MAX_QUOTA_BYTES
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Storage quota must be a finite non-negative value within the supported range.",
+                )
+            requested_storage_quota_bytes = int(storage_quota_gb_value * (1024 ** 3))
+
+        try:
+            balance = validate_managed_balance(balance)
+        except InvalidInitialBalanceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if management_access.is_creator:
+            if abs(balance - previous_balance) > 0.001:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change account balances.",
+                )
+            if user_role_id is not None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change account roles.",
+                )
+            if requested_storage_quota_bytes != current_storage_quota_bytes:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change storage quotas.",
+                )
+            requested_storage_quota_bytes = current_storage_quota_bytes
+            if bool(all_prompts_access) != current_all_prompts_access:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change full prompt access.",
+                )
+            balance = float(previous_balance)
+            all_prompts_access = current_all_prompts_access
+
+            normalized_submitted_phone = (
+                phone_number.strip() if phone_number is not None else None
+            )
+            normalized_submitted_phone = normalized_submitted_phone or None
+            normalized_submitted_email = (
+                email.strip().lower() if email is not None else None
+            )
+            normalized_submitted_email = normalized_submitted_email or None
+            normalized_current_email = (
+                current_email.strip().lower() if current_email else None
+            )
+            if (
+                phone_number is not None
+                and normalized_submitted_phone != current_phone_number
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change account phone numbers.",
+                )
+            if (
+                email is not None
+                and normalized_submitted_email != normalized_current_email
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can change account email addresses.",
+                )
+            if new_password:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only administrators can reset account passwords.",
+                )
+
+            phone_number = current_phone_number
+            email = current_email
+            can_change_password = current_can_change_password
+            authentication_mode = current_authentication_mode
+
+            accessible_prompts = await get_user_role_accessible_prompts(
+                current_user.id
+            )
+            if prompt_id not in accessible_prompts:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only assign prompts that you can access.",
+                )
 
         # Validate authentication mode
         valid_auth_modes = ["magic_link_only", "magic_link_password", "password_only"]
@@ -4651,50 +5115,102 @@ async def update_user(
         if not bool(selected_llm[1]) and int(machine) != int(current_user_llm_id or 0):
             raise HTTPException(status_code=400, detail="Selected LLM is disabled.")
 
-        # Validate the new username
-        if len(new_username) < 3 or len(new_username) > 20:
-            raise HTTPException(status_code=400, detail="The username must be between 3 and 20 characters.")
+        if new_username != current_username:
+            raise HTTPException(
+                status_code=400,
+                detail="Username cannot be changed after account creation.",
+            )
 
-        if not re.match(r'^[a-zA-Z0-9_-]+$', new_username):
-            raise HTTPException(status_code=400, detail="The username can only contain letters, numbers, hyphens, and underscores.")
+        if management_access.is_admin:
+            if phone_number is None:
+                phone_number = current_phone_number
+            else:
+                phone_number = phone_number.strip() or None
+                if phone_number and not phone_number.startswith("+"):
+                    phone_number = f"+{phone_number}"
 
-        # Verify if the new username is already in use
-        await cursor.execute(
-            "SELECT id FROM USERS WHERE LOWER(username) = LOWER(?) AND id != ?",
-            (new_username, user_id)
-        )
-        if await cursor.fetchone():
-            raise HTTPException(status_code=400, detail="This username is already in use.")
+            if email is None:
+                email = current_email
+            else:
+                email = email.strip().lower() or None
 
-        # Email validation if provided
+        phone_number_changed = phone_number != current_phone_number
+        email_changed = email != current_email
+
+        if phone_number_changed and phone_number:
+            await cursor.execute(
+                "SELECT id FROM USERS WHERE phone_number = ? AND id != ?",
+                (phone_number, user_id),
+            )
+            if await cursor.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phone number already in use.",
+                )
+
         if email:
-            email = email.strip().lower()
             email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
             if not re.match(email_pattern, email):
-                return JSONResponse(content={"success": False, "error": "Please enter a valid email address."})
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please enter a valid email address.",
+                )
 
-            # Check if email is already in use
-            await cursor.execute("SELECT id FROM USERS WHERE email = ? AND id != ?", (email, user_id))
-            existing_user = await cursor.fetchone()
-            if existing_user:
-                return JSONResponse(content={"success": False, "error": "Email address already in use."})
+            if email_changed:
+                await cursor.execute(
+                    "SELECT id FROM USERS WHERE email = ? AND id != ?",
+                    (email, user_id),
+                )
+                if await cursor.fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Email address already in use.",
+                    )
 
-        # Update user information
-        update_query = """
-        UPDATE USERS SET
-            username = ?,
-            phone_number = ?,
-            email = ?
-        WHERE id = ?
-        """
-        update_params = [new_username, phone_number, email, user_id]
+        if new_password and len(new_password) < 8:
+            raise HTTPException(
+                status_code=400,
+                detail="Password must be at least 8 characters.",
+            )
+        if authentication_mode == "password_only" and not (
+            current_password_hash or new_password
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Password-only mode requires a password.",
+            )
+        if (
+            authentication_mode in {"magic_link_only", "magic_link_password"}
+            and not email
+            and (
+                email_changed
+                or authentication_mode != current_authentication_mode
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Magic-link authentication requires an email address.",
+            )
+        if can_change_password and authentication_mode == "magic_link_only":
+            raise HTTPException(
+                status_code=400,
+                detail="Password changes require a password authentication mode.",
+            )
 
+        user_update_fields = [
+            "phone_number = ?",
+            "email = ?",
+            "session_version = COALESCE(session_version, 1) + 1",
+        ]
+        update_params = [phone_number, email]
+        if phone_number_changed:
+            user_update_fields.append("phone_verified = 0")
         if new_password:
-            update_query = update_query.replace("username = ?", "username = ?, password = ?")
-            update_params.insert(1, hash_password(new_password))
+            user_update_fields.append("password = ?")
+            update_params.append(hash_password(new_password))
 
         # Role change - only admins can change roles
-        if user_role_id and await current_user.is_admin:
+        if user_role_id and management_access.is_admin:
             # Validate role_id exists
             await cursor.execute("SELECT id FROM USER_ROLES WHERE id = ?", (user_role_id,))
             if await cursor.fetchone():
@@ -4708,21 +5224,24 @@ async def update_user(
                         req_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else None)
                         if not await is_elevated(current_user.id, request_ip=req_ip):
                             return JSONResponse(content={"success": False, "error": "Ultra Admin+ elevation required to change an admin's role."})
-                        # Audit log for role change of admin via Ultra Admin+
                         await cursor.execute("SELECT role_name FROM USER_ROLES WHERE id = ?", (user_role_id,))
                         new_role_row = await cursor.fetchone()
                         new_role_name = new_role_row[0] if new_role_row else f"role_id={user_role_id}"
-                        await log_admin_action(
-                            admin_id=current_user.id,
-                            action_type="ultra_admin_changed_admin_role",
-                            request=request,
-                            target_user_id=user_id,
-                            details=f"Admin '{username}' role changed to '{new_role_name}' by '{current_user.username}' via Ultra Admin+"
-                        )
-                    update_query = update_query.replace("email = ?", "email = ?, role_id = ?")
-                    update_params.insert(-1, user_role_id)
+                        pending_admin_role_audit = {
+                            "admin_id": current_user.id,
+                            "action_type": "ultra_admin_changed_admin_role",
+                            "request": request,
+                            "target_user_id": user_id,
+                            "details": (
+                                f"Admin '{username}' role changed to "
+                                f"'{new_role_name}' by "
+                                f"'{current_user.username}' via Ultra Admin+"
+                            ),
+                        }
+                    user_update_fields.append("role_id = ?")
+                    update_params.append(user_role_id)
 
-        await cursor.execute(update_query, update_params)
+        update_params.append(user_id)
 
         # Validate API key mode if provided
         if api_key_mode:
@@ -4744,12 +5263,13 @@ async def update_user(
             all_prompts_access = ?,
             public_prompts_access = ?,
             can_change_password = ?,
-            authentication_mode = ?
+            authentication_mode = ?,
+            storage_quota_bytes = ?
         """
         update_details_params = [
             prompt_id, machine, allow_file_upload, allow_image_generation,
             balance, all_prompts_access, public_prompts_access, can_change_password,
-            authentication_mode
+            authentication_mode, requested_storage_quota_bytes
         ]
 
         # Add api_key_mode to update if provided
@@ -4774,7 +5294,9 @@ async def update_user(
         update_details_params.append(category_access_value)
 
         # Process enterprise billing mode
-        if billing_mode == "user_pays" and (await current_user.is_user or await current_user.is_admin):
+        if billing_mode == "user_pays" and (
+            management_access.is_creator or management_access.is_admin
+        ) and current_user.id != user_id:
             billing_account_id_value = current_user.id
             billing_limit_value = billing_limit if billing_limit and billing_limit > 0 else None
             billing_action_value = billing_limit_action if billing_limit_action in ['block', 'notify', 'auto_refill'] else 'block'
@@ -4786,6 +5308,73 @@ async def update_user(
             billing_action_value = 'block'
             billing_auto_refill_value = 10.0
             billing_max_limit_value = None
+
+        if (
+            billing_action_value == 'auto_refill'
+            and billing_limit_value is not None
+            and billing_max_limit_value is not None
+            and billing_max_limit_value < billing_limit_value
+        ):
+            return JSONResponse(
+                content={
+                    'success': False,
+                    'error': 'Maximum billing limit cannot be lower than the billing limit.',
+                },
+                status_code=400,
+            )
+
+        requested_billing_configuration = (
+            billing_account_id_value,
+            billing_limit_value,
+            billing_action_value,
+            billing_auto_refill_value,
+            billing_max_limit_value,
+        )
+        if requested_billing_configuration != current_billing_configuration:
+            # Reap expired holds before deciding that billing is still busy.
+            # The write transaction below then prevents a fresh reservation
+            # from appearing between the final check and this configuration
+            # update.
+            await conn.rollback()
+            await reconcile_stale_usage_reservations()
+            await conn.execute("BEGIN IMMEDIATE")
+            await cursor.execute(
+                """
+                SELECT 1
+                FROM BILLING_USAGE_RESERVATIONS
+                WHERE user_id = ? AND status = 'active'
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            if await cursor.fetchone():
+                await conn.rollback()
+                return JSONResponse(
+                    content={
+                        'success': False,
+                        'error': (
+                            'Billing settings cannot be changed while this '
+                            'account has usage in progress.'
+                        ),
+                    },
+                    status_code=409,
+                )
+            await cursor.execute(
+                "SELECT balance FROM USER_DETAILS WHERE user_id = ?",
+                (user_id,),
+            )
+            refreshed_balance_row = await cursor.fetchone()
+            if refreshed_balance_row is not None:
+                refreshed_balance = float(refreshed_balance_row[0] or 0.0)
+                if abs(balance - previous_balance) <= 0.001:
+                    balance = refreshed_balance
+                previous_balance = refreshed_balance
+                update_details_params[4] = balance
+
+        await cursor.execute(
+            f"UPDATE USERS SET {', '.join(user_update_fields)} WHERE id = ?",
+            update_params,
+        )
 
         update_details_query += ", billing_account_id = ?, billing_limit = ?, billing_limit_action = ?, billing_auto_refill_amount = ?, billing_max_limit = ?"
         update_details_params.extend([billing_account_id_value, billing_limit_value, billing_action_value, billing_auto_refill_value, billing_max_limit_value])
@@ -4799,7 +5388,7 @@ async def update_user(
             await cursor.execute("DELETE FROM magic_links WHERE user_id = ?", (user_id,))
 
         # Record balance change in TRANSACTIONS if balance was modified
-        if abs(balance - previous_balance) > 0.001:
+        if management_access.is_admin and abs(balance - previous_balance) > 0.001:
             balance_diff = balance - previous_balance
             if balance_diff > 0:
                 tx_description = f"Admin balance adjustment: +${balance_diff:.2f} by {current_user.username}"
@@ -4821,6 +5410,9 @@ async def update_user(
             ))
 
         await conn.commit()
+
+    if pending_admin_role_audit:
+        await log_admin_action(**pending_admin_role_audit)
 
     return JSONResponse(content={"success": True, "message": "User updated successfully"})
 
@@ -5023,6 +5615,7 @@ async def renew_token(request: Request, username: str, current_user: User = Depe
                         "INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)",
                         (user_id, new_token, new_expires_at)
                     )
+            await bump_session_version(conn, user_id)
             await conn.commit()
             url_path = 'login?token='
             full_magic_link = f"{get_auth_base_url(request).rstrip('/')}/{url_path}{new_token}"
@@ -5086,7 +5679,12 @@ async def set_user_activation(request: Request, username: str, current_user: Use
 
         if current_enabled != enabled:
             await cursor.execute(
-                "UPDATE USERS SET is_enabled = ? WHERE id = ?",
+                """
+                UPDATE USERS
+                SET is_enabled = ?,
+                    session_version = COALESCE(session_version, 1) + 1
+                WHERE id = ?
+                """,
                 (1 if enabled else 0, target_user_id),
             )
             await conn.commit()
@@ -5185,8 +5783,9 @@ async def get_user_rate_limit_status(request: Request, username: str, current_us
         raise HTTPException(status_code=403, detail="Admin access required.")
 
     limits_config = {
-        "id:login": RLC.LOGIN_BY_USER,
-        "id_fail:login": RLC.LOGIN_BY_USER,
+        "id:login": RLC.LOGIN_ACCOUNT_OBSERVATION,
+        "id_fail:login": RLC.LOGIN_ACCOUNT_OBSERVATION,
+        "pair_fail:login": RLC.LOGIN_BY_ACCOUNT_IP_FAILURES,
         "id:recovery": RLC.RECOVERY_BY_EMAIL,
         "id_fail:recovery": RLC.RECOVERY_BY_EMAIL,
     }
@@ -5245,7 +5844,8 @@ async def refresh_session(request: Request, current_user: User = Depends(get_cur
         token = create_access_token(
             data={
                 "sub": user_info["username"],
-                "user_info": user_info
+                "user_info": user_info,
+                "auth_time": current_user.auth_time,
             },
             expires_delta=expires_delta
         )
@@ -5322,53 +5922,46 @@ async def delete_user(username, current_user, request_ip=None):
                 detail="Unauthorized: You do not have permission to delete this account"
             )
 
-        # Audit log for admin-on-admin deletion via Ultra Admin+
-        if is_target_admin and ultra_admin_elevated:
-            await log_admin_action(
-                admin_id=current_user.id,
-                action_type="ultra_admin_deleted_admin",
-                request=None,
-                target_user_id=user_id,
-                details=f"Admin '{username}' deleted by '{current_user.username}' via Ultra Admin+"
-            )
-
+        audit_admin_deletion = bool(is_target_admin and ultra_admin_elevated)
+        held_blob_ids = []
+        transaction_started = False
         try:
-            # Add user to revoked list in Redis
-            await add_revoked_user(user_id)
-            logger.debug(f"Added user {username} to revoked list")
-
-            # Get and delete prompts
-            await cursor.execute("""
-                SELECT p.id, p.name
-                FROM prompts p
-                WHERE p.created_by_user_id = ?
-            """, (user_id,))
-            user_prompts = await cursor.fetchall()
-
-            # Delete physical folders of prompts
-            hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
-            for prompt in user_prompts:
-                prompt_id = prompt[0]
-                prompt_name = prompt[1]
-                sanitized_prompt_name = sanitize_name(prompt_name)
-                padded_id = f"{prompt_id:07d}"
-
-                prompt_dir = os.path.join(
-                    users_directory,
-                    hash_prefix1,
-                    hash_prefix2,
-                    user_hash,
-                    "prompts",
-                    padded_id[:3],
-                    f"{padded_id[3:]}_{sanitized_prompt_name}"
+            await conn.rollback()
+            await reconcile_stale_usage_reservations()
+            # Serialize this guard with reservation creation and the user DELETE.
+            # Once this write transaction starts, a new reservation cannot slip
+            # between the active-usage check and the account cascade.
+            await conn.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            await cursor.execute(
+                """
+                SELECT 1
+                FROM BILLING_USAGE_RESERVATIONS
+                WHERE status = 'active'
+                  AND (user_id = ? OR billing_account_id = ?)
+                LIMIT 1
+                """,
+                (user_id, user_id),
+            )
+            if await cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Account cannot be deleted while provider usage is "
+                        "still in progress. Please try again shortly."
+                    ),
                 )
 
-                if os.path.exists(prompt_dir):
-                    try:
-                        shutil.rmtree(prompt_dir)
-                        logger.debug(f"Deleted prompt directory: {prompt_dir}")
-                    except Exception as e:
-                        logger.error(f"Error deleting prompt directory {prompt_dir}: {str(e)}")
+            # Capture the DISTINCT blobs this user references BEFORE the DB
+            # cascade. Deleting the USERS row cascades FILE_ATTACHMENTS away, so
+            # the blob ids must be recorded now; the ones left unreferenced are
+            # pruned after the transaction commits (blobs still referenced by
+            # other users survive -- dedupe-correct).
+            await cursor.execute(
+                "SELECT DISTINCT blob_id FROM FILE_ATTACHMENTS WHERE user_id = ?",
+                (user_id,),
+            )
+            held_blob_ids = [row[0] for row in await cursor.fetchall()]
 
             # Cascade deletion of all related data in database
             async with conn.cursor() as delete_cursor:
@@ -5467,19 +6060,78 @@ async def delete_user(username, current_user, request_ip=None):
                 logger.debug(f"Deleted user record for {username}")
 
                 await conn.commit()
+                transaction_started = False
                 logger.info(f"Successfully deleted user {username} and all associated data")
 
-            return {"message": f"User {username} successfully deleted"}
-
+        except HTTPException:
+            if transaction_started:
+                await conn.rollback()
+            raise
         except Exception as e:
-            await conn.rollback()
+            if transaction_started:
+                await conn.rollback()
             logger.error(f"Error during user deletion process for {username}: {str(e)}")
             raise HTTPException(
                 status_code=500,
                 detail=f"Error during user deletion process: {str(e)}"
             )
-        finally:
-            await conn.close()
+
+    # External side effects only run after the account deletion committed.
+    if audit_admin_deletion:
+        await log_admin_action(
+            admin_id=current_user.id,
+            action_type="ultra_admin_deleted_admin",
+            request=None,
+            target_user_id=None,
+            details=(
+                f"Admin '{username}' deleted by '{current_user.username}' "
+                "via Ultra Admin+"
+            ),
+        )
+
+    try:
+        await add_revoked_user(user_id)
+        logger.debug(f"Added user {username} to revoked list")
+    except Exception as exc:
+        # The account is already gone from the source of truth, so a transient
+        # revocation-cache failure must not report the committed deletion as a
+        # failure to the caller.
+        logger.error(
+            "Could not add deleted user %s to the revocation cache: %s",
+            username,
+            exc,
+        )
+
+    # Prune the blobs this user held that are now unreferenced. Runs only after
+    # the deletion transaction has fully closed (the `async with` above exited):
+    # prune_unreferenced_blobs opens its own connection and BEGIN IMMEDIATE.
+    # Blobs still referenced by other users are kept (dedupe-correct). The
+    # account is already gone from the source of truth, so a cleanup failure
+    # must not report the committed deletion as a failure -- log and continue.
+    # Guard the empty case: passing [] would fall into the no-arg branch and
+    # trigger a platform-wide zero-ref scan instead of a no-op.
+    if held_blob_ids:
+        try:
+            await prune_unreferenced_blobs(held_blob_ids)
+        except Exception as exc:
+            logger.error(
+                "Error pruning blobs for deleted user %s: %s", username, str(exc)
+            )
+
+    # Remove the user's entire media tree (conversation files, generated media,
+    # profile pictures, prompt landing pages). Leave the two shared hash-prefix
+    # parent dirs untouched. Same non-fail-fast policy as above: the DB rows are
+    # already gone, so disk-cleanup failure must not resurrect a half-deleted
+    # user (this mirrors prune_unreferenced_blobs' own unlink handling).
+    user_dir = get_user_directory(username)
+    if os.path.exists(user_dir):
+        try:
+            shutil.rmtree(user_dir)
+            logger.debug(f"Deleted user directory: {user_dir}")
+        except Exception as e:
+            logger.error(f"Error deleting user directory {user_dir}: {str(e)}")
+
+    return {"message": f"User {username} successfully deleted"}
 
 async def delete_selected_users(usernames, current_user, request_ip=None):
     for username in usernames:
@@ -5632,6 +6284,7 @@ async def delete_users(request: Request, current_user: User = Depends(get_curren
         return JSONResponse(content={"error": "No users selected."}, status_code=400)
 
     errors = []
+    error_statuses = []
     deleted = []
     for username in selected_users:
         try:
@@ -5639,9 +6292,15 @@ async def delete_users(request: Request, current_user: User = Depends(get_curren
             deleted.append(username)
         except HTTPException as e:
             errors.append(f"{username}: {e.detail}")
+            error_statuses.append(e.status_code)
 
     if errors and not deleted:
-        return JSONResponse(content={"detail": "; ".join(errors)}, status_code=403)
+        unique_statuses = set(error_statuses)
+        status_code = error_statuses[0] if len(unique_statuses) == 1 else 400
+        return JSONResponse(
+            content={"detail": "; ".join(errors)},
+            status_code=status_code,
+        )
     elif errors:
         return JSONResponse(content={"message": f"Deleted {len(deleted)} user(s). Errors: {'; '.join(errors)}"})
     else:
@@ -5659,6 +6318,8 @@ async def delete_account(request: Request, current_user: User = Depends(get_curr
             "message": "Account deleted successfully",
             "logout": True,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -7560,7 +8221,7 @@ async def create_service(request: Request, current_user: User = Depends(get_curr
 
     if not await current_user.is_admin:
         return JSONResponse(content={"error": "Access denied"}, status_code=403)
-    service_types = ["TTS", "STT", "Images", "Music"]
+    service_types = ["TTS", "STT", "Images", "Video", "Music"]
     context = await get_template_context(request, current_user)
     context["service_types"] = service_types
     return templates.TemplateResponse("services/create_service.html", context)
@@ -7593,7 +8254,7 @@ async def edit_service(request: Request, service_id: int, current_user: User = D
         service = await cursor.fetchone()
         await conn.close()
         if service:
-            service_types = ["TTS", "STT", "Images", "Music"]
+            service_types = ["TTS", "STT", "Images", "Video", "Music"]
             context = await get_template_context(request, current_user)
             context.update({
                 "service_id": service_id,
@@ -7896,25 +8557,42 @@ async def auth_image(request: Request, token: str = Query(None), request_uri: st
         if not request_uri:
             raise HTTPException(status_code=400, detail="No request_uri provided")
 
-        # Build user's base directory
-        hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
-        user_base = Path(f"data/users/{hash_prefix1}/{hash_prefix2}/{user_hash}")
+        try:
+            clean_uri = normalize_image_path(request_uri)
+            token_path = payload.get("media_path")
+            if token_path:
+                token_path = normalize_image_path(token_path)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=403, detail="Access denied")
 
-        # Clean up request_uri
-        clean_uri = request_uri.strip()
-        if clean_uri.startswith('/'):
-            clean_uri = clean_uri[1:]
+        if token_path:
+            # New tokens authorize one exact resource. This also supports public
+            # prompt avatars owned by another user without granting access to
+            # any sibling file in that owner's directory.
+            if not secrets.compare_digest(token_path, clean_uri):
+                logger.warning("[auth_image] Token path does not match requested image")
+                raise HTTPException(status_code=403, detail="Access denied")
 
-        # Extract relative path from request_uri (remove users/hash/hash/hash/ prefix if present)
-        uri_parts = clean_uri.split('/')
-        if len(uri_parts) >= 4 and uri_parts[0] == 'users':
-            # Remove the users/hash1/hash2/hash3 prefix to get relative path
-            relative_path = '/'.join(uri_parts[4:]) if len(uri_parts) > 4 else ''
+            uri_parts = clean_uri.split('/')
+            if len(uri_parts) < 5 or uri_parts[0] != 'users':
+                raise HTTPException(status_code=403, detail="Access denied")
+            image_base = Path("data").joinpath(*uri_parts[:4])
+            relative_path = '/'.join(uri_parts[4:])
+            validate_path_within_directory(relative_path, image_base)
         else:
-            relative_path = clean_uri
-
-        # Validate path is within user directory
-        validated_path = validate_path_within_directory(relative_path, user_base)
+            # Tokens issued before path binding, plus the deliberately generic
+            # media token, are restricted to the token holder's own directory.
+            hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
+            user_base = Path(f"data/users/{hash_prefix1}/{hash_prefix2}/{user_hash}")
+            expected_prefix = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/"
+            if clean_uri.startswith("users/"):
+                if not clean_uri.startswith(expected_prefix):
+                    logger.warning("[auth_image] Token user does not match image path")
+                    raise HTTPException(status_code=403, detail="Access denied")
+                relative_path = clean_uri[len(expected_prefix):]
+            else:
+                relative_path = clean_uri
+            validate_path_within_directory(relative_path, user_base)
 
         logger.debug(f"[auth_image] Authentication successful for user: {username}")
         return Response(status_code=200)
@@ -8652,59 +9330,140 @@ async def admin_watchdog_events(request: Request, current_user: User = Depends(g
 
 
 @app.post("/api/send-verification-code")
-async def send_verification_code(request: PhoneNumberRequest):
-    if async_twilio is None or service_sid is None:
-        raise HTTPException(status_code=503, detail="SMS verification service is not configured")
+async def send_verification_code(
+    payload: PhoneVerificationRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+
+    if payload.purpose not in {
+        PURPOSE_CREATE_USER,
+        PURPOSE_PROFILE_PHONE_CHANGE,
+    }:
+        raise HTTPException(status_code=400, detail="Invalid phone verification purpose.")
+
+    if (
+        payload.purpose == PURPOSE_PROFILE_PHONE_CHANGE
+        and not has_recent_authentication(current_user)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Please sign in again before changing your phone number.",
+        )
+
+    if payload.purpose == PURPOSE_CREATE_USER:
+        async with get_db_connection(readonly=True) as conn:
+            actor_role = await get_live_user_role(conn, current_user.id)
+        if actor_role not in {"admin", "user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot verify a phone number for user creation.",
+            )
+
     try:
-        phone_number = request.phone
-        logger.debug(f"Attempting to send verification code to: {phone_number}")
+        phone_number = normalize_phone_number(payload.phone)
+        async with get_db_connection(readonly=True) as conn:
+            if payload.purpose == PURPOSE_PROFILE_PHONE_CHANGE:
+                cursor = await conn.execute(
+                    "SELECT id FROM USERS WHERE phone_number = ? AND id != ?",
+                    (phone_number, current_user.id),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT id FROM USERS WHERE phone_number = ?",
+                    (phone_number,),
+                )
+            if await cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Phone number already in use.",
+                )
 
-        # Ensure phone number is in E.164 format
-        if phone_number[:1] != '+':
-            phone_number = '+' + phone_number
-
-        logger.debug(f"Formatted phone number: {phone_number}")
-        logger.debug(f"Using Twilio SID: {twilio_sid}")
-
-        result = await async_twilio.send_verification(service_sid, phone_number)
-        logger.debug(f"Verification status: {result['status']}")
-        return {"status": result["status"]}
-    except TwilioAPIError as e:
-        logger.error(f"Twilio Error: {e}")
-        logger.error(f"Error Code: {e.code}")
-        logger.error(f"Error Message: {e.msg}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        challenge = await request_phone_verification(
+            actor_user_id=current_user.id,
+            phone_number=phone_number,
+            purpose=payload.purpose,
+            request_ip=get_client_ip(request),
+            twilio_client=async_twilio,
+            service_sid=service_sid,
+        )
+        return {
+            "status": challenge.status,
+            "challenge_id": challenge.challenge_id,
+            "expires_in": challenge.expires_in,
+        }
+    except HTTPException:
+        raise
+    except PhoneVerificationError as exc:
+        headers = None
+        if isinstance(exc, PhoneVerificationRateLimitError):
+            headers = {"Retry-After": str(exc.retry_after)}
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=headers,
+        ) from exc
 
 @app.post("/api/verify-code")
-async def verify_code(request: Request):
-    if async_twilio is None or service_sid is None:
-        raise HTTPException(status_code=503, detail="SMS verification service is not configured")
-    data = await request.json()
-    verification_request = VerificationCodeRequest(phone=data['phone'], code=data['code'])
-    try:
-        result = await async_twilio.check_verification(
-            service_sid, verification_request.phone, verification_request.code
+async def verify_code(
+    verification_request: VerificationCodeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    if current_user is None:
+        return unauthenticated_response()
+
+    if verification_request.purpose not in {
+        PURPOSE_CREATE_USER,
+        PURPOSE_PROFILE_PHONE_CHANGE,
+    }:
+        raise HTTPException(status_code=400, detail="Invalid phone verification purpose.")
+
+    if (
+        verification_request.purpose == PURPOSE_PROFILE_PHONE_CHANGE
+        and not has_recent_authentication(current_user)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Please sign in again before changing your phone number.",
         )
-        if result["status"] != "approved":
-            raise HTTPException(status_code=400, detail=f"Verification failed with status: {result['status']}")
 
-        # Mark phone as verified
-        phone = verification_request.phone
-        if phone[:1] != '+':
-            phone = '+' + phone
-        async with get_db_connection() as conn:
-            await conn.execute(
-                "UPDATE USERS SET phone_verified = TRUE WHERE phone_number = ?",
-                (phone,)
+    if verification_request.purpose == PURPOSE_CREATE_USER:
+        async with get_db_connection(readonly=True) as conn:
+            actor_role = await get_live_user_role(conn, current_user.id)
+        if actor_role not in {"admin", "user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot verify a phone number for user creation.",
             )
-            await conn.commit()
 
-        return JSONResponse(content={"status": result["status"]}, status_code=200)
-    except Exception as e:
-        return JSONResponse(content={"success": False, "message": str(e)}, status_code=400)
+    try:
+        challenge = await verify_phone_code(
+            actor_user_id=current_user.id,
+            challenge_id=verification_request.challenge_id,
+            code=verification_request.code,
+            phone_number=verification_request.phone,
+            purpose=verification_request.purpose,
+            twilio_client=async_twilio,
+            service_sid=service_sid,
+        )
+        return JSONResponse(
+            content={
+                "status": challenge.status,
+                "challenge_id": challenge.challenge_id,
+            },
+            status_code=200,
+        )
+    except PhoneVerificationError as exc:
+        headers = None
+        if isinstance(exc, PhoneVerificationRateLimitError):
+            headers = {"Retry-After": str(exc.retry_after)}
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=headers,
+        ) from exc
 
 @app.get("/api/current-user-id")
 async def get_current_user_id(current_user: User = Depends(get_current_user)):
@@ -9089,6 +9848,9 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
 
             # Link Google account to existing user
             await update_user_google_id(user.id, google_id, "google_linked")
+            user = await get_user_by_id(user.id)
+            if not user:
+                raise RuntimeError("Linked user could not be reloaded")
             logger.info(f"Linked Google account to existing user {user.id}")
 
             # Handle pack access for existing user
@@ -9187,7 +9949,12 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
                 billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "user_pays" else None,
                 billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "user_pays" else "block",
                 billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "user_pays" else 10.0,
-                billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" else None
+                billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" else None,
+                initial_balance_funder_id=(
+                    ucr_creator_id
+                    if float(landing_config.get("initial_balance", 0.0)) > 0
+                    else None
+                ),
             )
         else:
             # Original add_user call (no pack config)
@@ -9259,37 +10026,6 @@ async def _auth_google_callback_inner(request: Request, code: str, state: str, e
                         await revert_conn.commit()
                 except Exception as revert_err:
                     logger.error(f"Failed to revert captive status for OAuth user {user_id}: {revert_err}")
-
-        # Record initial_balance as TRANSACTION for audit trail
-        oauth_initial_balance = landing_config.get("initial_balance", 0.0) if landing_config else 0.0
-        if oauth_initial_balance > 0:
-            try:
-                async with get_db_connection() as conn:
-                    desc = "Welcome credit"
-                    if pack_id:
-                        name_cur = await conn.execute("SELECT name FROM PACKS WHERE id = ?", (pack_id,))
-                        name_row = await name_cur.fetchone()
-                        desc = f"Welcome credit from pack: {name_row[0]}" if name_row else f"Welcome credit from pack {pack_id}"
-                    elif prompt_id:
-                        name_cur = await conn.execute("SELECT name FROM PROMPTS WHERE id = ?", (prompt_id,))
-                        name_row = await name_cur.fetchone()
-                        desc = f"Welcome credit from {name_row[0]}" if name_row else f"Welcome credit from prompt {prompt_id}"
-
-                    await conn.execute('''
-                        INSERT INTO TRANSACTIONS
-                        (user_id, type, amount, balance_before, balance_after,
-                         description, reference_id)
-                        VALUES (?, 'balance_credit', ?, 0, ?, ?, ?)
-                    ''', (
-                        user_id,
-                        oauth_initial_balance,
-                        oauth_initial_balance,
-                        desc,
-                        f'registration_{user_id}'
-                    ))
-                    await conn.commit()
-            except Exception as txn_err:
-                logger.warning(f"Could not record OAuth registration bonus transaction: {txn_err}")
 
         # Grant pack access for free pack registration
         if pack_id:
@@ -9543,7 +10279,13 @@ async def verify_email(request: Request, token: str):
             billing_limit=landing_config.get("billing_limit") if landing_config.get("billing_mode") == "user_pays" and not is_user else None,
             billing_limit_action=landing_config.get("billing_limit_action", "block") if landing_config.get("billing_mode") == "user_pays" and not is_user else "block",
             billing_auto_refill_amount=landing_config.get("billing_auto_refill_amount", 10.0) if landing_config.get("billing_mode") == "user_pays" and not is_user else 10.0,
-            billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" and not is_user else None
+            billing_max_limit=landing_config.get("billing_max_limit") if landing_config.get("billing_mode") == "user_pays" and not is_user else None,
+            initial_balance_funder_id=(
+                ucr_creator_id
+                if not is_user
+                and float(landing_config.get("initial_balance", 0.0)) > 0
+                else None
+            ),
         )
 
         if not user_id:
@@ -9594,42 +10336,15 @@ async def verify_email(request: Request, token: str):
         # Update password hash directly (since add_user might not handle pre-hashed passwords)
         async with get_db_connection() as conn:
             await conn.execute(
-                "UPDATE USERS SET password = ? WHERE id = ?",
+                """
+                UPDATE USERS
+                SET password = ?,
+                    session_version = COALESCE(session_version, 1) + 1
+                WHERE id = ?
+                """,
                 (pending["password_hash"], user_id)
             )
             await conn.commit()
-
-        # Record initial_balance as TRANSACTION for audit trail
-        reg_initial_balance = landing_config.get("initial_balance", 0.0) if not is_user else 0.0
-        if reg_initial_balance > 0:
-            try:
-                async with get_db_connection() as conn:
-                    # Build description with source name
-                    desc = "Welcome credit"
-                    if pack_id:
-                        name_cur = await conn.execute("SELECT name FROM PACKS WHERE id = ?", (pack_id,))
-                        name_row = await name_cur.fetchone()
-                        desc = f"Welcome credit from pack: {name_row[0]}" if name_row else f"Welcome credit from pack {pack_id}"
-                    elif prompt_id:
-                        name_cur = await conn.execute("SELECT name FROM PROMPTS WHERE id = ?", (prompt_id,))
-                        name_row = await name_cur.fetchone()
-                        desc = f"Welcome credit from {name_row[0]}" if name_row else f"Welcome credit from prompt {prompt_id}"
-
-                    await conn.execute('''
-                        INSERT INTO TRANSACTIONS
-                        (user_id, type, amount, balance_before, balance_after,
-                         description, reference_id)
-                        VALUES (?, 'balance_credit', ?, 0, ?, ?, ?)
-                    ''', (
-                        user_id,
-                        reg_initial_balance,
-                        reg_initial_balance,
-                        desc,
-                        f'registration_{user_id}'
-                    ))
-                    await conn.commit()
-            except Exception as txn_err:
-                logger.warning(f"Could not record registration bonus transaction: {txn_err}")
 
         # Grant pack access if this was a pack registration
         if pack_id:
@@ -10101,9 +10816,14 @@ def build_message_after_image_delete(message_data) -> str:
     return "[image deleted]"
 
 # Helper function to delete files
-async def delete_file_variants(variants: List[Path], user_dir: Path) -> Tuple[int, int]:
-    """Deletes file variants and returns counters"""
+async def delete_file_variants(
+    variants: List[Path],
+    user_dir: Path,
+    conn: aiosqlite.Connection,
+) -> Tuple[int, int, int]:
+    """Delete safe image variants and clear their generated-media rows."""
     deleted = failed = 0
+    ledger_paths: List[Path] = []
     for variant_path in variants:
         try:
             variant_abs_path = variant_path.resolve()
@@ -10118,14 +10838,21 @@ async def delete_file_variants(variants: List[Path], user_dir: Path) -> Tuple[in
             if await aiofiles.os.path.exists(str(variant_path)):
                 await aiofiles.os.remove(str(variant_path))
                 deleted += 1
+                ledger_paths.append(variant_abs_path)
                 logging.info(f"Successfully deleted: {variant_path}")
             else:
                 logging.warning(f"File not found: {variant_path}")
                 failed += 1
+                # Clear a stale ledger row even when the physical file has
+                # already disappeared. The path passed the user-root check.
+                ledger_paths.append(variant_abs_path)
         except Exception as e:
             logging.error(f"Error deleting variant {variant_path}: {e}")
             failed += 1
-    return deleted, failed
+    ledger_rows_deleted = await storage_quota.delete_generated_file_rows(
+        conn, (str(path) for path in ledger_paths)
+    )
+    return deleted, failed, ledger_rows_deleted
 
 @app.delete("/api/delete-image/{message_id}")
 async def delete_image(
@@ -10191,7 +10918,9 @@ async def delete_image(
         for url in extract_image_urls(message_data):
             try:
                 variant_paths = process_image_path(url, user_dir)
-                deleted, failed = await delete_file_variants(variant_paths, user_dir)
+                deleted, failed, _ = await delete_file_variants(
+                    list(variant_paths), user_dir, conn
+                )
                 deleted_count += deleted
                 failed_count += failed
             except Exception as e:
@@ -10242,6 +10971,7 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
         user_dir = Path(get_user_directory(current_user.username))
         replacements_to_apply = []
         deleted_count = failed_count = 0
+        ledger_rows_deleted = 0
 
         for message in await cursor.fetchall():
             message_data = orjson.loads(message['message'])
@@ -10273,7 +11003,9 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
             for url in extract_image_urls(message_data):
                 try:
                     variant_paths = process_image_path(url, user_dir)
-                    deleted, failed = await delete_file_variants(variant_paths, user_dir)
+                    deleted, failed, ledger_deleted = await delete_file_variants(
+                        list(variant_paths), user_dir, conn
+                    )
                     if deleted > 0 and not message_deleted:
                         replacements_to_apply.append(
                             (build_message_after_image_delete(message_data), message['id'])
@@ -10281,6 +11013,7 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
                         message_deleted = True
                     deleted_count += deleted
                     failed_count += failed
+                    ledger_rows_deleted += ledger_deleted
                 except Exception as e:
                     logging.error(f"Error processing image URL {url}: {e}")
                     failed_count += 1
@@ -10290,7 +11023,7 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
                 "UPDATE MESSAGES SET message = ? WHERE id = ?",
                 replacements_to_apply
             )
-        if replacements_to_apply or deleted_count > 0:
+        if replacements_to_apply or deleted_count > 0 or ledger_rows_deleted > 0:
             await conn.commit()
             await prune_unreferenced_blobs()
 
@@ -10301,32 +11034,109 @@ async def delete_images(image_ids: List[int], current_user: User = Depends(get_c
         }
 
 @app.post("/admin/disable-cloudflare-cache")
-async def disable_cloudflare_cache(current_user: User = Depends(get_current_user)):
+async def disable_cloudflare_cache(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     if current_user is None:
         return unauthenticated_response()
 
-    if not (await current_user.is_admin or await current_user.is_user):
-        return JSONResponse(content={"error": "You do not have permission to access this action."}, status_code=403)
+    if not await is_admin(current_user.id):
+        return JSONResponse(content={"error": "Admin access required."}, status_code=403)
+
+    forwarded = request.headers.get("X-Forwarded-For")
+    request_ip = (
+        forwarded.split(",")[0].strip()
+        if forwarded
+        else (request.client.host if request.client else "unknown")
+    )
+    if not await is_elevated(current_user.id, request_ip=request_ip):
+        return JSONResponse(
+            content={
+                "error": (
+                    "Ultra Admin+ elevation is required. "
+                    "Elevate from User Management and try again."
+                ),
+                "reason": "ultra_admin_required",
+            },
+            status_code=403,
+        )
 
     try:
-        subprocess.run(["python", "cloudflare-cache-disabler.py"], check=True)
-        return {"message": "Cloudflare cache disabled successfully"}
+        await run_cloudflare_cache_disable()
+        logger.info(
+            "Cloudflare development mode enabled by admin %s",
+            current_user.id,
+        )
+        try:
+            await log_admin_action(
+                admin_id=current_user.id,
+                action_type="cloudflare_cache_disabled",
+                request=request,
+                details="Cloudflare development mode enabled",
+            )
+        except Exception as audit_error:
+            logger.warning(
+                "Could not audit Cloudflare maintenance: %s",
+                audit_error,
+            )
+        return {
+            "success": True,
+            "message": "Cloudflare cache disabled successfully",
+        }
     except subprocess.CalledProcessError:
         raise HTTPException(status_code=500, detail="Error disabling Cloudflare cache")
+    except MaintenanceTaskBusy:
+        raise HTTPException(
+            status_code=409,
+            detail="Cloudflare cache maintenance is already running.",
+        )
+    except MaintenanceTaskTimedOut:
+        raise HTTPException(
+            status_code=504,
+            detail="Cloudflare cache maintenance timed out.",
+        )
 
 @app.post("/admin/clear-audio-cache")
-async def clear_audio_cache(time_arg: dict, current_user: User = Depends(get_current_user)):
+async def clear_audio_cache(
+    request: Request,
+    time_arg: dict,
+    current_user: User = Depends(get_current_user),
+):
     if current_user is None:
         return unauthenticated_response()
 
-    if not (await current_user.is_admin or await current_user.is_user):
-        return JSONResponse(content={"error": "You do not have permission to access this action."}, status_code=403)
+    if not await is_admin(current_user.id):
+        return JSONResponse(content={"error": "Admin access required."}, status_code=403)
 
     try:
-        subprocess.run(["python", "clear-audio-cache.py", time_arg["time_arg"]], check=True)
-        return {"message": "Audio cache cleared successfully"}
+        requested_age = time_arg.get("time_arg")
+        await run_audio_cache_cleanup(requested_age)
+        logger.info("Audio cache cleared by admin %s", current_user.id)
+        try:
+            await log_admin_action(
+                admin_id=current_user.id,
+                action_type="audio_cache_cleared",
+                request=request,
+                details=f"Cache age threshold: {requested_age}",
+            )
+        except Exception as audit_error:
+            logger.warning("Could not audit audio maintenance: %s", audit_error)
+        return {"success": True, "message": "Audio cache cleared successfully"}
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except subprocess.CalledProcessError:
         raise HTTPException(status_code=500, detail="Error clearing audio cache")
+    except MaintenanceTaskBusy:
+        raise HTTPException(
+            status_code=409,
+            detail="Audio cache maintenance is already running.",
+        )
+    except MaintenanceTaskTimedOut:
+        raise HTTPException(
+            status_code=504,
+            detail="Audio cache maintenance timed out.",
+        )
 
 
 @app.post("/admin/toggle-captcha")
@@ -10778,6 +11588,305 @@ async def update_pricing_config(request: Request, current_user: User = Depends(g
 
 
 # =============================================================================
+# Storage Quotas (per-user storage limits)
+# =============================================================================
+
+# The admin JSON API speaks bytes with the key "default_quota_bytes"; the value
+# is persisted under the SYSTEM_CONFIG key "storage_quota_default_bytes".
+STORAGE_QUOTA_CONFIG_KEY = "storage_quota_default_bytes"
+STORAGE_QUOTA_CONFIG_DESCRIPTION = "Default per-user storage quota in bytes (0 = unlimited)"
+
+
+async def _storage_quota_uploads_by_user(conn):
+    """Per-user upload usage (dedupe-aware) as {user_id: bytes} via one GROUP BY.
+
+    Sums each blob once per distinct (user_id, blob_id) pair so the same file
+    re-uploaded by one user counts once, while each distinct user holding it is
+    charged fully. Returns an empty dict when the FILE_* tables do not exist yet
+    (fresh DB where nobody has uploaded), matching storage_quota's handling.
+    """
+    try:
+        cursor = await conn.execute(
+            """
+            SELECT du.user_id, COALESCE(SUM(fb.size_bytes), 0) AS uploads_bytes
+            FROM (
+                SELECT DISTINCT user_id, blob_id
+                FROM FILE_ATTACHMENTS
+                WHERE status IN ('pending', 'active')
+            ) du
+            JOIN FILE_BLOBS fb ON fb.id = du.blob_id
+            GROUP BY du.user_id
+            """
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return {}
+        raise
+    rows = await cursor.fetchall()
+    return {int(row[0]): int(row[1]) for row in rows}
+
+
+async def _storage_quota_generated_by_user(conn):
+    """Per-user generated-media usage as {user_id: bytes} via one GROUP BY."""
+    cursor = await conn.execute(
+        "SELECT user_id, COALESCE(SUM(size_bytes), 0) FROM GENERATED_MEDIA_FILES GROUP BY user_id"
+    )
+    rows = await cursor.fetchall()
+    return {int(row[0]): int(row[1]) for row in rows}
+
+
+@app.get("/admin/storage-quotas", response_class=HTMLResponse)
+async def admin_storage_quotas_page(request: Request, current_user: User = Depends(get_current_user)):
+    """Admin page for per-user storage quotas and the global default."""
+    if current_user is None:
+        return RedirectResponse(url="/login", status_code=303)
+    if not await current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    context = await get_template_context(request, current_user)
+    return templates.TemplateResponse("admin_storage_quotas.html", context)
+
+
+@app.get("/api/admin/storage-quotas/config")
+async def get_storage_quota_config(current_user: User = Depends(get_current_user)):
+    """Return the global default quota in bytes (0 = unlimited)."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
+    async with get_db_connection(readonly=True) as conn:
+        default_quota_bytes = await storage_quota.get_default_quota_bytes(conn)
+    return JSONResponse(content={"success": True, "default_quota_bytes": default_quota_bytes})
+
+
+@app.put("/api/admin/storage-quotas/config")
+async def update_storage_quota_config(request: Request, current_user: User = Depends(get_current_user)):
+    """Update the global default quota (bytes, integer >= 0; 0 = unlimited)."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
+
+    data = await request.json()
+    if not isinstance(data, dict) or "default_quota_bytes" not in data:
+        return JSONResponse(status_code=400, content={"success": False, "message": "Missing default_quota_bytes"})
+    raw = data["default_quota_bytes"]
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return JSONResponse(status_code=400, content={"success": False, "message": "default_quota_bytes must be an integer >= 0"})
+    try:
+        new_value = int(raw)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"success": False, "message": "default_quota_bytes must be an integer >= 0"})
+    if new_value < 0 or new_value > storage_quota.MAX_QUOTA_BYTES:
+        return JSONResponse(status_code=400, content={"success": False, "message": "default_quota_bytes must be an integer >= 0"})
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT value FROM SYSTEM_CONFIG WHERE key = ?", (STORAGE_QUOTA_CONFIG_KEY,)
+        )
+        old_row = await cursor.fetchone()
+        old_value = old_row[0] if old_row else None
+        await conn.execute(
+            """
+            INSERT INTO SYSTEM_CONFIG (key, value, description, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (STORAGE_QUOTA_CONFIG_KEY, str(new_value), STORAGE_QUOTA_CONFIG_DESCRIPTION),
+        )
+        await conn.commit()
+
+    await log_admin_action(
+        admin_id=current_user.id,
+        action_type="storage_quota_default_updated",
+        request=request,
+        details=f"Default storage quota changed from {old_value} to {new_value} bytes by '{current_user.username}'",
+    )
+    return JSONResponse(content={"success": True, "default_quota_bytes": new_value})
+
+
+@app.get("/api/admin/storage-quotas/users")
+async def get_storage_quota_users(
+    search: str = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+):
+    """Per-user storage usage rows, ordered by total usage desc.
+
+    Usage is computed with two GROUP BY queries (uploads, generated) merged in
+    Python against a single overrides query -- never N+1 per-user queries.
+    percent is null for unlimited (quota 0), else total/quota*100 (1 decimal).
+    """
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    if limit < 1:
+        limit = 1
+    elif limit > 500:
+        limit = 500
+
+    async with get_db_connection(readonly=True) as conn:
+        default_quota_bytes = await storage_quota.get_default_quota_bytes(conn)
+        uploads_by_user = await _storage_quota_uploads_by_user(conn)
+        generated_by_user = await _storage_quota_generated_by_user(conn)
+
+        cursor = await conn.execute(
+            "SELECT user_id, storage_quota_bytes FROM USER_DETAILS WHERE storage_quota_bytes IS NOT NULL"
+        )
+        overrides = {int(row[0]): int(row[1]) for row in await cursor.fetchall()}
+
+        if search and search.strip():
+            cursor = await conn.execute(
+                "SELECT id, username FROM USERS WHERE LOWER(username) LIKE ?",
+                (f"%{search.strip().lower()}%",),
+            )
+        else:
+            cursor = await conn.execute("SELECT id, username FROM USERS")
+        user_rows = await cursor.fetchall()
+
+    results = []
+    for row in user_rows:
+        user_id = int(row[0])
+        username = row[1]
+        uploads_bytes = uploads_by_user.get(user_id, 0)
+        generated_bytes = generated_by_user.get(user_id, 0)
+        total_bytes = uploads_bytes + generated_bytes
+        is_override = user_id in overrides
+        quota_bytes = overrides[user_id] if is_override else default_quota_bytes
+        percent = None if quota_bytes == 0 else round(total_bytes / quota_bytes * 100, 1)
+        results.append({
+            "user_id": user_id,
+            "username": username,
+            "uploads_bytes": uploads_bytes,
+            "generated_bytes": generated_bytes,
+            "total_bytes": total_bytes,
+            "quota_bytes": quota_bytes,
+            "is_override": is_override,
+            "percent": percent,
+        })
+
+    results.sort(key=lambda r: r["total_bytes"], reverse=True)
+    results = results[:limit]
+    return JSONResponse(content={"success": True, "users": results})
+
+
+@app.put("/api/admin/storage-quotas/users/{user_id}")
+async def update_storage_quota_user(user_id: int, request: Request, current_user: User = Depends(get_current_user)):
+    """Set or clear a per-user quota override (bytes >= 0, or null to clear)."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
+
+    data = await request.json()
+    if not isinstance(data, dict) or "quota_bytes" not in data:
+        return JSONResponse(status_code=400, content={"success": False, "message": "Missing quota_bytes"})
+    raw = data["quota_bytes"]
+    if raw is None:
+        new_value = None
+    else:
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            return JSONResponse(status_code=400, content={"success": False, "message": "quota_bytes must be an integer >= 0 or null"})
+        try:
+            new_value = int(raw)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"success": False, "message": "quota_bytes must be an integer >= 0 or null"})
+        if new_value < 0 or new_value > storage_quota.MAX_QUOTA_BYTES:
+            return JSONResponse(status_code=400, content={"success": False, "message": "quota_bytes must be an integer >= 0 or null"})
+
+    async with get_db_connection() as conn:
+        cursor = await conn.execute(
+            "SELECT storage_quota_bytes FROM USER_DETAILS WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"success": False, "message": "User not found"})
+        old_value = int(row[0]) if row[0] is not None else None
+        await conn.execute(
+            "UPDATE USER_DETAILS SET storage_quota_bytes = ? WHERE user_id = ?",
+            (new_value, user_id),
+        )
+        await conn.commit()
+
+    await log_admin_action(
+        admin_id=current_user.id,
+        action_type="storage_quota_override_updated",
+        request=request,
+        target_user_id=user_id,
+        details=f"Storage quota override changed from {old_value} to {new_value} bytes by '{current_user.username}'",
+    )
+    return JSONResponse(content={"success": True, "user_id": user_id, "quota_bytes": new_value})
+
+
+@app.get("/api/admin/storage-quotas/stats")
+async def get_storage_quota_stats(current_user: User = Depends(get_current_user)):
+    """Global storage statistics (GROUP BY aggregation, no N+1)."""
+    if current_user is None:
+        return unauthenticated_response()
+    if not await current_user.is_admin:
+        return JSONResponse(status_code=403, content={"success": False, "message": "Admin access required"})
+
+    async with get_db_connection(readonly=True) as conn:
+        default_quota_bytes = await storage_quota.get_default_quota_bytes(conn)
+        uploads_by_user = await _storage_quota_uploads_by_user(conn)
+        generated_by_user = await _storage_quota_generated_by_user(conn)
+
+        # Physical disk. Upload blobs and their thumbnails (variants) live in the
+        # FILE_* tables, which are runtime-created and may be absent on a fresh DB.
+        try:
+            cursor = await conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM FILE_BLOBS")
+            physical_blob_total = int((await cursor.fetchone())[0])
+            cursor = await conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM FILE_BLOB_VARIANTS")
+            physical_variants_total = int((await cursor.fetchone())[0])
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                physical_blob_total = 0
+                physical_variants_total = 0
+            else:
+                raise
+
+        cursor = await conn.execute("SELECT user_id, storage_quota_bytes FROM USER_DETAILS")
+        detail_rows = await cursor.fetchall()
+
+    # Logical charged bytes: uploads (dedupe-aware per user) + generated (1:1).
+    uploads_logical_total = sum(uploads_by_user.values())
+    generated_total = sum(generated_by_user.values())
+    logical_total = uploads_logical_total + generated_total
+    # Only uploads can dedupe; generated media is physical 1:1.
+    dedupe_savings = uploads_logical_total - physical_blob_total
+
+    users_over_80 = 0
+    users_over_100 = 0
+    for row in detail_rows:
+        user_id = int(row[0])
+        override = row[1]
+        effective_quota = int(override) if override is not None else default_quota_bytes
+        if effective_quota == 0:
+            continue  # unlimited quota never counts toward over-threshold tallies
+        total_bytes = uploads_by_user.get(user_id, 0) + generated_by_user.get(user_id, 0)
+        if total_bytes >= effective_quota:
+            users_over_100 += 1
+        if total_bytes >= 0.8 * effective_quota:
+            users_over_80 += 1
+
+    return JSONResponse(content={
+        "success": True,
+        "logical_total": logical_total,
+        "physical_blob_total": physical_blob_total,
+        "physical_variants_total": physical_variants_total,
+        "generated_total": generated_total,
+        "dedupe_savings": dedupe_savings,
+        "users_over_80": users_over_80,
+        "users_over_100": users_over_100,
+    })
+
+
+# =============================================================================
 # Home Page Backend - API endpoints and welcome file system
 # =============================================================================
 
@@ -10863,6 +11972,20 @@ async def _get_pack_info_for_path(pack_id: int) -> dict:
         return None
 
 
+async def _require_welcome_access(current_user: User, entity_type: str, entity_id: int) -> None:
+    """Apply the same access policy to welcome HTML and its static assets."""
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.cursor()
+        if entity_type == "pack":
+            allowed = await can_user_access_pack(current_user, entity_id, cursor)
+        else:
+            allowed = await can_user_access_prompt(current_user, entity_id, cursor)
+
+    if not allowed:
+        # Missing and inaccessible worlds deliberately have the same response.
+        raise HTTPException(status_code=404, detail="Welcome resource not found")
+
+
 @app.get("/home/static/{world_tag}/{path:path}")
 async def serve_welcome_static_scoped(
     world_tag: str,
@@ -10887,6 +12010,9 @@ async def serve_welcome_static_scoped(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid world tag")
 
+        entity_type = 'prompt' if world_tag[0] == 'p' else 'pack'
+        await _require_welcome_access(current_user, entity_type, entity_id)
+
         # Resolve filesystem path
         if world_tag[0] == 'p':
             info = await get_prompt_info(entity_id)
@@ -10902,16 +12028,15 @@ async def serve_welcome_static_scoped(
         if not entity_path:
             raise HTTPException(status_code=404, detail="Entity not found")
 
-        welcome_static_dir = os.path.join(str(entity_path), "welcome", "static")
-        file_path = os.path.join(welcome_static_dir, path)
+        welcome_static_dir = Path(entity_path, "welcome", "static").resolve()
+        real_file = (welcome_static_dir / path).resolve()
 
-        # Security: ensure the resolved path is within the welcome static directory
-        real_file = os.path.realpath(file_path)
-        real_static_dir = os.path.realpath(welcome_static_dir)
-        if not real_file.startswith(real_static_dir):
+        # Path-aware containment also blocks similarly-prefixed sibling folders
+        # and symlinks that resolve outside the world's static directory.
+        if not real_file.is_relative_to(welcome_static_dir):
             raise HTTPException(status_code=403, detail="Access denied")
 
-        if not os.path.isfile(real_file):
+        if not real_file.is_file():
             raise HTTPException(status_code=404, detail="File not found")
 
         return FileResponse(real_file)
@@ -10938,15 +12063,7 @@ async def welcome_page(request: Request, entity_type: str, entity_id: int,
         return RedirectResponse(url="/login")
     if entity_type not in ("prompt", "pack"):
         raise HTTPException(status_code=404)
-    # Validate access using authoritative helpers
-    async with get_db_connection(readonly=True) as conn:
-        cursor = await conn.cursor()
-        if entity_type == "pack":
-            if not await can_user_access_pack(current_user, entity_id, cursor):
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            if not await can_user_access_prompt(current_user, entity_id, cursor):
-                raise HTTPException(status_code=403, detail="Access denied")
+    await _require_welcome_access(current_user, entity_type, entity_id)
     # Build and serve
     world = await build_world(entity_type, entity_id)
     if not world:

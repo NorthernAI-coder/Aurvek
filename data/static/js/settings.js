@@ -97,12 +97,14 @@
         if (days !== 'all') params.append('days', days);
 
         try {
-            const response = await fetch('/api/my-usage?' + params.toString());
-            if (!response.ok) throw new Error('Failed to load data');
+            const fetcher = typeof secureFetch === 'function' ? secureFetch : fetch;
+            const response = await fetcher('/api/my-usage?' + params.toString(), { credentials: 'include' });
+            if (!response || !response.ok) throw new Error('Failed to load data');
             const data = await response.json();
 
             updateBalance(data.balance);
             updateStats(data.stats);
+            updateStorage(data.storage);
             updateUsageByType(data.by_type);
             updateChart(data.daily);
             updateDailyBreakdown(data.daily);
@@ -126,6 +128,64 @@
         setEl('statTokensBreakdown', formatNumber(stats.tokens_in || 0) + ' in / ' + formatNumber(stats.tokens_out || 0) + ' out');
         setEl('statCost', '$' + (stats.total_cost || 0).toFixed(2));
         setEl('statAvgDaily', '$' + (stats.avg_daily || 0).toFixed(2));
+    }
+
+    // --- Storage quota card (fed by the `storage` object in /api/my-usage) ---
+    const GB_BYTES = 1024 * 1024 * 1024;
+
+    function formatStorageBytes(bytes) {
+        const value = Math.max(0, Number(bytes) || 0);
+        if (value >= GB_BYTES) return (value / GB_BYTES).toFixed(1) + ' GB';
+        if (value >= 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + ' MB';
+        if (value >= 1024) return (value / 1024).toFixed(1) + ' KB';
+        return Math.round(value) + ' B';
+    }
+
+    function updateStorage(storage) {
+        const card = document.getElementById('storageCard');
+        if (!card) return;
+        if (!storage || typeof storage.used_bytes !== 'number') {
+            // Older cached response without storage data: keep the card hidden.
+            card.classList.add('d-none');
+            return;
+        }
+
+        const amount = document.getElementById('storageAmount');
+        const bar = document.getElementById('storageBar');
+        const fill = document.getElementById('storageBarFill');
+        const breakdown = document.getElementById('storageBreakdown');
+        const used = storage.used_bytes || 0;
+        const quota = storage.quota_bytes || 0;
+
+        card.classList.remove('d-none', 'info', 'success', 'warning', 'danger');
+        breakdown.textContent = 'Uploads ' + formatStorageBytes(storage.uploads_bytes || 0) +
+            ' - Generated ' + formatStorageBytes(storage.generated_bytes || 0);
+
+        if (quota === 0) {
+            // Unlimited quota: used bytes only, no bar, no "of".
+            amount.textContent = formatStorageBytes(used);
+            card.classList.add('info');
+            bar.classList.add('d-none');
+            return;
+        }
+
+        const percent = (used / quota) * 100;
+        const clamped = Math.max(0, Math.min(100, percent));
+        amount.textContent = formatStorageBytes(used) + ' of ' + (quota / GB_BYTES).toFixed(1) + ' GB';
+        bar.classList.remove('d-none');
+        bar.setAttribute('aria-valuenow', String(Math.round(clamped)));
+        bar.setAttribute('aria-label', 'Storage usage ' + percent.toFixed(1) + '%');
+        fill.style.width = clamped + '%';
+        fill.classList.remove('warn', 'danger');
+        if (percent >= 95) {
+            fill.classList.add('danger');
+            card.classList.add('danger');
+        } else if (percent >= 80) {
+            fill.classList.add('warn');
+            card.classList.add('warning');
+        } else {
+            card.classList.add('success');
+        }
     }
 
     function updateUsageByType(byType) {

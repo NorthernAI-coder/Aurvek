@@ -246,6 +246,7 @@ async def landing_config(
             "name": prompt_info["name"],
             "public_id": public_id,
         }
+        wizard_available, _ = is_claude_available()
 
         context = await get_template_context(request, current_user)
         context.update(
@@ -260,6 +261,7 @@ async def landing_config(
                 "cname_target": CNAME_TARGET,
                 "slot_price": SLOT_PRICE,
                 "user_slots": user_slots,
+                "wizard_available": wizard_available,
             }
         )
         return templates.TemplateResponse("landing_config.html", context)
@@ -615,7 +617,20 @@ async def set_landing_geo(
 async def _run_security_check(text: str, *, prompt_id: int, label: str):
     try:
         security_result = await check_security(text)
-        if security_result["checked"] and not security_result["allowed"]:
+        if not security_result.get("checked"):
+            logger.error(
+                f"Security Guard unavailable for {label} on prompt {prompt_id}: "
+                f"{security_result.get('reason', 'unknown error')}"
+            )
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": "AI Wizard security check is temporarily unavailable",
+                    "error_code": "SECURITY_GUARD_UNAVAILABLE",
+                },
+                status_code=503,
+            )
+        if not security_result["allowed"]:
             logger.warning(
                 f"Security Guard BLOCKED {label} for prompt {prompt_id}: "
                 f"Threat level: {security_result['threat_level']}, "
@@ -633,7 +648,15 @@ async def _run_security_check(text: str, *, prompt_id: int, label: str):
                 status_code=403,
             )
     except Exception as e:
-        logger.error(f"Security Guard check error (allowing request): {e}")
+        logger.error(f"Security Guard check error (blocking request): {e}")
+        return JSONResponse(
+            {
+                "success": False,
+                "message": "AI Wizard security check is temporarily unavailable",
+                "error_code": "SECURITY_GUARD_UNAVAILABLE",
+            },
+            status_code=503,
+        )
     return None
 
 
@@ -654,8 +677,8 @@ async def generate_landing_with_wizard(
         return JSONResponse(
             {
                 "success": False,
-                "message": "AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex (PowerShell). Docs: https://code.claude.com/docs/en/setup",
-                "error_code": "CLAUDE_NOT_FOUND",
+                "message": "AI Wizard is disabled until a verified OS sandbox is configured.",
+                "error_code": "WIZARD_SANDBOX_UNAVAILABLE",
             },
             status_code=503,
         )
@@ -905,8 +928,8 @@ async def modify_landing_with_wizard(
         return JSONResponse(
             {
                 "success": False,
-                "message": "AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex (PowerShell). Docs: https://code.claude.com/docs/en/setup",
-                "error_code": "CLAUDE_NOT_FOUND",
+                "message": "AI Wizard is disabled until a verified OS sandbox is configured.",
+                "error_code": "WIZARD_SANDBOX_UNAVAILABLE",
             },
             status_code=503,
         )
@@ -1090,8 +1113,8 @@ async def generate_welcome_with_wizard(
         return JSONResponse(
             {
                 "success": False,
-                "message": "AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex (PowerShell). Docs: https://code.claude.com/docs/en/setup",
-                "error_code": "CLAUDE_NOT_FOUND",
+                "message": "AI Wizard is disabled until a verified OS sandbox is configured.",
+                "error_code": "WIZARD_SANDBOX_UNAVAILABLE",
             },
             status_code=503,
         )
@@ -1233,8 +1256,8 @@ async def modify_welcome_with_wizard(
         return JSONResponse(
             {
                 "success": False,
-                "message": "AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex (PowerShell). Docs: https://code.claude.com/docs/en/setup",
-                "error_code": "CLAUDE_NOT_FOUND",
+                "message": "AI Wizard is disabled until a verified OS sandbox is configured.",
+                "error_code": "WIZARD_SANDBOX_UNAVAILABLE",
             },
             status_code=503,
         )
@@ -1688,9 +1711,6 @@ async def list_components(
         components_dir = get_prompt_components_dir(prompt_id, prompt_info)
         css_dir = os.path.join(base_dir, "static", "css")
         js_dir = os.path.join(base_dir, "static", "js")
-
-        logger.info(f"css_dir: {css_dir}")
-        logger.info(f"js_dir: {js_dir}")
 
         def list_files(directory, extension):
             if os.path.exists(directory):

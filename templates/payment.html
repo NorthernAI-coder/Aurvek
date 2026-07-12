@@ -153,15 +153,15 @@
                 </div>
             </div>
 
-            <!-- Discount Code -->
+            <!-- Fixed Wallet Credit Code -->
             <div class="mb-3">
-                <label for="discount_code" class="form-label">Discount Code (optional)</label>
+                <label for="discount_code" class="form-label">Wallet Credit Code (optional)</label>
                 <div class="input-group">
                     <span class="input-group-text input-group-text-themed">
                         <i class="fas fa-tag"></i>
                     </span>
                     <input type="text" class="form-control" id="discount_code" name="discount_code"
-                           placeholder="Enter discount code">
+                           placeholder="Enter wallet credit code">
                     <button type="button" class="btn btn-secondary" onclick="applyDiscount()" id="applyBtn">
                         <i class="fas fa-check me-1"></i> Apply
                     </button>
@@ -180,7 +180,7 @@
             <div id="original-price-display" class="original-price" style="display: none;"></div>
             <div class="amount">$<span id="final-price-display">0.00</span></div>
             <div id="discount-badge" class="discount-badge" style="display: none;">
-                <i class="fas fa-percent me-1"></i><span id="discount-percent"></span>% OFF
+                <i class="fas fa-gift me-1"></i><span id="discount-label"></span>
             </div>
         </div>
 
@@ -199,9 +199,7 @@
 {% block scripts_inline %}
 <script>
     let finalAmount = 0;
-    let originalAmount = 0;
     let discountApplied = false;
-    let appliedDiscountCode = '';
 
     // Set amount from preset buttons
     function setAmount(value) {
@@ -226,7 +224,6 @@
     function updatePriceDisplay() {
         const amount = parseFloat(document.getElementById('amount').value) || 0;
         finalAmount = amount;
-        originalAmount = amount;
 
         document.getElementById('final-price-display').textContent = amount.toFixed(2);
         document.getElementById('original-price-display').style.display = 'none';
@@ -241,25 +238,17 @@
     // Reset discount
     function resetDiscount() {
         discountApplied = false;
-        appliedDiscountCode = '';
         document.getElementById('discount-message').style.display = 'none';
     }
 
-    // Apply discount code
+    // Validate and redeem a fixed wallet credit code
     async function applyDiscount() {
         const discountCode = document.getElementById('discount_code').value.trim();
-        const amount = parseFloat(document.getElementById('amount').value);
         const applyBtn = document.getElementById('applyBtn');
         const messageDiv = document.getElementById('discount-message');
 
         if (!discountCode) {
             messageDiv.innerHTML = '<span class="text-warning"><i class="fas fa-exclamation-triangle me-1"></i>Please enter a discount code</span>';
-            messageDiv.style.display = 'block';
-            return;
-        }
-
-        if (isNaN(amount) || amount < 5 || amount > 500) {
-            messageDiv.innerHTML = '<span class="text-danger"><i class="fas fa-times-circle me-1"></i>Please enter a valid amount between $5 and $500</span>';
             messageDiv.style.display = 'block';
             return;
         }
@@ -270,7 +259,6 @@
         try {
             const formData = new URLSearchParams();
             formData.append('discount_code', discountCode);
-            formData.append('amount', amount);
 
             const response = await fetch('/apply-discount', {
                 method: 'POST',
@@ -280,28 +268,24 @@
 
             const data = await response.json();
 
-            if (data.success) {
-                finalAmount = data.newPrice;
-                originalAmount = data.originalAmount;
+            if (response.ok && data.success) {
+                const walletGrantAmount = Number(data.walletGrantAmount);
+                if (!Number.isFinite(walletGrantAmount)) {
+                    throw new Error('Invalid wallet credit response');
+                }
+                finalAmount = 0;
                 discountApplied = true;
-                appliedDiscountCode = discountCode;
 
                 // Update display
-                document.getElementById('original-price-display').textContent = '$' + originalAmount.toFixed(2);
-                document.getElementById('original-price-display').style.display = 'block';
-                document.getElementById('final-price-display').textContent = finalAmount.toFixed(2);
-
-                const discountPercent = Math.round((1 - finalAmount / originalAmount) * 100);
-                document.getElementById('discount-percent').textContent = discountPercent;
+                document.getElementById('original-price-display').style.display = 'none';
+                document.getElementById('final-price-display').textContent = '0.00';
+                document.getElementById('discount-label').textContent = '$' + walletGrantAmount.toFixed(2) + ' FREE CREDIT';
                 document.getElementById('discount-badge').style.display = 'inline-block';
 
-                messageDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle me-1"></i>Discount applied successfully!</span>';
+                messageDiv.innerHTML = '<span class="text-success"><i class="fas fa-check-circle me-1"></i>$' + walletGrantAmount.toFixed(2) + ' wallet credit available. Applying it now...</span>';
                 messageDiv.style.display = 'block';
 
-                // If 100% discount, process immediately
-                if (finalAmount === 0) {
-                    processFreePurchase(discountCode);
-                }
+                await processFreePurchase(discountCode);
             } else {
                 messageDiv.innerHTML = '<span class="text-danger"><i class="fas fa-times-circle me-1"></i>' + (data.message || 'Invalid discount code') + '</span>';
                 messageDiv.style.display = 'block';
@@ -316,24 +300,22 @@
         applyBtn.innerHTML = '<i class="fas fa-check me-1"></i> Apply';
     }
 
-    // Process free purchase (100% discount)
+    // Redeem the fixed server-defined wallet credit
     async function processFreePurchase(discountCode) {
         try {
             const response = await fetch('/api/payment/free-credit', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    originalAmount: originalAmount,
-                    finalAmount: 0,
                     discount_code: discountCode
                 })
             });
 
+            const data = await response.json();
             if (response.ok) {
-                const data = await response.json();
                 window.location.href = data.redirectUrl;
             } else {
-                throw new Error('Server error');
+                throw new Error(data.detail || 'Server error');
             }
         } catch (error) {
             console.error('Error:', error);
@@ -351,7 +333,7 @@
             return;
         }
 
-        // If 100% discount, already handled
+        // A wallet credit is redeemed separately and never becomes a Stripe amount.
         if (finalAmount === 0) {
             return;
         }
@@ -365,18 +347,15 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    amount: discountApplied ? originalAmount : amount,
-                    discount_code: appliedDiscountCode || ''
+                    amount: amount,
+                    discount_code: ''
                 })
             });
 
             const data = await response.json();
 
             if (response.ok) {
-                if (data.free_purchase) {
-                    // 100% discount - process without Stripe
-                    await processFreePurchase(appliedDiscountCode);
-                } else if (data.url) {
+                if (data.url) {
                     // Redirect to Stripe Checkout
                     window.location.href = data.url;
                 } else {

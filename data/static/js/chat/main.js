@@ -388,6 +388,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     nameSpan.textContent = file.name;
                     pdfPreview.appendChild(iconSpan);
                     pdfPreview.appendChild(nameSpan);
+                    trackAttachmentPreview(file, pdfPreview);
                     imagePreviews.appendChild(pdfPreview);
                     attachedFiles.push(file);
                 } else if (isTextFile(file)) {
@@ -401,6 +402,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     name.textContent = file.name;
                     previewItem.appendChild(icon);
                     previewItem.appendChild(name);
+                    trackAttachmentPreview(file, previewItem);
                     imagePreviews.appendChild(previewItem);
                     attachedFiles.push(file);
                 } else if (file.type.startsWith('image/')) {
@@ -409,9 +411,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
                     const reader = new FileReader();
                     reader.onload = function(e) {
+                        if (!attachmentIsStillQueued(processed)) return;
                         const img = document.createElement('img');
                         img.src = e.target.result;
                         img.className = 'preview-image';
+                        trackAttachmentPreview(processed, img);
                         imagePreviews.appendChild(img);
                     };
                     reader.readAsDataURL(processed);

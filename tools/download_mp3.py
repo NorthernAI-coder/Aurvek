@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from tools.tts import process_text_for_tts, insert_tts_break, get_tts_generator
 from tools.tts_config import get_tts_profile, format_to_pydub
 from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, elevenlabs_key, openai_key, tts_engine, get_balance, deduct_balance, load_service_costs
+from database import get_db_connection
+from storage_quota import record_generated_file
 
 # Logging Configuration
 logger = logging.getLogger(__name__)
@@ -109,3 +111,24 @@ async def generate_and_save_mp3(conversation_id: int, user_id: int, is_admin: bo
             logger.debug(f"MP3 saved successfully at {mp3_file_path} for conversation_id: {conversation_id}")
         except Exception as e:
             logger.error(f"Error saving MP3: {e}")
+            return
+
+        # Ledger the export so it counts against the owner's storage quota (one
+        # row per file on disk). Fail fast: written first, ledgered immediately
+        # after -- if the ledger insert fails we delete the file and re-raise so
+        # an unaccounted artifact never exists. BASE_DIR carries a ".." segment,
+        # so the path is resolved before it reaches the ledger normalizer.
+        mp3_size_bytes = os.path.getsize(mp3_file_path)
+        try:
+            async with get_db_connection() as conn:
+                await record_generated_file(
+                    conn, conversation_id, 'mp3', os.path.abspath(mp3_file_path), mp3_size_bytes
+                )
+                await conn.commit()
+        except Exception:
+            if os.path.exists(mp3_file_path):
+                try:
+                    os.remove(mp3_file_path)
+                except OSError:
+                    logger.warning("Could not remove unaccounted MP3 file at %s", mp3_file_path)
+            raise

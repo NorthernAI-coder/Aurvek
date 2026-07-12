@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 
@@ -12,11 +13,22 @@ from file_storage import clone_attachments_for_branch, ensure_file_storage_schem
 from log_config import logger
 from models import User
 from prompts import can_user_access_prompt
+from storage_quota import StorageQuotaExceededError, ensure_known_growth_fits
 
 from chat.schemas import BranchConversationRequest
 from chat.services.privacy import ensure_conversation_privacy_schema
 
 router = APIRouter()
+
+
+def _directory_size_bytes(path: str) -> int:
+    total = 0
+    if not os.path.isdir(path):
+        return total
+    for root, _, filenames in os.walk(path):
+        for filename in filenames:
+            total += os.path.getsize(os.path.join(root, filename))
+    return total
 
 
 @router.post("/api/conversations/{conversation_id}/rollback")
@@ -116,6 +128,29 @@ async def branch_conversation(
             if not await cursor.fetchone():
                 raise HTTPException(status_code=400, detail="Invalid folder_id")
 
+        # Branching physically copies the source media tree. Its incremental
+        # size is known, so enforce a hard byte limit before any branch writes.
+        hash_prefix1, hash_prefix2, user_hash = generate_user_hash(
+            current_user.username
+        )
+        old_conv_str = f"{conversation_id:07d}"
+        src_dir = os.path.join(
+            users_directory,
+            hash_prefix1,
+            hash_prefix2,
+            user_hash,
+            "files",
+            old_conv_str[:3],
+            old_conv_str[3:],
+        )
+        branch_size_bytes = await asyncio.to_thread(_directory_size_bytes, src_dir)
+        try:
+            await ensure_known_growth_fits(
+                conn, current_user.id, branch_size_bytes
+            )
+        except StorageQuotaExceededError as quota_exc:
+            raise HTTPException(status_code=413, detail=quota_exc.message)
+
         branch_name = f"{source_chat_name} (branch)" if source_chat_name else None
 
         await cursor.execute(
@@ -137,6 +172,17 @@ async def branch_conversation(
             ),
         )
         new_conv_id = (await cursor.fetchone())[0]
+
+        # INSERT above serializes concurrent branch writers. Re-check inside
+        # that write transaction so two requests that passed the optimistic
+        # pre-check cannot both consume the same remaining quota.
+        try:
+            await ensure_known_growth_fits(
+                conn, current_user.id, branch_size_bytes
+            )
+        except StorageQuotaExceededError as quota_exc:
+            await conn.rollback()
+            raise HTTPException(status_code=413, detail=quota_exc.message)
 
         await ensure_file_storage_schema(conn)
         await cursor.execute(
@@ -186,12 +232,17 @@ async def branch_conversation(
                     (rewritten_message, new_message_id),
                 )
 
-        hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
-        old_conv_str = f"{conversation_id:07d}"
         new_conv_str = f"{new_conv_id:07d}"
 
-        src_dir = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "files", old_conv_str[:3], old_conv_str[3:])
-        dst_dir = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "files", new_conv_str[:3], new_conv_str[3:])
+        dst_dir = os.path.join(
+            users_directory,
+            hash_prefix1,
+            hash_prefix2,
+            user_hash,
+            "files",
+            new_conv_str[:3],
+            new_conv_str[3:],
+        )
 
         try:
             if os.path.exists(src_dir):
@@ -205,6 +256,22 @@ async def branch_conversation(
                     WHERE conversation_id = ? AND message LIKE ?
                     """,
                     (old_path_segment, new_path_segment, new_conv_id, f"%{old_path_segment}%"),
+                )
+                # Clone the source conversation's generated-media ledger rows onto
+                # the new branch, rewriting the conversation path segment the same
+                # way the message paths were rewritten above. This runs inside the
+                # branch transaction, so the rmtree rollback below also discards
+                # these rows if the commit fails. rel_path is canonical (no
+                # "users/" prefix), so its conversation segment is exactly
+                # "files/{c1}/{c2}" -- the same old/new segments used for messages.
+                await cursor.execute(
+                    """
+                    INSERT INTO GENERATED_MEDIA_FILES (user_id, conversation_id, kind, rel_path, size_bytes)
+                    SELECT user_id, ?, kind, REPLACE(rel_path, ?, ?), size_bytes
+                    FROM GENERATED_MEDIA_FILES
+                    WHERE conversation_id = ?
+                    """,
+                    (new_conv_id, old_path_segment, new_path_segment, conversation_id),
                 )
             await conn.commit()
         except Exception:

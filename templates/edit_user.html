@@ -74,19 +74,21 @@
                     <div class="flex-column">
                         <div class="mb-3">
                             <label for="new_username" class="form-label">Username</label>
-                            <input type="text" class="form-control" id="new_username" name="new_username" value="{{ user_data.username }}" required>
+                            <input type="text" class="form-control" id="new_username" name="new_username" value="{{ user_data.username }}" readonly required>
+                            <small class="form-text text-muted">The username is the permanent account identifier.</small>
                         </div>
                         <div class="mb-3">
                             <label for="email" class="form-label">Email Address</label>
-                            <input type="email" class="form-control" id="email" name="email" value="{{ user_data.email or '' }}">
+                            <input type="email" class="form-control" id="email" {% if is_admin %}name="email"{% endif %} value="{{ user_data.email or '' }}" {% if not is_admin %}readonly{% endif %}>
                             <small class="form-text text-muted">Required for magic link recovery</small>
                         </div>
                     </div>
                     <div class="flex-column">
                         <div class="mb-3">
                             <label for="phone_number" class="form-label">Phone Number</label>
-                            <input type="tel" class="form-control" id="phone_number" name="phone_number" value="{{ user_data.phone_number }}" inputmode="tel" oninput="this.value = this.value.replace(/[^0-9+\-() ]/g, '')">
+                            <input type="tel" class="form-control" id="phone_number" {% if is_admin %}name="phone_number"{% endif %} value="{{ user_data.phone_number or '' }}" inputmode="tel" {% if not is_admin %}readonly{% else %}oninput="this.value = this.value.replace(/[^0-9+\-() ]/g, '')"{% endif %}>
                         </div>
+                        {% if is_admin %}
                         <div class="mb-3">
                             <label for="new_password" class="form-label">New Password</label>
                             <div class="input-group">
@@ -102,13 +104,16 @@
                                 <i class="fas fa-key me-1"></i> Generate Strong Password
                             </button>
                         </div>
+                        {% else %}
+                        <small class="form-text text-muted">Email, phone and password changes are restricted to administrators.</small>
+                        {% endif %}
                     </div>
                 </div>
                 <div class="flex-row">
                     <div class="flex-column">
                         <div class="mb-3">
                             <label for="authenticationMode" class="form-label">Authentication Mode</label>
-                            <select class="form-select" id="authenticationMode" name="authentication_mode">
+                            <select class="form-select" id="authenticationMode" {% if is_admin %}name="authentication_mode"{% else %}disabled{% endif %}>
                                 <option value="magic_link_only" {{ 'selected' if user_data.authentication_mode == 'magic_link_only' else '' }}>Magic Link Only</option>
                                 <option value="magic_link_password" {{ 'selected' if user_data.authentication_mode == 'magic_link_password' else '' }}>Magic Link + Password</option>
                                 <option value="password_only" {{ 'selected' if user_data.authentication_mode == 'password_only' else '' }}>Password Only</option>
@@ -262,7 +267,7 @@
                             </label>
                         </div>
                         <div class="mb-3 form-check">
-                            <input type="checkbox" class="form-check-input" id="canChangePassword" name="can_change_password" {% if user_data.can_change_password %}checked{% endif %}>
+                            <input type="checkbox" class="form-check-input" id="canChangePassword" {% if is_admin %}name="can_change_password"{% else %}disabled{% endif %} {% if user_data.can_change_password %}checked{% endif %}>
                             <label class="form-check-label" for="canChangePassword">
                                 <i class="fas fa-key me-1 text-muted"></i> User can change password
                             </label>
@@ -431,6 +436,25 @@
                 </div>
             </div>
 
+            <!-- Section 8: Storage Quota (Admin only) -->
+            {% if is_admin %}
+            <div class="section-container">
+                <div class="section-title"><i class="fas fa-hard-drive me-2"></i>Storage Quota</div>
+                <div class="mb-3">
+                    <label for="storageQuotaGb" class="form-label">Storage quota (GB)</label>
+                    <div class="input-group" style="max-width: 240px;">
+                        <input type="number" class="form-control" id="storageQuotaGb" name="storage_quota_gb"
+                               min="0" step="any" placeholder="System default"
+                               value="{% if user_data.storage_quota_bytes is not none %}{{ '%g'|format(user_data.storage_quota_bytes / 1073741824) }}{% endif %}">
+                        <span class="input-group-text input-group-text-themed">GB</span>
+                    </div>
+                    <small class="form-text text-muted">
+                        Empty = system default (currently {% if storage_quota_default_bytes == 0 %}unlimited{% else %}{{ '%.1f'|format(storage_quota_default_bytes / 1073741824) }} GB{% endif %}). 0 = unlimited.
+                    </small>
+                </div>
+            </div>
+            {% endif %}
+
             <!-- Action Buttons -->
             <div class="d-flex gap-2">
                 <button type="submit" class="btn btn-primary">
@@ -485,17 +509,31 @@
         const symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?';
         const allChars = lowercase + uppercase + numbers + symbols;
 
-        let password = '';
-        password += lowercase[Math.floor(Math.random() * lowercase.length)];
-        password += uppercase[Math.floor(Math.random() * uppercase.length)];
-        password += numbers[Math.floor(Math.random() * numbers.length)];
-        password += symbols[Math.floor(Math.random() * symbols.length)];
+        const randomIndex = (max) => {
+            // Rejection sampling avoids modulo bias
+            const limit = Math.floor(0x100000000 / max) * max;
+            const buf = new Uint32Array(1);
+            do {
+                crypto.getRandomValues(buf);
+            } while (buf[0] >= limit);
+            return buf[0] % max;
+        };
 
-        for (let i = password.length; i < 16; i++) {
-            password += allChars[Math.floor(Math.random() * allChars.length)];
+        const chars = [
+            lowercase[randomIndex(lowercase.length)],
+            uppercase[randomIndex(uppercase.length)],
+            numbers[randomIndex(numbers.length)],
+            symbols[randomIndex(symbols.length)]
+        ];
+        while (chars.length < 16) {
+            chars.push(allChars[randomIndex(allChars.length)]);
         }
 
-        password = password.split('').sort(() => 0.5 - Math.random()).join('');
+        for (let i = chars.length - 1; i > 0; i--) {
+            const j = randomIndex(i + 1);
+            [chars[i], chars[j]] = [chars[j], chars[i]];
+        }
+        const password = chars.join('');
 
         const input = document.getElementById('new_password');
         input.value = password;

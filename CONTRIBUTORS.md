@@ -1,6 +1,6 @@
 # Contributors
 
-Thank you to everyone who has contributed to SparkAI!
+Thank you to everyone who has contributed to AURVEK!
 
 ## Core Team
 

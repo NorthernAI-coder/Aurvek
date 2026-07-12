@@ -41,6 +41,7 @@ from log_config import logger
 from models import User
 from prompts import get_user_directory
 from save_images import get_or_generate_img_token
+from storage_quota import delete_generated_file_rows
 from chat.services.message_rendering import process_message
 from chat.services.privacy import ensure_conversation_privacy_schema
 
@@ -62,9 +63,6 @@ async def scan_pdf_directory(base_path: Path, conversation_id: int) -> List[Dict
                     nginx_path = str(full_path).replace(os.sep, "/")
                     if not nginx_path.startswith("/users/"):
                         nginx_path = "/users/" + nginx_path.split("users/")[-1]
-
-                    hash_in_path = nginx_path.split("/")[4] if len(nginx_path.split("/")) > 4 else "unknown"
-                    logger.info("[PDF DEBUG] file=%s, hash_len=%s, hash=%s", file, len(hash_in_path), hash_in_path)
 
                     pdfs.append({
                         "path": str(full_path),
@@ -480,6 +478,12 @@ async def delete_pdf(request: Request, current_user: User = Depends(get_current_
 
         os.remove(str(pdf_path))
 
+        # Drop the ledger row for the file we just unlinked so it stops counting
+        # against storage quota.
+        async with get_db_connection() as conn:
+            await delete_generated_file_rows(conn, [str(pdf_path.resolve())])
+            await conn.commit()
+
         def remove_empty_dirs(path: Path):
             try:
                 current = path
@@ -523,6 +527,12 @@ async def delete_mp3(request: Request, current_user: User = Depends(get_current_
             raise HTTPException(status_code=403, detail="Access denied")
 
         os.remove(str(mp3_path))
+
+        # Drop the ledger row for the file we just unlinked so it stops counting
+        # against storage quota.
+        async with get_db_connection() as conn:
+            await delete_generated_file_rows(conn, [str(mp3_path.resolve())])
+            await conn.commit()
 
         def remove_empty_dirs(path: Path):
             try:
@@ -581,6 +591,10 @@ async def delete_pdfs(request: Request, current_user: User = Depends(get_current
                 logger.error("Error deleting PDF attachment %s: %s", public_id, exc)
                 failed_count += 1
 
+        # Generated PDF exports unlinked below; their ledger rows are removed in
+        # one batch afterwards. (attachment_refs are blob-store uploads, not
+        # generated media -- freed by prune_unreferenced_blobs, never ledgered.)
+        removed_pdf_paths = []
         for pdf_path in pdf_paths:
             path = Path(pdf_path)
             if path.suffix != ".pdf":
@@ -601,9 +615,15 @@ async def delete_pdfs(request: Request, current_user: User = Depends(get_current
             try:
                 await aiofiles.os.remove(str(resolved_path))
                 deleted_count += 1
+                removed_pdf_paths.append(str(resolved_path))
             except Exception as exc:
                 logger.error("Error deleting PDF %s: %s", path, exc)
                 failed_count += 1
+
+        if removed_pdf_paths:
+            async with get_db_connection() as conn:
+                await delete_generated_file_rows(conn, removed_pdf_paths)
+                await conn.commit()
 
         if attachment_refs:
             await prune_unreferenced_blobs()
@@ -629,6 +649,9 @@ async def delete_mp3s(request: Request, current_user: User = Depends(get_current
         deleted_count = 0
         failed_count = 0
 
+        # Generated MP3 exports unlinked below; their ledger rows are removed in
+        # one batch afterwards.
+        removed_mp3_paths = []
         for mp3_path in mp3_paths:
             path = Path(mp3_path)
             if path.suffix != ".mp3":
@@ -649,9 +672,15 @@ async def delete_mp3s(request: Request, current_user: User = Depends(get_current
             try:
                 await aiofiles.os.remove(str(resolved_path))
                 deleted_count += 1
+                removed_mp3_paths.append(str(resolved_path))
             except Exception as exc:
                 logger.error("Error deleting MP3 %s: %s", path, exc)
                 failed_count += 1
+
+        if removed_mp3_paths:
+            async with get_db_connection() as conn:
+                await delete_generated_file_rows(conn, removed_mp3_paths)
+                await conn.commit()
 
         return {"message": f"Successfully deleted: {deleted_count}, Failed: {failed_count}"}
     except Exception as exc:

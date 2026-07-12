@@ -34,6 +34,23 @@
         color: var(--text-muted);
         margin-top: 0.25rem;
     }
+    .stat-card .storage-bar {
+        height: 8px;
+        margin-top: 0.5rem;
+        border-radius: 4px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+    }
+    .stat-card .storage-bar-fill {
+        height: 100%;
+        border-radius: 4px;
+        background: var(--success);
+        transition: width 0.3s ease;
+    }
+    .stat-card .storage-bar-fill.warn { background: var(--warning); }
+    .stat-card .storage-bar-fill.danger { background: var(--danger); }
+    .stat-card.danger { border-left-color: var(--danger); }
     .filters-row {
         display: flex;
         gap: 15px;
@@ -449,12 +466,13 @@
                     <div class="flex-column">
                         <div class="mb-3">
                             <label for="username" class="form-label">Username</label>
-                            <input type="text" class="form-control" id="username" name="username" value="{{ user_data['username'] }}" required>
+                            <input type="text" class="form-control" id="username" name="username" value="{{ user_data['username'] }}" readonly required>
+                            <small class="form-text text-muted">Your username is the permanent account identifier.</small>
                         </div>
                         <div class="mb-3">
                             <label for="email" class="form-label">Email Address</label>
-                            <input type="email" class="form-control" id="email" name="email" value="{{ user_data['email'] or '' }}">
-                            <small class="form-text text-muted">Required for magic link recovery if your magic link expires</small>
+                            <input type="email" class="form-control" id="email" value="{{ user_data['email'] or '' }}" readonly>
+                            <small class="form-text text-muted">Email changes require a separate verified flow.</small>
                         </div>
                         <div class="mb-3">
                             <label for="phone" class="form-label">Phone Number</label>
@@ -463,7 +481,8 @@
                         </div>
                         <div class="mb-3" id="verificationCodeContainer" style="display: none;">
                             <label for="verificationCode" class="form-label">Verification Code</label>
-                            <input type="text" class="form-control" id="verificationCode" name="verification_code">
+                            <input type="text" class="form-control" id="verificationCode" inputmode="numeric" autocomplete="one-time-code">
+                            <input type="hidden" id="phoneVerificationId" name="phone_verification_id">
                         </div>
                         <div class="mb-3">
                             <label for="balance" class="form-label">Balance</label>
@@ -690,14 +709,14 @@
                             <div class="mb-3">
                                 <label for="new-password" class="form-label">New Password</label>
                                 <div class="input-group">
-                                    <input type="password" class="form-control" id="new-password" name="new_password"
-                                           minlength="6" oninput="checkPasswordStrength()">
+                                    <input type="password" class="form-control" id="new-password"
+                                           minlength="8" oninput="checkPasswordStrength()">
                                     <button class="btn btn-show-password" type="button" onclick="togglePassword('new-password', this)">
                                         <i class="fas fa-eye"></i>
                                     </button>
                                 </div>
                                 <ul class="password-requirements mt-2 list-unstyled">
-                                    <li id="req-length" class="invalid">At least 6 characters</li>
+                                    <li id="req-length" class="invalid">At least 8 characters</li>
                                     <li id="req-different" class="invalid">Different from current password</li>
                                 </ul>
                             </div>
@@ -920,6 +939,20 @@
                 <div class="stat-card success">
                     <div class="label"><i class="fas fa-calendar-day me-1"></i>Avg. Daily</div>
                     <div class="amount" id="statAvgDaily">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Storage -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="stat-card info d-none" id="storageCard">
+                    <div class="label"><i class="fas fa-hard-drive me-1"></i>Storage</div>
+                    <div class="amount" id="storageAmount">-</div>
+                    <div class="storage-bar" id="storageBar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Storage usage">
+                        <div class="storage-bar-fill" id="storageBarFill"></div>
+                    </div>
+                    <div class="subtext" id="storageBreakdown"></div>
                 </div>
             </div>
         </div>
@@ -1267,7 +1300,7 @@
     let currentAlterEgoId = "{{ user_data['current_alter_ego_id'] }}";
     let currentUserVoiceId = "{{ current_user_voice_id }}";
     let currentUserId = "{{ current_user_id }}";
-    let originalPhoneNumber = "{{ user_data['phone_number'] }}";
+    let originalPhoneNumber = {{ (user_data['phone_number'] or '')|tojson }};
     let homePreferences = {{ home_preferences | tojson }};
 
     {% if can_change_password %}
@@ -1291,7 +1324,7 @@
         const oldPassword = document.getElementById('old-password').value;
 
         const reqLength = document.getElementById('req-length');
-        if (newPassword.length >= 6) {
+        if (newPassword.length >= 8) {
             reqLength.classList.remove('invalid');
             reqLength.classList.add('valid');
         } else {
@@ -1359,8 +1392,8 @@
                     errorDiv.style.display = 'block';
                     return;
                 }
-                if (newPassword.length < 6) {
-                    errorText.textContent = 'Password must be at least 6 characters.';
+                if (newPassword.length < 8) {
+                    errorText.textContent = 'Password must be at least 8 characters.';
                     errorDiv.style.display = 'block';
                     return;
                 }
@@ -1384,8 +1417,9 @@
                         body: formData
                     });
 
+                    const data = await response.json();
                     if (response.ok) {
-                        successText.textContent = 'Password changed successfully!';
+                        successText.textContent = data.detail;
                         successDiv.style.display = 'block';
                         document.getElementById('old-password').value = '';
                         document.getElementById('new-password').value = '';
@@ -1395,8 +1429,12 @@
                         document.getElementById('req-different').className = 'invalid';
                         // Re-snapshot form after password fields cleared
                         FormGuard.markClean('#editProfileForm');
+                        if (data.reauthenticate) {
+                            setTimeout(() => {
+                                window.location.href = '/login';
+                            }, 1200);
+                        }
                     } else {
-                        const data = await response.json();
                         if (response.status === 400 && data.detail === "Current password is incorrect") {
                             errorText.textContent = 'Current password is incorrect.';
                         } else if (data.detail) {

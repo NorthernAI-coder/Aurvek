@@ -786,6 +786,8 @@
         var username = "{{ username }}";
         var userProfilePicture = "{{ user_profile_picture | default('', true) }}";
         var botProfilePicture = "{{ bot_profile_picture | default('', true) }}";
+        var botProfilePicture128 = "{{ bot_profile_picture_128 | default('', true) }}";
+        var botProfilePictureFullsize = "{{ bot_profile_picture_fullsize | default('', true) }}";
         var isAdmin = {{ is_admin|tojson }};
         var isUser = {{ is_user|tojson }};
         var promptDescription = {{ prompt_description|tojson|safe }};

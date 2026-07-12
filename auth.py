@@ -66,6 +66,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         "iat": int(current_time.timestamp()),  # issued at
         "exp": int(expire.timestamp())         # expiration time
     })
+    to_encode.setdefault("auth_time", int(current_time.timestamp()))
     
     logger.info(f"Creating token at: {current_time.isoformat()}")
     logger.info(f"Token will expire at: {expire.isoformat()}")
@@ -108,45 +109,37 @@ async def get_current_user(request: Request) -> Optional[User]:
             logger.info("Invalid token: missing user information")
             return None
 
+        user_id = int(user_info["id"])
+        token_session_version = user_info.get("session_version")
+        if token_session_version is None:
+            logger.info("Invalid token: missing session version")
+            return None
+
         # Check if user is revoked
-        if await is_user_revoked(user_info["id"]):
+        if await is_user_revoked(user_id):
             logger.info("User revoked")
             return None
 
-        if not await is_user_enabled_in_db(user_info["id"]):
-            logger.info("User disabled")
+        live_user = await get_user_by_id(user_id)
+        if not live_user or not live_user.is_enabled:
+            logger.info("User missing or disabled")
+            return None
+        if int(token_session_version) != live_user.session_version:
+            logger.info("Session version mismatch for user %s", user_id)
             return None
 
-    except JWTError as e:
-        logger.error(f"Error decoding JWT token: {e}")
+    except (JWTError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error validating JWT token: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading live session user: {e}")
         return None
 
-    logger.debug(f"username: {user_info['username']}")
-
-    user = User(
-        id=user_info["id"],
-        username=user_info["username"],
-        password=None,  # We don't need the password here
-        role_id=user_info["role_id"],
-        is_enabled=user_info["is_enabled"],
-        can_send_files=user_info["can_send_files"],
-        can_generate_images=user_info["can_generate_images"],
-        current_prompt_id=user_info["current_prompt_id"],
-        uses_magic_link=user_info["uses_magic_link"],
-        voice_id=user_info["voice_id"],
-        voice_code=user_info["voice_code"],
-        all_prompts_access=user_info["all_prompts_access"],
-        public_prompts_access=user_info["public_prompts_access"],
-        authentication_mode=user_info.get("authentication_mode", "magic_link_only"),
-        can_change_password=user_info.get("can_change_password", False),
-        is_admin=user_info["is_admin"],
-        is_user=user_info.get("is_user", user_info.get("is_manager")),
-    )
-
-    # Add indicator of whether magic link was used to the user
-    user.used_magic_link = user_info.get("used_magic_link", False)
-
-    return user
+    logger.debug("Authenticated live user: %s", live_user.username)
+    live_user.used_magic_link = bool(user_info.get("used_magic_link", False))
+    live_user.auth_time = int(payload.get("auth_time", payload.get("iat", 0)))
+    live_user.session_expires_at = int(payload.get("exp", 0))
+    return live_user
 
 # Function to get a user by username
 async def get_user_by_username(username: str) -> Optional[User]:
@@ -156,7 +149,7 @@ async def get_user_by_username(username: str) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -191,6 +184,7 @@ def create_user_from_row(row):
         can_change_password=bool(row['can_change_password']),
         google_id=row['google_id'],
         auth_provider=row['auth_provider'] or 'local',
+        session_version=row['session_version'],
         is_admin=None,
         is_user=None,
     )
@@ -201,7 +195,7 @@ async def get_user_by_id(user_id: int) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -224,7 +218,7 @@ async def get_user_from_phone_number(phone_number: str) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled, u.phone_number,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -246,7 +240,7 @@ async def get_user_from_telegram_chat_id(chat_id: int) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled, u.phone_number,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -279,46 +273,36 @@ async def get_current_user_from_websocket(websocket: WebSocket) -> Optional[User
         if not user_info:
             return None
 
+        user_id = int(user_info["id"])
+        token_session_version = user_info.get("session_version")
+        if token_session_version is None:
+            logger.info("WebSocket: Token missing session version")
+            return None
+
         # Check if user is revoked
-        if await is_user_revoked(user_info["id"]):
+        if await is_user_revoked(user_id):
             logger.info("WebSocket: User revoked")
             return None
 
-        if not await is_user_enabled_in_db(user_info["id"]):
-            logger.info("WebSocket: User disabled")
+        live_user = await get_user_by_id(user_id)
+        if not live_user or not live_user.is_enabled:
+            logger.info("WebSocket: User missing or disabled")
+            return None
+        if int(token_session_version) != live_user.session_version:
+            logger.info("WebSocket: Session version mismatch for user %s", user_id)
             return None
 
-    except JWTError as e:
-        logger.error(f"WebSocket: Error decoding JWT token: {e}")
+    except (JWTError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"WebSocket: Error validating JWT token: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"WebSocket: Error loading live session user: {e}")
         return None
 
-    user = User(
-        id=user_info["id"],
-        username=user_info["username"],
-        password=None,  # We don't need the password here
-        role_id=user_info["role_id"],
-        is_enabled=user_info["is_enabled"],
-        can_send_files=user_info["can_send_files"],
-        can_generate_images=user_info["can_generate_images"],
-        current_prompt_id=user_info["current_prompt_id"],
-        uses_magic_link=user_info["uses_magic_link"],
-        voice_id=user_info.get("voice_id"),
-        voice_code=user_info.get("voice_code"),
-        all_prompts_access=user_info.get("all_prompts_access"),
-        public_prompts_access=user_info.get("public_prompts_access"),
-        authentication_mode=user_info.get("authentication_mode", "magic_link_only"),
-        can_change_password=user_info.get("can_change_password", False),
-        is_admin=user_info.get("is_admin"),
-        is_user=user_info.get("is_user", user_info.get("is_manager")),
-    )
-
-    # Add indicator of whether magic link was used to the user
-    user.used_magic_link = user_info.get("used_magic_link", False)
-
-    # If you need fetch_role_ids, you can call it here
-    # await user.fetch_role_ids()
-
-    return user
+    live_user.used_magic_link = bool(user_info.get("used_magic_link", False))
+    live_user.auth_time = int(payload.get("auth_time", payload.get("iat", 0)))
+    live_user.session_expires_at = int(payload.get("exp", 0))
+    return live_user
     
 async def get_user_id_from_conversation(conversation_id: int) -> int:
     logger.info("entra en get_user_id_from_conversation")
@@ -367,8 +351,35 @@ async def create_user_info(user, used_magic_link):
         "authentication_mode": user.authentication_mode,
         "can_change_password": user.can_change_password,
         "role_id": user.role_id,
+        "session_version": user.session_version,
         "used_magic_link": used_magic_link  # New boolean field
     }
+
+
+async def bump_session_version(conn, user_id: int) -> int:
+    """Invalidate every previously issued session for a user."""
+    cursor = await conn.execute(
+        """
+        UPDATE USERS
+        SET session_version = COALESCE(session_version, 1) + 1
+        WHERE id = ?
+        RETURNING session_version
+        """,
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise ValueError(f"User {user_id} does not exist")
+    return int(row[0])
+
+
+def has_recent_authentication(user: User, max_age_seconds: int = 600) -> bool:
+    """Return whether the current session authenticated recently enough."""
+    auth_time = int(getattr(user, "auth_time", 0) or 0)
+    if auth_time <= 0:
+        return False
+    age = int(datetime.now(timezone.utc).timestamp()) - auth_time
+    return 0 <= age <= max_age_seconds
 
 def create_login_response(user_info, redirect_url=None, default_redirect="/home", expires_delta: Optional[timedelta] = None):
     token = create_access_token(
@@ -442,6 +453,7 @@ async def generate_magic_link(user_id: int, url_path: str, request: Request, nex
                     'INSERT INTO magic_links (user_id, token, expires_at) VALUES (?, ?, ?)',
                     (user_id, token, expires_at)
                 )
+        await bump_session_version(conn, user_id)
         await conn.commit()
 
         query_params = {"token": token}
@@ -461,7 +473,7 @@ async def get_user_by_google_id(google_id: str) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -485,7 +497,7 @@ async def get_user_by_email(email: str) -> Optional[User]:
         query = '''
         SELECT
             u.id, u.username, u.password, u.role_id, u.is_enabled,
-            u.google_id, u.auth_provider,
+            u.google_id, u.auth_provider, u.session_version,
             ud.current_prompt_id, ud.allow_file_upload, ud.allow_image_generation,
             ud.all_prompts_access, ud.public_prompts_access,
             ud.authentication_mode, ud.can_change_password,
@@ -508,7 +520,13 @@ async def update_user_google_id(user_id: int, google_id: str, auth_provider: str
     try:
         async with get_db_connection() as conn:
             await conn.execute(
-                "UPDATE USERS SET google_id = ?, auth_provider = ? WHERE id = ?",
+                """
+                UPDATE USERS
+                SET google_id = ?,
+                    auth_provider = ?,
+                    session_version = COALESCE(session_version, 1) + 1
+                WHERE id = ?
+                """,
                 (google_id, auth_provider, user_id)
             )
             await conn.commit()

@@ -10,14 +10,23 @@ intercept and look in the global data/static/ directory.
 """
 
 import logging
-import os
+import re
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional, Dict
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import FileResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from cachetools import TTLCache
+
+from marketplace.landing.isolation import (
+    apply_creator_content_headers,
+    get_creator_content_config,
+    is_host_isolated_from_primary,
+    primary_app_url,
+    verify_content_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,14 @@ _domain_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
 
 # Primary domains that should skip custom domain lookup
 _primary_domains: set = set()
+
+_PAGE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+_WELCOME_PAGE_RE = re.compile(r"^/_aurvek/welcome/(prompt|pack)/(\d+)/([^/]+)/$")
+_WELCOME_STATIC_RE = re.compile(
+    r"^/_aurvek/welcome/(prompt|pack)/(\d+)/([^/]+)/static/(.+)$"
+)
+_ALLOWED_COOKIE_NAMES = {"_aurvek_visitor"}
 
 
 def _build_prompt_path(username: str, prompt_id: int, prompt_name: str) -> Path:
@@ -91,28 +108,43 @@ class CustomDomainMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         host = request.headers.get("host", "").lower().split(":")[0]
 
+        creator_config = get_creator_content_config(primary_hosts=_primary_domains)
+        if creator_config and host == creator_config.host:
+            request.state.creator_content_origin = True
+            self._strip_application_cookies(request)
+            response = await self._dispatch_creator_content(request, call_next)
+            # This is an Aurvek-owned, dedicated origin. User-supplied custom
+            # domains share the catch-all server and deliberately do not get a
+            # persistent HSTS policy that would outlive their configuration.
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
+            return response
+
         # Skip for primary domains
         if is_primary_domain(host):
+            # Legacy welcome assets contain creator-authored CSS/JS.  Welcome
+            # pages now load them through signed paths on the isolated host;
+            # keeping the old primary-origin route reachable would preserve a
+            # same-origin execution primitive.
+            if request.url.path.startswith("/home/static/"):
+                return Response(status_code=404, headers={"Cache-Control": "no-store"})
             return await call_next(request)
 
         from marketplace.config import marketplace_public_landings_enabled
         if not marketplace_public_landings_enabled():
-            return Response(
-                content=self._get_404_html(),
-                status_code=404,
-                media_type="text/html"
-            )
+            return self._not_found_response()
+
+        # A custom landing domain must be on a separate site from Aurvek.  A
+        # sibling subdomain could otherwise receive same-site cookies and make
+        # creator JavaScript an application-origin concern again.
+        if not is_host_isolated_from_primary(host, primary_hosts=_primary_domains):
+            return self._not_found_response()
 
         # Check if this is a custom domain
         domain_data = await self._get_domain_data(host)
 
         if domain_data is None:
             # Not a known custom domain -> 404
-            return Response(
-                content=self._get_404_html(),
-                status_code=404,
-                media_type="text/html"
-            )
+            return self._not_found_response()
 
         # Inject prompt data into request state
         request.state.custom_domain = True
@@ -122,14 +154,292 @@ class CustomDomainMiddleware(BaseHTTPMiddleware):
         request.state.username = domain_data["username"]
         request.state.public_id = domain_data["public_id"]
 
+        self._strip_application_cookies(request)
+
+        return await self._dispatch_custom_domain(request, call_next, domain_data)
+
+    async def _dispatch_creator_content(self, request: Request, call_next) -> Response:
+        """Allow only creator-content routes on the cookie-less shared host."""
+        path = request.url.path
+        method = request.method.upper()
+
+        if path == "/api/analytics/track-visit" and method == "POST":
+            return self._finalize_isolated_response(await call_next(request), path=path)
+
+        welcome_match = _WELCOME_PAGE_RE.fullmatch(path)
+        if welcome_match and method in {"GET", "HEAD"}:
+            response = await self._serve_isolated_welcome(request, welcome_match)
+            return self._finalize_isolated_response(
+                response,
+                path=path,
+                allow_primary_frame=True,
+                no_store=True,
+            )
+
+        welcome_static_match = _WELCOME_STATIC_RE.fullmatch(path)
+        if welcome_static_match and method in {"GET", "HEAD"}:
+            response = await self._serve_isolated_welcome_static(
+                request,
+                welcome_static_match,
+            )
+            return self._finalize_isolated_response(
+                response,
+                path=path,
+                allow_primary_frame=True,
+                no_store=True,
+            )
+
+        route_kind = self._creator_route_kind(path)
+        if route_kind == "auth" and method in {"GET", "HEAD"}:
+            target = primary_app_url(path)
+            if target:
+                return self._finalize_isolated_response(
+                    RedirectResponse(target, status_code=302),
+                    path=path,
+                    no_store=True,
+                )
+            return self._not_found_response()
+
+        if route_kind == "content" and method in {"GET", "HEAD"}:
+            is_preview = request.query_params.get("preview") == "1"
+            is_embed = request.query_params.get("embed") == "1"
+            return self._finalize_isolated_response(
+                await call_next(request),
+                path=path,
+                allow_primary_frame=is_embed,
+                no_store=is_preview,
+            )
+
+        return self._not_found_response()
+
+    async def _dispatch_custom_domain(
+        self,
+        request: Request,
+        call_next,
+        domain_data: Dict,
+    ) -> Response:
+        """Expose a strict landing-only surface on creator custom domains."""
+        path = request.url.path
+        method = request.method.upper()
+
+        if path == "/api/analytics/track-visit" and method == "POST":
+            return self._finalize_isolated_response(await call_next(request), path=path)
+
+        if path in {"/register", "/login"}:
+            if method not in {"GET", "HEAD"}:
+                return self._not_found_response()
+            from common import slugify
+
+            auth_path = (
+                f"/p/{domain_data['public_id']}/{slugify(domain_data['prompt_name'])}{path}"
+            )
+            target = primary_app_url(auth_path)
+            if not target:
+                return self._not_found_response()
+            return self._finalize_isolated_response(
+                RedirectResponse(target, status_code=302),
+                path=path,
+                no_store=True,
+            )
+
         # Serve static files directly to bypass the global StaticFiles mount.
         # Without this, /static/* requests hit app.mount("/static", StaticFiles(...))
         # which looks in data/static/ (global) instead of the prompt's directory.
         path = request.url.path
-        if path.startswith("/static/"):
-            return self._serve_landing_static(domain_data, path[8:])  # strip "/static/"
+        if path.startswith("/static/") and method in {"GET", "HEAD"}:
+            return self._finalize_isolated_response(
+                self._serve_landing_static(domain_data, path[8:]),
+                path=path,
+            )  # strip "/static/"
 
-        return await call_next(request)
+        if method in {"GET", "HEAD"} and self._valid_custom_landing_path(path):
+            is_embed = request.query_params.get("embed") == "1"
+            return self._finalize_isolated_response(
+                self._serve_custom_landing_html(domain_data, path),
+                path=path,
+                allow_primary_frame=is_embed,
+            )
+
+        return self._not_found_response()
+
+    @staticmethod
+    def _creator_route_kind(path: str) -> str | None:
+        """Classify the narrow route surface supported by the shared host."""
+        parts = path.split("/")
+        # /p/{public_id}/{slug}[/{page|static/...}]
+        if len(parts) >= 4 and parts[1] == "p" and _PUBLIC_ID_RE.fullmatch(parts[2]):
+            if not parts[3] or len(parts[3]) > 200:
+                return None
+            if len(parts) == 4 or (len(parts) == 5 and parts[4] == ""):
+                return "content"
+            if len(parts) == 5 and parts[4] in {"register", "login"}:
+                return "auth"
+            if len(parts) == 5 and _PAGE_RE.fullmatch(parts[4]):
+                return "content"
+            if len(parts) >= 6 and parts[4] == "static" and all(parts[5:]):
+                return "content"
+            return None
+
+        # /pack/{public_id}/{slug}/[static/...]
+        if len(parts) >= 4 and parts[1] == "pack" and _PUBLIC_ID_RE.fullmatch(parts[2]):
+            if not parts[3] or len(parts[3]) > 200:
+                return None
+            if len(parts) == 4 or (len(parts) == 5 and parts[4] == ""):
+                return "content"
+            if len(parts) == 5 and parts[4] in {"register", "login"}:
+                return "auth"
+            if len(parts) >= 6 and parts[4] == "static" and all(parts[5:]):
+                return "content"
+        return None
+
+    @staticmethod
+    def _valid_custom_landing_path(path: str) -> bool:
+        if path in {"/", "/index.html"}:
+            return True
+        parts = path.split("/")
+        return len(parts) == 2 and bool(_PAGE_RE.fullmatch(parts[1]))
+
+    @staticmethod
+    def _strip_application_cookies(request: Request) -> None:
+        """Remove Aurvek auth/session cookies before isolated route handling."""
+        cookie_header = request.headers.get("cookie", "")
+        safe_pairs: list[str] = []
+        if cookie_header:
+            try:
+                parsed = SimpleCookie()
+                parsed.load(cookie_header)
+                safe_pairs = [
+                    f"{name}={parsed[name].value}"
+                    for name in _ALLOWED_COOKIE_NAMES
+                    if name in parsed
+                ]
+            except Exception:
+                safe_pairs = []
+
+        headers = [
+            (key, value)
+            for key, value in request.scope.get("headers", [])
+            if key.lower() != b"cookie"
+        ]
+        if safe_pairs:
+            headers.append((b"cookie", "; ".join(safe_pairs).encode("latin-1")))
+        request.scope["headers"] = headers
+        # Starlette caches Headers and cookie parsing lazily on the request.
+        request.__dict__.pop("_headers", None)
+        request.__dict__.pop("_cookies", None)
+
+    @staticmethod
+    def _filter_response_cookies(response: Response) -> None:
+        safe_headers = []
+        for key, value in response.raw_headers:
+            if key.lower() != b"set-cookie":
+                safe_headers.append((key, value))
+                continue
+            cookie_name = value.split(b"=", 1)[0].decode("latin-1", "ignore").strip()
+            if cookie_name in _ALLOWED_COOKIE_NAMES:
+                safe_headers.append((key, value))
+        response.raw_headers = safe_headers
+
+    def _finalize_isolated_response(
+        self,
+        response: Response,
+        *,
+        path: str,
+        allow_primary_frame: bool = False,
+        no_store: bool = False,
+    ) -> Response:
+        self._filter_response_cookies(response)
+        is_static_asset = path.startswith("/static/") or "/static/" in path
+        response = apply_creator_content_headers(
+            response,
+            allow_primary_frame=allow_primary_frame,
+            # Explore and welcome iframes intentionally omit
+            # allow-same-origin. Their local subresources therefore have an
+            # opaque initiator and must opt into CORP cross-origin.
+            allow_cross_origin_resource=is_static_asset,
+            no_store=no_store,
+        )
+        if is_static_asset:
+            # Sandboxed Explore/welcome documents have an opaque Origin
+            # (serialized as null). Public/signed static assets carry no
+            # ambient credentials, so a wildcard is safe and is required by
+            # webfonts and ES modules in addition to CORP.
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+    async def _serve_isolated_welcome(self, request: Request, match: re.Match) -> Response:
+        entity_type, raw_entity_id, token = match.groups()
+        entity_id = int(raw_entity_id)
+        expected = {
+            "purpose": "welcome",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        }
+        if verify_content_token(token, expected=expected) is None:
+            return self._not_found_response()
+
+        from welcome_service import build_world
+
+        world = await build_world(entity_type, entity_id)
+        if not world:
+            return self._not_found_response()
+        index_path = Path(world["path"]) / "welcome" / "index.html"
+        try:
+            html = index_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return self._not_found_response()
+
+        prefix = f"/_aurvek/welcome/{entity_type}/{entity_id}/{token}/"
+        html = html.replace("/home/static/", prefix + "static/")
+        primary_chat = primary_app_url("/chat")
+        if primary_chat:
+            html = html.replace(
+                'href="/chat',
+                f'target="_top" href="{primary_chat}',
+            )
+            html = html.replace(
+                "href='/chat",
+                f"target='_top' href='{primary_chat}",
+            )
+
+        return HTMLResponse(html)
+
+    async def _serve_isolated_welcome_static(
+        self,
+        request: Request,
+        match: re.Match,
+    ) -> Response:
+        entity_type, raw_entity_id, token, resource_path = match.groups()
+        entity_id = int(raw_entity_id)
+        expected = {
+            "purpose": "welcome",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        }
+        if verify_content_token(token, expected=expected) is None:
+            return self._not_found_response()
+
+        from welcome_service import build_world
+
+        world = await build_world(entity_type, entity_id)
+        if not world:
+            return self._not_found_response()
+        static_root = (Path(world["path"]) / "welcome" / "static").resolve()
+        try:
+            resolved = (static_root / resource_path).resolve(strict=True)
+            resolved.relative_to(static_root)
+        except (OSError, ValueError):
+            return self._not_found_response()
+        if not resolved.is_file():
+            return self._not_found_response()
+
+        suffix = resolved.suffix.lower()
+        media_type = _MEDIA_TYPES.get(suffix, "application/octet-stream")
+        return FileResponse(resolved, media_type=media_type)
+
+    def _not_found_response(self) -> Response:
+        response = HTMLResponse(self._get_404_html(), status_code=404)
+        return apply_creator_content_headers(response, no_store=True)
 
     async def _get_domain_data(self, domain: str) -> Optional[Dict]:
         """Get prompt data for a custom domain (cached)."""
@@ -201,6 +511,33 @@ class CustomDomainMiddleware(BaseHTTPMiddleware):
             media_type=media_type,
             headers={"Cache-Control": "public, max-age=3600"},
         )
+
+    def _serve_custom_landing_html(self, domain_data: Dict, path: str) -> Response:
+        """Serve creator HTML directly so application routes cannot win routing."""
+        if path in {"/", "/index.html"}:
+            page = "home"
+        else:
+            page = path.strip("/")
+        if not _PAGE_RE.fullmatch(page):
+            return self._not_found_response()
+
+        prompt_dir = _build_prompt_path(
+            domain_data["username"],
+            domain_data["prompt_id"],
+            domain_data["prompt_name"],
+        )
+        html_path = prompt_dir / f"{page}.html"
+        try:
+            resolved = html_path.resolve(strict=True)
+            resolved.relative_to(prompt_dir.resolve())
+            html = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            return self._not_found_response()
+
+        from marketplace.landing.rendering import inject_custom_domain_analytics
+
+        html = inject_custom_domain_analytics(html, domain_data["prompt_id"])
+        return HTMLResponse(html)
 
     def _get_404_html(self) -> str:
         """Return 404 HTML for unknown domains."""

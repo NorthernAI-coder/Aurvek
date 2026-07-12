@@ -15,6 +15,7 @@ from file_storage import (
 )
 from log_config import logger
 from models import User
+from storage_quota import StorageQuotaExceededError
 
 from chat.services.attachment_uploads import (
     ATTACHMENT_UPLOAD_CHUNK_ROOT,
@@ -316,6 +317,9 @@ async def complete_attachment_upload(
             filename=filename,
             content_type=normalized_type,
         )
+    except StorageQuotaExceededError as exc:
+        await delete_attachment_upload_dir(upload_dir)
+        return json_error(exc.message, status_code=413)
     except ValueError as exc:
         await delete_attachment_upload_dir(upload_dir)
         return json_error(str(exc), status_code=400)

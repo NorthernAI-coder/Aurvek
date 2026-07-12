@@ -81,9 +81,18 @@ class RateLimiter:
         self._attempts[key].append(now)
         return True, max_attempts - current_count - 1
 
-    def record_failure(self, key: str):
-        """Record a failure without checking limit (for failure-only tracking)."""
-        self._attempts[key].append(datetime.now())
+    def record_failure(self, key: str, window_minutes: int = 1440) -> int:
+        """Record a failure and return its count in the requested window."""
+        now = datetime.now()
+        window_start = now - timedelta(minutes=window_minutes)
+        recent = [t for t in self._attempts[key] if t > window_start]
+        recent.append(now)
+        self._attempts[key] = recent
+        return len(recent)
+
+    def clear_key(self, key: str) -> bool:
+        """Clear one exact bucket without affecting other accounts or IPs."""
+        return self._attempts.pop(key, None) is not None
 
     def check_only(
         self,
@@ -128,7 +137,13 @@ class RateLimiter:
     def clear_for_ip(self, ip: str) -> int:
         """Clear all IP-scoped buckets for a specific IP."""
         suffix = f":{ip}"
-        keys_to_delete = [key for key in self._attempts if key.endswith(suffix)]
+        pair_marker = f":{ip}:"
+        keys_to_delete = [
+            key
+            for key in self._attempts
+            if key.endswith(suffix)
+            or (key.startswith("pair_fail:") and pair_marker in key)
+        ]
         for key in keys_to_delete:
             del self._attempts[key]
         return len(keys_to_delete)
@@ -229,8 +244,9 @@ class RateLimitConfig:
 
     # --- Login endpoints ---
     LOGIN_BY_IP_ALL = (20, 60)           # 20 attempts per hour per IP
-    LOGIN_BY_IP_FAILURES = (5, 60)       # 5 failures per hour per IP
-    LOGIN_BY_USER = (5, 1440)            # 5 per user per 24h
+    LOGIN_BY_IP_FAILURES = (20, 60)      # 20 credential failures/hour/IP
+    LOGIN_BY_ACCOUNT_IP_FAILURES = (5, 15)  # 5 failures/account/IP/15min
+    LOGIN_ACCOUNT_OBSERVATION = (20, 1440)  # Alerting only; never blocks
 
     # --- Registration endpoints ---
     REGISTER_BY_IP_ALL = (10, 60)        # 10 attempts per hour per IP
@@ -400,3 +416,85 @@ def record_failure(request, action_name: str, identifier: str = None):
         rate_limiter.record_failure(f"id_fail:{action_name}:{identifier.lower()}")
 
     logger.debug(f"Recorded failure: {action_name} from IP {ip}")
+
+
+def _normalize_login_identifier(identifier: str) -> str:
+    return (identifier or "").strip().lower()[:128]
+
+
+def _login_pair_key(request, identifier: str) -> str:
+    return (
+        f"pair_fail:login:{get_client_ip(request)}:"
+        f"{_normalize_login_identifier(identifier)}"
+    )
+
+
+def check_login_failure_limits(request, identifier: str) -> Optional[dict]:
+    """Check blocking login-failure buckets without recording an attempt."""
+    ip = get_client_ip(request)
+    checks = (
+        (
+            f"ip_fail:login:{ip}",
+            RateLimitConfig.LOGIN_BY_IP_FAILURES,
+            "Too many failed attempts from this network. Please try again later.",
+        ),
+        (
+            _login_pair_key(request, identifier),
+            RateLimitConfig.LOGIN_BY_ACCOUNT_IP_FAILURES,
+            "Too many failed attempts for this account. Please try again later.",
+        ),
+    )
+
+    for key, limit, message in checks:
+        allowed, _ = rate_limiter.check_only(key, limit[0], limit[1])
+        if not allowed:
+            return {
+                "status": "error",
+                "message": message,
+                "retry_after_seconds": rate_limiter.get_retry_after(
+                    key,
+                    limit[1],
+                ),
+            }
+    return None
+
+
+def record_login_failure(request, identifier: str) -> int:
+    """Record one credential failure and return the account/IP failure count."""
+    normalized = _normalize_login_identifier(identifier)
+    ip = get_client_ip(request)
+    rate_limiter.record_failure(
+        f"ip_fail:login:{ip}",
+        RateLimitConfig.LOGIN_BY_IP_FAILURES[1],
+    )
+    pair_count = rate_limiter.record_failure(
+        _login_pair_key(request, normalized),
+        RateLimitConfig.LOGIN_BY_ACCOUNT_IP_FAILURES[1],
+    )
+    observation_count = rate_limiter.record_failure(
+        f"id_fail:login:{normalized}",
+        RateLimitConfig.LOGIN_ACCOUNT_OBSERVATION[1],
+    )
+    if observation_count == RateLimitConfig.LOGIN_ACCOUNT_OBSERVATION[0]:
+        logger.warning(
+            "High login failure volume observed for account identifier %s",
+            normalized,
+        )
+    return pair_count
+
+
+def clear_login_failures(request, identifier: str) -> int:
+    """Clear account-specific failures after a successful authentication."""
+    normalized = _normalize_login_identifier(identifier)
+    keys = (
+        _login_pair_key(request, normalized),
+        f"id_fail:login:{normalized}",
+    )
+    return sum(rate_limiter.clear_key(key) for key in keys)
+
+
+def get_login_backoff_seconds(failure_count: int) -> int:
+    """Return a small progressive delay for repeated credential failures."""
+    if failure_count <= 0:
+        return 0
+    return min(2 ** failure_count, 8)

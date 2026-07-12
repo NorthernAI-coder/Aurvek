@@ -3,13 +3,60 @@
 # Modified to initialize Redis when the application starts and avoid the 2 second delay to connect to the pool
 
 
+import asyncio
+import math
 import os
+import secrets
+import time
+from collections import OrderedDict, deque
 import dramatiq
 from datetime import timedelta
 from typing import Optional
 from redis import asyncio as aioredis
 from dramatiq.brokers.redis import RedisBroker
 from log_config import logger
+
+
+_RATE_LIMIT_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local cutoff = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local member = ARGV[5]
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+    redis.call('EXPIRE', key, ttl)
+    return {0, count}
+end
+
+redis.call('ZADD', key, now, member)
+redis.call('EXPIRE', key, ttl)
+return {1, count + 1}
+"""
+
+_RATE_LIMIT_STATUS_SCRIPT = """
+local key = KEYS[1]
+local cutoff = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local count = redis.call('ZCARD', key)
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+if count > 0 then
+    redis.call('EXPIRE', key, ttl)
+end
+if #oldest == 0 then
+    return {count, ''}
+end
+return {count, oldest[2]}
+"""
+
+_LOCAL_RATE_LIMIT_MAX_KEYS = 10_000
+_local_rate_limit_buckets: OrderedDict[str, deque[float]] = OrderedDict()
+_local_rate_limit_lock = asyncio.Lock()
 
 class RedisManager:
     _instance = None
@@ -127,93 +174,178 @@ async def close_redis_connection():
     await RedisManager.close()
 
 # Rate limiting functions
+def _rate_limit_parameters(limit: int, window_minutes: int) -> tuple[int, float, int]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    if isinstance(window_minutes, bool) or not isinstance(window_minutes, (int, float)) or window_minutes <= 0:
+        raise ValueError("window_minutes must be positive")
+
+    window_seconds = float(window_minutes) * 60
+    ttl_seconds = max(1, math.ceil(window_seconds + 60))
+    return limit, window_seconds, ttl_seconds
+
+
+def _prune_local_bucket(bucket: deque[float], cutoff: float) -> None:
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+
+
+def _get_local_bucket(key: str) -> deque[float]:
+    bucket = _local_rate_limit_buckets.get(key)
+    if bucket is None:
+        if len(_local_rate_limit_buckets) >= _LOCAL_RATE_LIMIT_MAX_KEYS:
+            _local_rate_limit_buckets.popitem(last=False)
+        bucket = deque()
+        _local_rate_limit_buckets[key] = bucket
+    else:
+        _local_rate_limit_buckets.move_to_end(key)
+    return bucket
+
+
+async def _record_local_rate_limit(
+    key: str,
+    *,
+    limit: int,
+    window_seconds: float,
+    now: float,
+    enforce_limit: bool,
+) -> tuple[bool, int, Optional[float]]:
+    async with _local_rate_limit_lock:
+        bucket = _get_local_bucket(key)
+        _prune_local_bucket(bucket, now - window_seconds)
+        if enforce_limit and len(bucket) >= limit:
+            oldest = bucket[0] if bucket else None
+            return False, len(bucket), oldest
+        bucket.append(now)
+        return True, len(bucket), bucket[0]
+
+
+async def _get_local_rate_limit_status(
+    key: str,
+    *,
+    window_seconds: float,
+    now: float,
+) -> tuple[int, Optional[float]]:
+    async with _local_rate_limit_lock:
+        bucket = _get_local_bucket(key)
+        _prune_local_bucket(bucket, now - window_seconds)
+        if not bucket:
+            _local_rate_limit_buckets.pop(key, None)
+            return 0, None
+        return len(bucket), bucket[0]
+
+
 async def check_rate_limit(user_id: int, action: str = "ai_call", limit: int = 30, window_minutes: int = 1) -> bool:
     """
     Check if user has exceeded rate limit for a specific action.
     Uses sliding window counter with Redis.
-    
+
     Args:
         user_id: User ID to check
-        action: Action type (default: 'ai_call')  
+        action: Action type (default: 'ai_call')
         limit: Max requests per window (default: 30)
         window_minutes: Time window in minutes (default: 1)
-    
+
     Returns:
         True if under limit, False if exceeded
     """
+    limit, window_seconds, ttl_seconds = _rate_limit_parameters(limit, window_minutes)
+    current_time = time.time()
+    window_start = current_time - window_seconds
+    key = f"rate_limit:{action}:{user_id}"
+    member = f"{time.time_ns()}:{secrets.token_hex(8)}"
+
     try:
-        import time
-        current_time = int(time.time())
-        window_start = current_time - (window_minutes * 60)
-        
-        # Use sorted set to track requests in time window
-        key = f"rate_limit:{action}:{user_id}"
-        
-        # Remove old entries outside the window
-        await redis_client.zremrangebyscore(key, 0, window_start)
-        
-        # Count current requests in window
-        current_count = await redis_client.zcard(key)
-        
-        if current_count >= limit:
-            logger.warning(f"Rate limit exceeded for user {user_id}, action {action}: {current_count}/{limit}")
-            return False
-        
-        # Add current request to set
-        await redis_client.zadd(key, {str(current_time): current_time})
-        
-        # Set expiry for the key (cleanup old keys)
-        await redis_client.expire(key, window_minutes * 60 + 60)
-        
-        return True
-        
+        result = await redis_client.eval(
+            _RATE_LIMIT_SCRIPT,
+            1,
+            key,
+            current_time,
+            window_start,
+            limit,
+            ttl_seconds,
+            member,
+        )
+        allowed = bool(int(result[0]))
+        current_count = int(result[1])
+        if allowed:
+            # Mirror accepted requests so a Redis outage degrades to a bounded,
+            # process-local limiter instead of suddenly failing open.
+            await _record_local_rate_limit(
+                key,
+                limit=limit,
+                window_seconds=window_seconds,
+                now=current_time,
+                enforce_limit=False,
+            )
+        else:
+            logger.warning(
+                "Rate limit exceeded for user %s, action %s: %s/%s",
+                user_id,
+                action,
+                current_count,
+                limit,
+            )
+        return allowed
     except Exception as e:
         logger.error(f"Error checking rate limit for user {user_id}: {e}")
-        # On Redis error, allow request (fail open)
-        return True
+        allowed, current_count, _ = await _record_local_rate_limit(
+            key,
+            limit=limit,
+            window_seconds=window_seconds,
+            now=current_time,
+            enforce_limit=True,
+        )
+        if not allowed:
+            logger.warning(
+                "Local rate limit exceeded for user %s, action %s: %s/%s",
+                user_id,
+                action,
+                current_count,
+                limit,
+            )
+        return allowed
 
 async def get_rate_limit_status(user_id: int, action: str = "ai_call", limit: int = 30, window_minutes: int = 1) -> dict:
     """
     Get current rate limit status for user.
-    
+
     Returns:
         Dict with current count, limit, and reset time
     """
+    limit, window_seconds, ttl_seconds = _rate_limit_parameters(limit, window_minutes)
+    current_time = time.time()
+    key = f"rate_limit:{action}:{user_id}"
+
     try:
-        import time
-        current_time = int(time.time())
-        window_start = current_time - (window_minutes * 60)
-        
-        key = f"rate_limit:{action}:{user_id}"
-        
-        # Clean old entries and count current
-        await redis_client.zremrangebyscore(key, 0, window_start)
-        current_count = await redis_client.zcard(key)
-        
-        # Calculate when the oldest request will expire
-        oldest_requests = await redis_client.zrange(key, 0, 0, withscores=True)
-        reset_time = None
-        if oldest_requests:
-            oldest_timestamp = int(oldest_requests[0][1])
-            reset_time = oldest_timestamp + (window_minutes * 60)
-        
-        return {
-            "current": current_count,
-            "limit": limit,
-            "remaining": max(0, limit - current_count),
-            "reset_time": reset_time,
-            "window_minutes": window_minutes
-        }
-        
+        result = await redis_client.eval(
+            _RATE_LIMIT_STATUS_SCRIPT,
+            1,
+            key,
+            current_time - window_seconds,
+            ttl_seconds,
+        )
+        current_count = int(result[0])
+        oldest_timestamp = float(result[1]) if result[1] not in (None, "", b"") else None
     except Exception as e:
         logger.error(f"Error getting rate limit status for user {user_id}: {e}")
-        return {
-            "current": 0,
-            "limit": limit,
-            "remaining": limit,
-            "reset_time": None,
-            "window_minutes": window_minutes
-        }
+        current_count, oldest_timestamp = await _get_local_rate_limit_status(
+            key,
+            window_seconds=window_seconds,
+            now=current_time,
+        )
+
+    reset_time = None
+    if oldest_timestamp is not None:
+        reset_time = math.ceil(oldest_timestamp + window_seconds)
+
+    return {
+        "current": current_count,
+        "limit": limit,
+        "remaining": max(0, limit - current_count),
+        "reset_time": reset_time,
+        "window_minutes": window_minutes,
+    }
 
 # Basic metrics functions
 async def increment_metric(metric_name: str, value: int = 1, ttl_hours: int = 24):

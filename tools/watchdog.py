@@ -16,13 +16,18 @@ import orjson
 
 from database import get_db_connection
 from common import (
-    consume_token,
     decrypt_api_key,
     extract_post_watchdog_config,
     get_llm_info,
-    get_llm_token_costs,
     get_user_api_key_mode,
     resolve_api_key_for_provider,
+)
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    refund_fixed_usage,
+    reserve_ai_provider_call,
+    settle_ai_reservation_components,
 )
 from tools.llm_caller import (
     call_llm_non_streaming_with_usage,
@@ -335,6 +340,36 @@ async def run_watchdog_evaluation(
             return
 
         try:
+            billing_reservation_id = await _reserve_watchdog_tokens(
+                user_id=user_id,
+                prompt_id=prompt_id,
+                llm_info=llm_info,
+                system_prompt=steering_prompt_text,
+                user_message=eval_prompt,
+                max_tokens=500,
+                byok=resolved_key is not None,
+            )
+        except InsufficientBalanceError:
+            await _persist_error_event(
+                conversation_id,
+                prompt_id,
+                user_message_id,
+                bot_message_id,
+                "Insufficient balance for watchdog evaluation",
+            )
+            return
+        except BillingReservationError as exc:
+            logger.error("watchdog: could not reserve evaluator billing: %s", exc)
+            await _persist_error_event(
+                conversation_id,
+                prompt_id,
+                user_message_id,
+                bot_message_id,
+                "Watchdog billing is temporarily unavailable",
+            )
+            return
+
+        try:
             response = await call_llm_non_streaming_with_usage(
                 machine=llm_info["machine"],
                 model=llm_info["model"],
@@ -345,29 +380,46 @@ async def run_watchdog_evaluation(
                 api_key_override=resolved_key,
             )
             raw_response = response.text
+        except asyncio.CancelledError:
+            await _refund_watchdog_reservation(billing_reservation_id)
+            raise
         except Exception as exc:
+            await _refund_watchdog_reservation(billing_reservation_id)
             logger.error("watchdog: LLM call failed for conv=%d: %s", conversation_id, exc)
             await _persist_error_event(conversation_id, prompt_id, user_message_id, bot_message_id,
                                        f"LLM call error: {exc}")
             return
 
-        # 7b. Billing: consume evaluator tokens through the same platform path
         try:
-            await _consume_watchdog_tokens(
+            await _settle_watchdog_tokens(
+                reservation_id=billing_reservation_id,
                 user_id=user_id,
                 prompt_id=prompt_id,
-                model=llm_info["model"],
+                llm_info=llm_info,
                 input_tokens=response.input_tokens,
                 output_tokens=response.output_tokens,
                 byok=resolved_key is not None,
             )
-        except Exception:
+            await _refund_watchdog_reservation(billing_reservation_id)
+        except asyncio.CancelledError:
+            await _refund_watchdog_reservation(billing_reservation_id)
+            raise
+        except Exception as exc:
+            await _refund_watchdog_reservation(billing_reservation_id)
             logger.error(
                 "watchdog: failed to bill evaluator call for conv=%d user=%d",
                 conversation_id,
                 user_id,
                 exc_info=True,
             )
+            await _persist_error_event(
+                conversation_id,
+                prompt_id,
+                user_message_id,
+                bot_message_id,
+                f"Watchdog billing error: {exc}",
+            )
+            return
 
         # 8. Parse response JSON
         parsed = extract_json_from_llm_response(raw_response)
@@ -618,46 +670,67 @@ async def _read_user_api_keys(user_id: int) -> dict:
         return {}
 
 
-async def _consume_watchdog_tokens(
+async def _reserve_watchdog_tokens(
     user_id: int,
     prompt_id: int,
-    model: str,
+    llm_info: dict,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int,
+    byok: bool,
+) -> str | None:
+    reservation_id, _ = await reserve_ai_provider_call(
+        user_id=user_id,
+        prompt_id=prompt_id,
+        input_payload=(system_prompt, user_message),
+        maximum_output_tokens=max_tokens,
+        input_cost_per_million=llm_info.get("input_token_cost", 0),
+        output_cost_per_million=llm_info.get("output_token_cost", 0),
+        byok=byok,
+    )
+    return reservation_id
+
+
+async def _settle_watchdog_tokens(
+    *,
+    reservation_id: str | None,
+    user_id: int,
+    prompt_id: int,
+    llm_info: dict,
     input_tokens: int,
     output_tokens: int,
-    byok: bool = False,
-):
-    # Some providers may omit usage. In that case billing is best-effort with zeroes.
-    input_tokens = int(input_tokens or 0)
-    output_tokens = int(output_tokens or 0)
+    byok: bool,
+) -> None:
+    if not reservation_id:
+        return
+    settled = await settle_ai_reservation_components(
+        reservation_id=reservation_id,
+        user_id=user_id,
+        prompt_id=prompt_id,
+        components=[
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "input_cost_per_million": llm_info.get("input_token_cost", 0),
+                "output_cost_per_million": llm_info.get("output_token_cost", 0),
+                "byok": byok,
+            }
+        ],
+    )
+    if not settled:
+        raise BillingReservationError("Watchdog billing reservation is not active")
 
-    async with get_db_connection() as conn:
-        await conn.execute("BEGIN IMMEDIATE")
-        cursor = await conn.cursor()
-        try:
-            input_cost, output_cost = await get_llm_token_costs(model, conn)
-            billed = await consume_token(
-                user_id=user_id,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                input_token_cost_per_million=input_cost,
-                output_token_cost_per_million=output_cost,
-                conn=conn,
-                cursor=cursor,
-                prompt_id=prompt_id,
-                byok=byok,
-            )
-            if not billed:
-                logger.warning(
-                    "watchdog: billing returned False for user=%d model=%s input=%d output=%d",
-                    user_id,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                )
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
+
+async def _refund_watchdog_reservation(reservation_id: str | None) -> None:
+    if not reservation_id:
+        return
+    try:
+        await refund_fixed_usage(reservation_id)
+    except BillingReservationError:
+        logger.exception(
+            "watchdog: could not release billing reservation %s",
+            reservation_id,
+        )
 
 
 async def _persist_event(
@@ -965,6 +1038,23 @@ Locks are NOT justified for:
 The conversation may be in any language. Evaluate the behavior regardless of language."""
 
     try:
+        billing_reservation_id = await _reserve_watchdog_tokens(
+            user_id=user_id,
+            prompt_id=prompt_id,
+            llm_info=llm_info,
+            system_prompt=judge_system_prompt,
+            user_message=judge_user_prompt,
+            max_tokens=300,
+            byok=resolved_key is not None,
+        )
+    except InsufficientBalanceError:
+        fallback = analysis[:2000] if analysis else f"Address the {event_type} issue flagged by the monitoring system."
+        return (False, "Insufficient balance for lock judge", fallback)
+    except BillingReservationError as exc:
+        fallback = analysis[:2000] if analysis else f"Address the {event_type} issue flagged by the monitoring system."
+        return (False, f"Lock judge billing error: {exc}", fallback)
+
+    try:
         response = await call_llm_non_streaming_with_usage(
             machine=llm_info["machine"],
             model=llm_info["model"],
@@ -975,18 +1065,15 @@ The conversation may be in any language. Evaluate the behavior regardless of lan
             api_key_override=resolved_key,
         )
 
-        # Bill judge tokens
-        try:
-            await _consume_watchdog_tokens(
-                user_id=user_id,
-                prompt_id=prompt_id,
-                model=llm_info["model"],
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
-                byok=resolved_key is not None,
-            )
-        except Exception:
-            logger.error("Lock judge: failed to bill tokens for conv=%d", conversation_id, exc_info=True)
+        await _settle_watchdog_tokens(
+            reservation_id=billing_reservation_id,
+            user_id=user_id,
+            prompt_id=prompt_id,
+            llm_info=llm_info,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            byok=resolved_key is not None,
+        )
 
         parsed = extract_json_from_llm_response(response.text)
         if parsed is None:
@@ -1014,6 +1101,8 @@ The conversation may be in any language. Evaluate the behavior regardless of lan
         logger.error("Lock judge: LLM call failed for conv=%d: %s", conversation_id, exc)
         fallback = analysis[:2000] if analysis else f"Address the {event_type} issue flagged by the monitoring system."
         return (False, f"Lock judge error: {exc}", fallback)
+    finally:
+        await _refund_watchdog_reservation(billing_reservation_id)
 
 
 async def _finalize_conversation_lock(
@@ -1409,32 +1498,36 @@ async def run_pre_watchdog_evaluation(
     # Append security suffix (no role-coherence for pre-watchdog)
     steering_prompt_text += WATCHDOG_SECURITY_SUFFIX
 
-    # 5. Call evaluator LLM
-    response = await call_llm_non_streaming_with_usage(
-        machine=llm_info["machine"],
-        model=llm_info["model"],
+    billing_reservation_id = await _reserve_watchdog_tokens(
+        user_id=user_id,
+        prompt_id=prompt_id,
+        llm_info=llm_info,
         system_prompt=steering_prompt_text,
         user_message=eval_prompt,
-        timeout=15,
         max_tokens=400,
-        api_key_override=resolved_key,
+        byok=resolved_key is not None,
     )
-
-    # 6. Bill tokens
     try:
-        await _consume_watchdog_tokens(
+        response = await call_llm_non_streaming_with_usage(
+            machine=llm_info["machine"],
+            model=llm_info["model"],
+            system_prompt=steering_prompt_text,
+            user_message=eval_prompt,
+            timeout=15,
+            max_tokens=400,
+            api_key_override=resolved_key,
+        )
+        await _settle_watchdog_tokens(
+            reservation_id=billing_reservation_id,
             user_id=user_id,
             prompt_id=prompt_id,
-            model=llm_info["model"],
+            llm_info=llm_info,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
             byok=resolved_key is not None,
         )
-    except Exception:
-        logger.error(
-            "pre-watchdog: failed to bill evaluator call for conv=%d user=%d",
-            conversation_id, user_id, exc_info=True,
-        )
+    finally:
+        await _refund_watchdog_reservation(billing_reservation_id)
 
     # 7. Parse JSON response
     parsed = extract_json_from_llm_response(response.text)

@@ -24,7 +24,8 @@
             <thead>
                 <tr>
                     <th>Code</th>
-                    <th>Discount Value</th>
+                    <th>Scope</th>
+                    <th>Value</th>
                     <th>Active</th>
                     <th>Validity Date</th>
                     <th>Usage Count</th>
@@ -35,7 +36,14 @@
                 {% for discount in discounts %}
                 <tr>
                     <td>{{ discount.code }}</td>
-                    <td>{{ discount.discount_value }}%</td>
+                    <td>{{ 'Wallet' if discount.scope == 'wallet' else 'Marketplace' }}</td>
+                    <td>
+                        {% if discount.scope == 'wallet' %}
+                            ${{ '%.2f'|format(discount.wallet_grant_amount) }} credit
+                        {% else %}
+                            {{ discount.discount_value }}%
+                        {% endif %}
+                    </td>
                     <td>{{ 'Yes' if discount.active else 'No' }}</td>
                     <td>{{ discount.validity_date if discount.validity_date else 'Unlimited' }}</td>
                     <td>{{ discount.usage_count if discount.usage_count is not none else 'Unlimited' }}</td>
@@ -66,8 +74,20 @@
                 <form id="editDiscountForm" data-form-guard>
                     <input type="hidden" id="editCode" name="code">
                     <div class="mb-3">
+                        <label for="editScope" class="form-label">Scope</label>
+                        <select class="form-select" id="editScope" name="scope" onchange="toggleEditDiscountScope()">
+                            <option value="marketplace">Marketplace purchase discount</option>
+                            <option value="wallet">Fixed wallet credit</option>
+                        </select>
+                    </div>
+                    <div class="mb-3" id="editMarketplaceDiscountFields">
                         <label for="editDiscountValue" class="form-label">Discount Value (%)</label>
-                        <input type="text" class="form-control" id="editDiscountValue" name="discount_value" inputmode="numeric" pattern="[0-9]*" oninput="this.value = this.value.replace(/[^0-9]/g, '')" required>
+                        <input type="number" class="form-control" id="editDiscountValue" name="discount_value" min="0.01" max="100" step="0.01" required>
+                    </div>
+                    <div class="mb-3" id="editWalletGrantFields" style="display: none;">
+                        <label for="editWalletGrantAmount" class="form-label">Wallet Credit (USD)</label>
+                        <input type="number" class="form-control" id="editWalletGrantAmount" name="wallet_grant_amount" min="5" max="500" step="0.01" disabled>
+                        <small class="form-text text-muted">Fixed amount; one redemption per user.</small>
                     </div>
                     <div class="mb-3 form-check">
                         <input type="checkbox" class="form-check-input" id="editActive" name="active">
@@ -107,12 +127,15 @@
             .then(response => response.json())
             .then(data => {
                 $('#editCode').val(data.code);
+                $('#editScope').val(data.scope || 'marketplace');
                 $('#editDiscountValue').val(data.discount_value);
+                $('#editWalletGrantAmount').val(data.wallet_grant_amount);
                 $('#editActive').prop('checked', data.active);
                 $('#editValidityDate').val(data.validity_date);
                 $('#editUnlimitedValidity').prop('checked', data.unlimited_validity);
                 $('#editUsageCount').val(data.usage_count);
                 $('#editUnlimitedUsage').prop('checked', data.unlimited_usage);
+                toggleEditDiscountScope();
 
                 $('#editDiscountModal').modal('show');
             })
@@ -126,14 +149,15 @@
             method: 'POST',
             body: formData
         })
-        .then(response => response.json())
-        .then(data => {
+        .then(async response => {
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Could not update discount');
             FormGuard.markClean(document.getElementById('editDiscountForm'));
             NotificationModal.info('Discount Updated', data.message);
             $('#editDiscountModal').modal('hide');
             location.reload();
         })
-        .catch(error => console.error('Error:', error));
+        .catch(error => NotificationModal.error('Update Failed', error.message));
     }
 
     function deleteDiscount(code) {
@@ -164,5 +188,17 @@
     $('#editUnlimitedUsage').change(function() {
         $('#editUsageCount').prop('disabled', this.checked);
     });
+
+    function toggleEditDiscountScope() {
+        const isWallet = document.getElementById('editScope').value === 'wallet';
+        const discountInput = document.getElementById('editDiscountValue');
+        const walletGrantInput = document.getElementById('editWalletGrantAmount');
+        document.getElementById('editMarketplaceDiscountFields').style.display = isWallet ? 'none' : '';
+        document.getElementById('editWalletGrantFields').style.display = isWallet ? '' : 'none';
+        discountInput.disabled = isWallet;
+        discountInput.required = !isWallet;
+        walletGrantInput.disabled = !isWallet;
+        walletGrantInput.required = isWallet;
+    }
 </script>
 {% endblock %}

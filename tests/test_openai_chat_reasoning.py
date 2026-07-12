@@ -1,5 +1,7 @@
 import orjson
+import aiohttp
 import pytest
+from unittest.mock import AsyncMock
 
 from ai_runtime.providers import openai_chat
 
@@ -58,6 +60,145 @@ def _sse_payload(event: str) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_partial_stream_usage_is_accumulated_even_when_provider_then_fails(
+    monkeypatch,
+):
+    class _FailingContent:
+        async def iter_chunked(self, _size):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise aiohttp.ClientError("connection lost")
+
+    class _FailingResponse(_FakeResponse):
+        def __init__(self):
+            self.content = _FailingContent()
+
+    class _FailingSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _FailingResponse()
+
+    accumulate = AsyncMock(return_value=(20, 2))
+    save = AsyncMock(return_value=(10, 11))
+    monkeypatch.setattr(openai_chat.aiohttp, "ClientSession", _FailingSession)
+    monkeypatch.setattr(
+        openai_chat,
+        "accumulate_ai_provider_call_usage",
+        accumulate,
+    )
+    monkeypatch.setattr(openai_chat, "save_content_to_db", save)
+    monkeypatch.setattr(openai_chat, "record_provider_error_for_label", AsyncMock())
+    monkeypatch.setattr(openai_chat, "record_provider_success_for_label", AsyncMock())
+
+    chunks = [
+        chunk
+        async for chunk in openai_chat.call_llm_api(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-test",
+            temperature=0.7,
+            max_tokens=100,
+            prompt="system",
+            conversation_id=123,
+            current_user=_User(),
+            request=None,
+            api_url="https://example.invalid/v1/chat/completions",
+            api_key="test",
+            provider_label="OpenAI (GPT)",
+            user_message="hi",
+            save_to_db=True,
+            billing_reservation_id="ai-reservation",
+        )
+    ]
+
+    assert any("partial" in chunk for chunk in chunks)
+    accumulate.assert_awaited_once()
+    assert accumulate.await_args.kwargs["output_payload"][0] == "partial"
+    save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_o1_reasoning_tokens_are_not_charged_twice(monkeypatch):
+    response_payload = {
+        "choices": [{"message": {"content": "answer"}}],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 11,
+            "total_tokens": 16,
+            "completion_tokens_details": {"reasoning_tokens": 7},
+        },
+    }
+
+    class _O1Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return response_payload
+
+        async def text(self):
+            return ""
+
+    class _O1Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _O1Response()
+
+    save = AsyncMock(return_value=(10, 11))
+    monkeypatch.setattr(openai_chat.aiohttp, "ClientSession", _O1Session)
+    monkeypatch.setattr(openai_chat, "save_content_to_db", save)
+    monkeypatch.setattr(
+        openai_chat,
+        "accumulate_ai_provider_call_usage",
+        AsyncMock(return_value=(5, 11)),
+    )
+    monkeypatch.setattr(
+        openai_chat,
+        "record_provider_success_for_label",
+        AsyncMock(),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in openai_chat.call_o1_api(
+            messages=[{"role": "user", "content": "hi"}],
+            model="o1-test",
+            temperature=1,
+            max_tokens=100,
+            prompt="system",
+            conversation_id=321,
+            current_user=_User(),
+            request=None,
+            user_message="hi",
+            llm_id=9,
+            billing_reservation_id="ai-reservation",
+        )
+    ]
+
+    assert chunks
+    save.assert_awaited_once()
+    args = save.await_args.args
+    assert args[1:4] == (5, 11, 16)
+    assert save.await_args.kwargs["billing_reservation_id"] == "ai-reservation"
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_reasoning_streams_as_thinking(monkeypatch):
     payload = "\n\n".join([
         'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}',
@@ -107,6 +248,7 @@ async def test_openai_compatible_tool_call_preserves_reasoning_content(monkeypat
     payload = "\n\n".join([
         'data: {"choices":[{"delta":{"reasoning_content":"need a search"}}]}',
         'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"query_perplexity","arguments":"{\\"query\\":\\"docs\\"}"}}]},"finish_reason":"tool_calls"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}',
         "data: [DONE]",
         "",
     ])
@@ -145,6 +287,7 @@ async def test_openai_compatible_tool_call_preserves_reasoning_content(monkeypat
         "name": "query_perplexity",
         "arguments": {"query": "docs"},
         "id": "call_1",
+        "_billing_usage": {"input_tokens": 2, "output_tokens": 3},
         "reasoning_content": "need a search",
     }]
 

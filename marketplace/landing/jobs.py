@@ -16,6 +16,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Literal
 
+from marketplace.landing.sandbox import get_wizard_sandbox_status
+
 # Project paths. This module lives under marketplace/landing/.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 JOBS_DIR = PROJECT_ROOT / "data" / "jobs" / "landing"
@@ -487,6 +489,14 @@ def start_job(
     Returns:
         Job record with task_id
     """
+    sandbox_status = get_wizard_sandbox_status()
+    if not sandbox_status.available:
+        return {
+            "success": False,
+            "error": "AI Wizard is disabled until a verified OS sandbox is configured",
+            "error_code": "WIZARD_SANDBOX_UNAVAILABLE",
+        }
+
     # Check for existing active job (target-aware: landing and welcome can run in parallel)
     if target == "welcome":
         if pack_id:

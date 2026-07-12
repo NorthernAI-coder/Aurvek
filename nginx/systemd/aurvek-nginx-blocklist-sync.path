@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch Aurvek dynamic IP blocklist
+After=nginx.service
+
+[Path]
+# Aurvek publishes with atomic rename. Watch the parent directory because
+# systemd can miss an inode replacement when PathChanged targets the file.
+PathChanged=/opt/aurvek-data
+Unit=aurvek-nginx-blocklist-sync.service
+
+[Install]
+WantedBy=multi-user.target

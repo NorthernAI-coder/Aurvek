@@ -456,6 +456,7 @@ function createFolderChatElement(conversation) {
     chatElement.className = 'list-group-item list-group-item-action folder-chat-item';
     chatElement.dataset.conversationId = conversation.id;
     chatElement.dataset.lastActivity = conversation.last_activity || '';
+    chatElement._conversationData = conversation;
 
     const chatName = conversation.chat_name || `Chat ${conversation.id}`;
     
@@ -472,8 +473,14 @@ function createFolderChatElement(conversation) {
     
     // Create the complete chat menu (same as main chats)
     const chatMenu = createChatMenuForFolder(conversation);
-    
+    const externalDeviceBadge = typeof createExternalDeviceBadge === 'function'
+        ? createExternalDeviceBadge(conversation)
+        : null;
     chatContent.appendChild(chatInfo);
+    if (externalDeviceBadge) {
+        chatElement.classList.add('external-device-row');
+        chatContent.appendChild(externalDeviceBadge);
+    }
     chatContent.appendChild(chatMenu);
     chatElement.appendChild(chatContent);
 
@@ -485,7 +492,7 @@ function createFolderChatElement(conversation) {
 
     // Click handler to continue conversation
     chatElement.addEventListener('click', (e) => {
-        if (!e.target.closest('.chat-menu')) {
+        if (!e.target.closest('.chat-menu') && !e.target.closest('.external-device-badge')) {
             // Remove active-chat class from ALL chats everywhere
             document.querySelectorAll('.active-chat').forEach(el => {
                 el.classList.remove('active-chat');
@@ -545,6 +552,11 @@ function createChatMenuForFolder(conversation) {
     // Telegram option
     const telegramLink = createPlatformLink('telegram', conversation);
     chatMenuContent.appendChild(telegramLink);
+
+    if (!conversation.external_platform) {
+        const externalAccessLink = createMenuLink('fa-plug', 'External access', () => openExternalAccessModal(conversation.id));
+        chatMenuContent.appendChild(externalAccessLink);
+    }
 
     // Add folder options section
     addFolderOptionsToMenu(chatMenuContent, conversation.id, true);
@@ -1229,6 +1241,9 @@ function updateNewChatButtonState() {
 
 // Setup integration with new chat functionality
 function setupNewChatIntegration() {
+    if (window.__foldersNewChatIntegrated) return;
+    window.__foldersNewChatIntegrated = true;
+
     // Store reference to original startNewConversation function if it exists
     if (typeof window.startNewConversation === 'function') {
         window.originalStartNewConversation = window.startNewConversation;
@@ -1263,11 +1278,12 @@ function setupNewChatIntegration() {
     };
     
     // Override startNewConversation to support folders
-    window.startNewConversation = function(promptId = null, options = {}) {
+    window.startNewConversation = async function(promptId = null, options = {}) {
         const incognito = options && options.incognito === true;
+        const targetFolderId = incognito ? null : currentSelectedFolderId;
         
         // If no folder selected, use original function
-        if ((!currentSelectedFolderId || incognito) && typeof window.originalStartNewConversation === 'function') {
+        if ((!targetFolderId || incognito) && typeof window.originalStartNewConversation === 'function') {
             return window.originalStartNewConversation(promptId, options);
         }
         
@@ -1302,37 +1318,56 @@ function setupNewChatIntegration() {
         }
         
         // Add folder_id if a folder is selected
-        if (currentSelectedFolderId && !incognito) {
-            body.folder_id = currentSelectedFolderId;
+        if (targetFolderId && !incognito) {
+            body.folder_id = targetFolderId;
         }
         
         const beforeCreate = typeof maybeCloseCurrentIncognitoBeforeLeaving === 'function'
             ? maybeCloseCurrentIncognitoBeforeLeaving()
             : Promise.resolve(true);
 
-        return beforeCreate.then(canContinue => {
-            if (!canContinue) return Promise.resolve();
-            return secureFetch('/api/conversations/new', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(body)
+        let data;
+        try {
+            const canContinue = await beforeCreate;
+            if (!canContinue) return;
+
+            const response = await secureFetch('/api/conversations/new', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
             });
-        })
-        .then(response => {
-            if (!response) {
-                // secureFetch returned null (likely session expired)
-                throw new Error('Session expired');
+            if (!response) return;
+
+            data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.detail || data.message || 'Conversation creation failed');
             }
-            return response.json();
-        })
-        .then(data => {
+            if (!data || data.id === undefined || data.id === null) {
+                throw new Error('Conversation creation returned an invalid response');
+            }
+        } catch (error) {
+            // A POST may have reached the server even when the response failed.
+            // Never retry it automatically without an idempotency key.
+            console.error('Error creating conversation:', error);
+            if (typeof NotificationModal !== 'undefined') {
+                NotificationModal.error(
+                    'Chat Creation Failed',
+                    'The chat could not be created. Refresh the chat list before trying again.'
+                );
+            }
+            return;
+        }
+
+        try {
             startDate = new Date();
+            isCurrentConversationEmpty = true;
+            isFirstCall = false;
             
-            if (currentSelectedFolderId) {
+            if (targetFolderId) {
                 // If created in folder, reload folder chats and then activate the new chat
-                loadFolderChats(currentSelectedFolderId, () => {
+                await loadFolderChats(targetFolderId, () => {
                     // Callback executed after folder chats are loaded
                     const newFolderChat = document.querySelector(`.folder-chat-item[data-conversation-id="${data.id}"]`);
                     
@@ -1349,7 +1384,7 @@ function setupNewChatIntegration() {
                 });
 
                 // Update only the conversation count for this specific folder
-                updateFolderConversationCount(currentSelectedFolderId);
+                await updateFolderConversationCount(targetFolderId);
                 
                 // Don't add to main conversation list - it's in a folder
             } else {
@@ -1357,23 +1392,17 @@ function setupNewChatIntegration() {
                 addConversationElement(data, data.name, null, true);
             }
             
-            return continueConversation(data.id, data.name, data.machine);
-        })
-        .then(() => {
-            isCurrentConversationEmpty = true; 
-            isFirstCall = false;
-        })
-        .catch(error => {
-            if (error.message === 'Session expired') {
-                // Session validation was already handled by secureFetch, no need to log as error
-                return;
+            await continueConversation(data.id, data.name, data.machine);
+        } catch (error) {
+            console.error('Conversation created, but the chat UI could not be refreshed:', error);
+            try {
+                await loadChatFolders();
+            } catch (refreshError) {
+                console.error('Error refreshing folders after chat creation:', refreshError);
             }
-            console.error('Error creating conversation:', error);
-            // Fall back to original function if available
-            if (typeof window.originalStartNewConversation === 'function') {
-                return window.originalStartNewConversation(promptId, options);
-            }
-        });
+        }
+
+        return data;
     };
 }
 

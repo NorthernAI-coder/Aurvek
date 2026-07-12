@@ -22,10 +22,13 @@ from database import get_db_connection
 from marketplace.config import marketplace_discovery_enabled
 from rate_limiter import (
     RateLimitConfig as RLC,
-    check_failure_limit,
+    check_login_failure_limits,
     check_rate_limits,
+    clear_login_failures,
+    get_login_backoff_seconds,
     get_client_ip,
     record_failure,
+    record_login_failure,
 )
 
 
@@ -164,6 +167,7 @@ async def handle_login_request(
                                             "error": "Magic link has expired.",
                                         },
                                     )
+                                clear_login_failures(request, user_obj.username)
                                 return create_login_response(
                                     user_info,
                                     redirect_url=next_url,
@@ -188,8 +192,6 @@ async def handle_login_request(
         rate_error = check_rate_limits(
             request,
             ip_limit=RLC.LOGIN_BY_IP_ALL,
-            identifier=username,
-            identifier_limit=RLC.LOGIN_BY_USER,
             action_name="login",
         )
         if rate_error:
@@ -198,7 +200,7 @@ async def handle_login_request(
                 {**template_context, "error": rate_error["message"]},
             )
 
-        fail_error = check_failure_limit(request, "login", RLC.LOGIN_BY_IP_FAILURES)
+        fail_error = check_login_failure_limits(request, username)
         if fail_error:
             return templates.TemplateResponse(
                 "login.html",
@@ -208,7 +210,7 @@ async def handle_login_request(
         client_ip = get_client_ip(request)
         captcha_ok, captcha_error = await verify_captcha(captcha_token, client_ip)
         if not captcha_ok:
-            record_failure(request, "login", username)
+            record_failure(request, "login_captcha")
             return templates.TemplateResponse(
                 "login.html",
                 {**template_context, "error": captcha_error},
@@ -217,8 +219,8 @@ async def handle_login_request(
         user_result = await get_user_by_username(username)
 
         if user_result and not user_result.is_enabled:
-            record_failure(request, "login", username)
-            await asyncio.sleep(2)
+            failure_count = record_login_failure(request, username)
+            await asyncio.sleep(get_login_backoff_seconds(failure_count))
             return templates.TemplateResponse(
                 "login.html",
                 {
@@ -229,6 +231,7 @@ async def handle_login_request(
 
         if user_result and user_result.password and user_result.can_use_password():
             if verify_password(user_result.password, password):
+                clear_login_failures(request, username)
                 user_info = await create_user_info(user_result, False)
                 default_redirect = await get_after_login_redirect(user_result.id)
                 return create_login_response(
@@ -237,8 +240,8 @@ async def handle_login_request(
                     default_redirect=default_redirect,
                 )
         else:
-            record_failure(request, "login", username)
-            await asyncio.sleep(2)
+            failure_count = record_login_failure(request, username)
+            await asyncio.sleep(get_login_backoff_seconds(failure_count))
             return templates.TemplateResponse(
                 "login.html",
                 {
@@ -247,8 +250,8 @@ async def handle_login_request(
                 },
             )
 
-        record_failure(request, "login", username)
-        await asyncio.sleep(2)
+        failure_count = record_login_failure(request, username)
+        await asyncio.sleep(get_login_backoff_seconds(failure_count))
         return templates.TemplateResponse(
             "login.html",
             {

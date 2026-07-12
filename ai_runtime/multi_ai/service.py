@@ -1,4 +1,19 @@
+import math
+
 from ai_runtime.dependencies import *
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    accumulate_ai_reservation_usage,
+    estimate_structured_billing_tokens,
+    estimate_structured_usage_tokens,
+    get_user_billing_availability,
+    get_variable_billing_rates,
+    refund_fixed_usage,
+    reserve_ai_usage,
+    revalidate_user_billing,
+    settle_ai_reservation_components,
+)
 from ai_runtime.attachments.pdf import (
     _estimate_pdf_input_tokens_for_preflight,
     _extract_pdf_metadata_from_context_messages,
@@ -91,6 +106,7 @@ async def _run_single_ai(
     input_tokens_collected = 0
     output_tokens_collected = 0
     content_collected = ""
+    provider_error = None
 
     try:
         if apply_no_memory_limit:
@@ -206,7 +222,7 @@ async def _run_single_ai(
                                 "content": content_text,
                             })
                         elif "error" in chunk_data:
-                            error_item = {
+                            provider_error = {
                                 "type": "error",
                                 "llm_id": llm_id,
                                 "model": model,
@@ -231,20 +247,36 @@ async def _run_single_ai(
                                 "retry_token",
                             ):
                                 if key in chunk_data:
-                                    error_item[key] = chunk_data[key]
-                            await queue.put(error_item)
-                            return
+                                    provider_error[key] = chunk_data[key]
                     except orjson.JSONDecodeError:
                         pass
 
-        # Signal done
-        await queue.put({
-            "type": "done",
-            "llm_id": llm_id,
-            "model": model,
-            "input_tokens": input_tokens_collected or int(input_token_fallback or 0),
-            "output_tokens": output_tokens_collected or estimate_message_tokens(content_collected),
-        })
+        usage_observed = bool(
+            input_tokens_collected
+            or output_tokens_collected
+            or content_collected
+        )
+        usage_payload = {
+            "input_tokens": (
+                input_tokens_collected
+                or (int(input_token_fallback or 0) if usage_observed or not provider_error else 0)
+            ),
+            "output_tokens": (
+                output_tokens_collected
+                or estimate_message_tokens(content_collected)
+            ),
+            "billable_usage": usage_observed or provider_error is None,
+        }
+        if provider_error:
+            provider_error.update(usage_payload)
+            await queue.put(provider_error)
+        else:
+            await queue.put({
+                "type": "done",
+                "llm_id": llm_id,
+                "model": model,
+                **usage_payload,
+            })
 
     except Exception as exc:
         error_id = str(uuid.uuid4())[:8]
@@ -252,11 +284,25 @@ async def _run_single_ai(
             "[_run_single_ai] Error for llm_id=%d model=%s error_id=%s: %s",
             llm_id, model, error_id, exc, exc_info=True,
         )
+        usage_observed = bool(
+            input_tokens_collected
+            or output_tokens_collected
+            or content_collected
+        )
         await queue.put({
             "type": "error",
             "llm_id": llm_id,
             "model": model,
             "error": f"Internal error (ref: {error_id})",
+            "input_tokens": (
+                input_tokens_collected
+                or (int(input_token_fallback or 0) if usage_observed else 0)
+            ),
+            "output_tokens": (
+                output_tokens_collected
+                or estimate_message_tokens(content_collected)
+            ),
+            "billable_usage": usage_observed,
         })
 
 
@@ -714,12 +760,10 @@ async def process_multi_ai_message(
     # --- 6. Balance check ---
     # Determine which models are BYOK (user's own API key)
     byok_models = {mid for mid in model_ids if resolved_keys.get(mid) is not None}
-    all_byok = len(byok_models) == len(model_ids)
-    prompt_is_paid = bool(prompt_id) and await _is_prompt_paid(prompt_id)
 
-    from common import BYOK_MIN_BALANCE_PAID_PROMPT
-
-    current_balance = await get_balance(current_user.id)
+    billing_availability = await get_user_billing_availability(current_user.id)
+    current_balance = billing_availability["available"]
+    billing_preflight_amount = 0.0
     model_output_caps = {}
     model_output_fallbacks = {}
     for mid in model_ids:
@@ -730,9 +774,28 @@ async def process_multi_ai_message(
 
     # Estimate max_tokens based on the SUM of costs across all selected models.
     # This is conservative and prevents partial billing failures at commit time.
-    input_tokens_est_base = estimate_message_tokens(user_message)
+    input_tokens_est_base = max(
+        estimate_message_tokens(user_message),
+        estimate_structured_billing_tokens(
+            system_prompt,
+            context_messages_dicts,
+            user_message,
+        ),
+    )
     input_tokens_est_by_model = {
         mid: input_tokens_est_base + _estimate_pdf_input_tokens_for_preflight(
+            context_pdf_pages,
+            llm_infos[mid].get("machine"),
+        )
+        for mid in model_ids
+    }
+    input_usage_fallback_base = estimate_structured_usage_tokens(
+        system_prompt,
+        context_messages_dicts,
+        user_message,
+    )
+    input_usage_fallback_by_model = {
+        mid: input_usage_fallback_base + _estimate_pdf_input_tokens_for_preflight(
             context_pdf_pages,
             llm_infos[mid].get("machine"),
         )
@@ -757,10 +820,7 @@ async def process_multi_ai_message(
         yield f"data: {orjson.dumps({'error': f'Cost configuration missing for models: {missing_cost_ids}'}).decode()}\n\n"
         return
 
-    # Only sum costs for system-key models (BYOK models have zero API cost)
-    sum_input_cost_per_token = 0.0
-    sum_output_cost_per_token = 0.0
-    all_free = True
+    rates_by_id = {}
     for mid in model_ids:
         input_cost_million, output_cost_million = costs_by_id[mid]
         if output_cost_million < 0:
@@ -785,59 +845,53 @@ async def process_multi_ai_message(
             yield f"data: {orjson.dumps({'error': guard_error}).decode()}\n\n"
             return
 
-        if input_cost_million > 0 or output_cost_million > 0:
-            all_free = False
+        rates_by_id[mid] = await get_variable_billing_rates(
+            user_id=current_user.id,
+            prompt_id=prompt_id,
+            input_cost_per_million=input_cost_million,
+            output_cost_per_million=output_cost_million,
+            byok=mid in byok_models,
+        )
 
-        if mid not in byok_models:
-            sum_input_cost_per_token += input_cost_million / 1_000_000
-            sum_output_cost_per_token += output_cost_million / 1_000_000
+    estimated_input_charge = 0.0
+    combined_output_rate = 0.0
+    for mid in model_ids:
+        rates = rates_by_id[mid]
+        if llm_infos[mid].get("machine") == "Claude":
+            estimated_input_charge += (
+                input_tokens_est_by_model[mid] * 4 * rates.input_per_token
+            )
+            combined_output_rate += (
+                6 * rates.input_per_token + 4 * rates.output_per_token
+            )
+        else:
+            estimated_input_charge += (
+                input_tokens_est_by_model[mid] * rates.input_per_token
+            )
+            combined_output_rate += rates.output_per_token
 
-    # Balance checks — after cost detection so we know if models are free
-    if all_byok:
-        # All models use user's keys - no API cost to platform
-        if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
-            yield f"data: {orjson.dumps({'error': 'Insufficient balance for creator markup'}).decode()}\n\n"
-            return
-    elif all_free:
-        # All free models: check paid prompt markup only
-        if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
-            yield f"data: {orjson.dumps({'error': 'Insufficient balance for creator markup'}).decode()}\n\n"
-            return
-    elif current_balance <= 0:
+    available_for_visible_output = current_balance - estimated_input_charge
+    if available_for_visible_output < -1e-12:
         yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
         return
 
-    if all_byok or all_free:
-        # All BYOK or all free models: no API cost constraint on token count
-        max_tokens = shared_model_output_cap
-        balance_limited = False
-    elif sum_output_cost_per_token <= 0:
-        yield f"data: {orjson.dumps({'error': 'Invalid model cost configuration'}).decode()}\n\n"
-        return
-    else:
-        estimated_input_cost = sum(
-            input_tokens_est_by_model[mid] * (costs_by_id[mid][0] / 1_000_000)
-            for mid in model_ids
-            if mid not in byok_models
+    if combined_output_rate > 0:
+        max_affordable_tokens = math.floor(
+            max(0.0, available_for_visible_output) / combined_output_rate
         )
-        if estimated_input_cost >= current_balance:
-            yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
-            return
-
-        available_for_output = current_balance - estimated_input_cost
-        max_affordable_tokens = int(available_for_output / sum_output_cost_per_token)
         max_tokens = int(min(shared_model_output_cap, max_affordable_tokens))
         balance_limited = max_affordable_tokens < shared_model_output_cap
+    else:
+        max_tokens = int(shared_model_output_cap)
+        balance_limited = False
 
-        while max_tokens > 0:
-            estimated_total_cost = estimated_input_cost + (max_tokens * sum_output_cost_per_token)
-            if estimated_total_cost <= current_balance:
-                break
-            max_tokens -= 1
-
-        if max_tokens < 1:
-            yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
-            return
+    if max_tokens < 1:
+        yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+        return
+    billing_preflight_amount = (
+        estimated_input_charge
+        + max_tokens * combined_output_rate
+    )
 
     logger.info(
         "[process_multi_ai_message] Cost pre-check passed: models=%s, byok_models=%s, "
@@ -852,11 +906,68 @@ async def process_multi_ai_message(
     )
 
     # --- 7. Parallel execution ---
+    if not await revalidate_user_billing(
+        current_user.id,
+        billing_preflight_amount,
+    ):
+        yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+        return
+
+    try:
+        ai_reservation_id = await reserve_ai_usage(
+            user_id=current_user.id,
+            maximum_amount=billing_preflight_amount,
+        )
+    except InsufficientBalanceError:
+        yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+        return
+    except BillingReservationError:
+        logger.exception("Could not reserve Multi-AI usage")
+        yield f"data: {orjson.dumps({'error': 'AI billing is temporarily unavailable'}).decode()}\n\n"
+        return
+
     stop_signals[conversation_id] = False
 
     queue = asyncio.Queue()
     tasks = {}
     results = {}
+
+    async def _persist_completed_component(mid: int) -> None:
+        result = results[mid]
+        if (
+            not ai_reservation_id
+            or not result.get("billable_usage")
+            or result.get("component_persisted")
+        ):
+            return
+        input_cost, output_cost = costs_by_id[mid]
+        input_tokens = int(result.get("input_tokens") or 0)
+        output_tokens = int(result.get("output_tokens") or 0)
+        if input_tokens <= 0:
+            input_tokens = input_usage_fallback_by_model[mid]
+        if output_tokens <= 0:
+            output_tokens = estimate_message_tokens(result.get("content", ""))
+        try:
+            await accumulate_ai_reservation_usage(
+                reservation_id=ai_reservation_id,
+                user_id=current_user.id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                component={
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "input_cost_per_million": input_cost,
+                    "output_cost_per_million": output_cost,
+                    "prompt_id": prompt_id,
+                    "byok": mid in byok_models,
+                },
+            )
+            result["component_persisted"] = True
+        except BillingReservationError:
+            logger.exception(
+                "Could not persist completed Multi-AI component %s",
+                mid,
+            )
 
     for mid in model_ids:
         info = llm_infos[mid]
@@ -878,7 +989,10 @@ async def process_multi_ai_message(
                 user_api_key=resolved_keys.get(mid),
                 prompt_id=prompt_id,
                 temperature=0.7,
-                input_token_fallback=input_tokens_est_by_model.get(mid, input_tokens_est_base),
+                input_token_fallback=input_usage_fallback_by_model.get(
+                    mid,
+                    input_usage_fallback_base,
+                ),
                 pdf_error_metadata=context_pdf_error_metadata,
                 apply_no_memory_limit=apply_no_memory_limit,
             )
@@ -891,6 +1005,9 @@ async def process_multi_ai_message(
             "error": False,
             "model": info["model"],
             "machine": info["machine"],
+            "completed": False,
+            "billable_usage": False,
+            "component_persisted": False,
         }
 
     done_count = 0
@@ -903,11 +1020,17 @@ async def process_multi_ai_message(
 
             if item["type"] == "chunk":
                 results[item_llm_id]["content"] += item["content"]
+                results[item_llm_id]["billable_usage"] = True
                 yield f"data: {orjson.dumps({'multi_ai': True, 'llm_id': item_llm_id, 'model': item['model'], 'content': item['content']}).decode()}\n\n"
 
             elif item["type"] == "done":
                 results[item_llm_id]["input_tokens"] = item.get("input_tokens", 0)
                 results[item_llm_id]["output_tokens"] = item.get("output_tokens", 0)
+                results[item_llm_id]["completed"] = True
+                results[item_llm_id]["billable_usage"] = bool(
+                    item.get("billable_usage", True)
+                )
+                await _persist_completed_component(item_llm_id)
                 done_count += 1
                 yield f"data: {orjson.dumps({'multi_ai_done': True, 'llm_id': item_llm_id, 'model': item['model']}).decode()}\n\n"
 
@@ -942,8 +1065,15 @@ async def process_multi_ai_message(
                     }
                     yield f"data: {orjson.dumps(pdf_payload).decode()}\n\n"
                     return
-                results[item_llm_id]["content"] = item.get("error", "Unknown error")
+                if not results[item_llm_id]["content"]:
+                    results[item_llm_id]["content"] = item.get("error", "Unknown error")
+                results[item_llm_id]["input_tokens"] = item.get("input_tokens", 0)
+                results[item_llm_id]["output_tokens"] = item.get("output_tokens", 0)
+                results[item_llm_id]["billable_usage"] = bool(
+                    item.get("billable_usage", False)
+                )
                 results[item_llm_id]["error"] = True
+                await _persist_completed_component(item_llm_id)
                 done_count += 1
                 error_payload = {
                     "multi_ai_error": True,
@@ -962,35 +1092,116 @@ async def process_multi_ai_message(
             task.cancel()
         await asyncio.gather(*tasks.values(), return_exceptions=True)
         raise
+    else:
+        # --- 8. Save combined result ---
+        combined_message = build_multi_ai_message(results, model_ids)
+        total_input = sum(r["input_tokens"] for r in results.values())
+        total_output = sum(r["output_tokens"] for r in results.values())
+
+        try:
+            user_msg_id, bot_msg_id = await save_multi_ai_to_db(
+                combined_message, results, model_ids,
+                total_input, total_output,
+                conversation_id, current_user.id, user_message,
+                prompt_id=prompt_id,
+                watchdog_config=watchdog_config,
+                watchdog_hint_active=watchdog_hint_active,
+                watchdog_hint_eval_id=watchdog_hint_eval_id,
+                byok_models=byok_models,
+                incognito=conversation_incognito,
+                billing_reservation_id=ai_reservation_id,
+            )
+
+            yield f"data: {orjson.dumps({'message_ids': {'user': user_msg_id, 'bot': bot_msg_id}}).decode()}\n\n"
+        except MultiAiBillingError as exc:
+            logger.warning("[process_multi_ai_message] Multi-AI billing failed: %s", exc)
+            yield f"data: {orjson.dumps({'error': 'Insufficient balance to finalize Multi-AI response'}).decode()}\n\n"
+        except Exception as exc:
+            logger.error("[process_multi_ai_message] Failed to save to DB: %s", exc, exc_info=True)
+            yield f"data: {orjson.dumps({'error': 'Failed to save response'}).decode()}\n\n"
+
+        yield "data: [DONE]\n\n"
     finally:
         for task in tasks.values():
             if not task.done():
                 task.cancel()
-
-    # --- 8. Save combined result ---
-    combined_message = build_multi_ai_message(results, model_ids)
-    total_input = sum(r["input_tokens"] for r in results.values())
-    total_output = sum(r["output_tokens"] for r in results.values())
-
-    try:
-        user_msg_id, bot_msg_id = await save_multi_ai_to_db(
-            combined_message, results, model_ids,
-            total_input, total_output,
-            conversation_id, current_user.id, user_message,
-            prompt_id=prompt_id,
-            watchdog_config=watchdog_config,
-            watchdog_hint_active=watchdog_hint_active,
-            watchdog_hint_eval_id=watchdog_hint_eval_id,
-            byok_models=byok_models,
-            incognito=conversation_incognito,
-        )
-
-        yield f"data: {orjson.dumps({'message_ids': {'user': user_msg_id, 'bot': bot_msg_id}}).decode()}\n\n"
-    except MultiAiBillingError as exc:
-        logger.warning("[process_multi_ai_message] Multi-AI billing failed: %s", exc)
-        yield f"data: {orjson.dumps({'error': 'Insufficient balance to finalize Multi-AI response'}).decode()}\n\n"
-    except Exception as exc:
-        logger.error("[process_multi_ai_message] Failed to save to DB: %s", exc, exc_info=True)
-        yield f"data: {orjson.dumps({'error': 'Failed to save response'}).decode()}\n\n"
-
-    yield "data: [DONE]\n\n"
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        while True:
+            try:
+                pending_item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            pending_llm_id = pending_item.get("llm_id")
+            if pending_item.get("type") == "done" and pending_llm_id in results:
+                results[pending_llm_id]["input_tokens"] = pending_item.get(
+                    "input_tokens", 0
+                )
+                results[pending_llm_id]["output_tokens"] = pending_item.get(
+                    "output_tokens", 0
+                )
+                results[pending_llm_id]["completed"] = True
+                results[pending_llm_id]["billable_usage"] = bool(
+                    pending_item.get("billable_usage", True)
+                )
+            elif pending_item.get("type") == "error" and pending_llm_id in results:
+                results[pending_llm_id]["input_tokens"] = pending_item.get(
+                    "input_tokens", 0
+                )
+                results[pending_llm_id]["output_tokens"] = pending_item.get(
+                    "output_tokens", 0
+                )
+                results[pending_llm_id]["billable_usage"] = bool(
+                    pending_item.get("billable_usage", False)
+                )
+                results[pending_llm_id]["error"] = True
+        try:
+            if ai_reservation_id:
+                for mid in model_ids:
+                    await _persist_completed_component(mid)
+                components = []
+                for mid in model_ids:
+                    result = results[mid]
+                    if not (
+                        result.get("completed")
+                        or result.get("billable_usage")
+                    ):
+                        continue
+                    input_cost, output_cost = costs_by_id[mid]
+                    reported_input = int(result.get("input_tokens") or 0)
+                    reported_output = int(result.get("output_tokens") or 0)
+                    components.append(
+                        {
+                            "input_tokens": (
+                                reported_input
+                                if reported_input > 0
+                                else input_usage_fallback_by_model[mid]
+                            ),
+                            "output_tokens": (
+                                reported_output
+                                if reported_output > 0
+                                else estimate_message_tokens(result.get("content", ""))
+                            ),
+                            "input_cost_per_million": input_cost,
+                            "output_cost_per_million": output_cost,
+                            "byok": mid in byok_models,
+                        }
+                    )
+                await settle_ai_reservation_components(
+                    reservation_id=ai_reservation_id,
+                    user_id=current_user.id,
+                    prompt_id=prompt_id,
+                    components=components,
+                )
+        except BillingReservationError:
+            logger.exception(
+                "Could not capture unfinished Multi-AI usage %s",
+                ai_reservation_id,
+            )
+        try:
+            if ai_reservation_id:
+                await refund_fixed_usage(ai_reservation_id)
+        except BillingReservationError:
+            logger.exception(
+                "Could not release unfinished Multi-AI reservation %s",
+                ai_reservation_id,
+            )

@@ -1,0 +1,61 @@
+{% extends 'base.html' %}
+
+{% block title %}Secure checkout - AURVEK{% endblock %}
+
+{% block content %}
+<div class="container py-5" style="max-width: 620px;">
+    <div class="card shadow-sm">
+        <div class="card-body p-4 text-center">
+            <h1 class="h3 mb-3">Secure checkout</h1>
+            <p class="mb-1">{{ prompt_name }}</p>
+            <p class="h4 mb-4">${{ '%.2f'|format(purchase_price) }}</p>
+            <div id="checkoutStatus" class="alert alert-info" role="status">
+                Preparing your checkout…
+            </div>
+            <button id="checkoutRetry" type="button" class="btn btn-primary d-none">
+                Try again
+            </button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts_inline %}
+<script>
+(function () {
+    const status = document.getElementById('checkoutStatus');
+    const retry = document.getElementById('checkoutRetry');
+
+    async function startCheckout() {
+        retry.classList.add('d-none');
+        status.className = 'alert alert-info';
+        status.textContent = 'Preparing your checkout…';
+        try {
+            const response = await fetch('/api/prompts/{{ prompt_id }}/purchase', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: '{}'
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Checkout could not be created');
+            if (data.checkout_url) {
+                window.location.assign(data.checkout_url);
+                return;
+            }
+            if (data.redirect || data.free_purchase) {
+                window.location.assign(data.redirect || '/chat');
+                return;
+            }
+            throw new Error(data.message || 'Checkout could not be created');
+        } catch (error) {
+            status.className = 'alert alert-danger';
+            status.textContent = error.message || 'Checkout could not be created';
+            retry.classList.remove('d-none');
+        }
+    }
+
+    retry.addEventListener('click', startCheckout);
+    startCheckout();
+})();
+</script>
+{% endblock %}

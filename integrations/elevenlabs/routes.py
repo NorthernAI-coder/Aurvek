@@ -8,7 +8,11 @@ from fastapi.responses import JSONResponse
 
 from auth import get_current_user, unauthenticated_response
 from database import get_db_connection
-from integrations.elevenlabs.service import service as elevenlabs_service
+from integrations.elevenlabs.service import (
+    ElevenLabsProviderSessionError,
+    ElevenLabsSessionBindingError,
+    service as elevenlabs_service,
+)
 from log_config import logger
 from models import User
 from tasks import download_elevenlabs_audio_task
@@ -34,6 +38,36 @@ def _pause_response(active_pause: dict) -> JSONResponse:
         },
         status_code=429,
     )
+
+
+def _binding_error_response(error_code: str) -> JSONResponse:
+    return JSONResponse(
+        content={
+            "error": error_code,
+            "message": "This voice session is not linked to this conversation.",
+        },
+        status_code=409,
+    )
+
+
+async def _mark_session_failed(
+    conversation_id: int,
+    session_id: str,
+    user_id: int,
+) -> None:
+    try:
+        await elevenlabs_service.mark_session_status(
+            conversation_id,
+            session_id,
+            "failed",
+            user_id,
+        )
+    except ElevenLabsSessionBindingError:
+        logger.warning(
+            "[ElevenLabs] Could not mark unbound session %s failed for conversation %s",
+            session_id,
+            conversation_id,
+        )
 
 
 @router.get("/api/conversations/{conversation_id}/elevenlabs/config")
@@ -82,7 +116,8 @@ async def start_elevenlabs_session(
         return JSONResponse(content={"error": "ElevenLabs integration is disabled"}, status_code=503)
 
     payload = await request.json()
-    session_id = (payload.get("session_id") or "").strip()
+    raw_session_id = payload.get("session_id")
+    session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
 
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
@@ -102,28 +137,53 @@ async def start_elevenlabs_session(
     if active_pause:
         return _pause_response(active_pause)
 
-    existing_session = (conversation.get("elevenlabs_session_id") or "").strip()
     existing_status = (conversation.get("elevenlabs_status") or "").lower()
-    if existing_session == session_id and existing_status == "active":
-        return JSONResponse(content={"status": "active", "session_id": session_id})
-
-    await elevenlabs_service.mark_session_started(conversation_id, session_id)
     try:
-        await record_wellbeing_activity(
-            user_id=current_user.id,
-            conversation_id=conversation_id,
-            activity_type="voice_call_started",
-            metadata={"elevenlabs_session_id": session_id},
-        )
-    except Exception:
-        logger.warning(
-            "[wellbeing] Failed to record ElevenLabs session start for conversation_id=%s",
+        newly_bound = await elevenlabs_service.register_session(
             conversation_id,
+            session_id,
+            conversation["user_id"],
+        )
+    except ElevenLabsProviderSessionError:
+        logger.warning(
+            "[ElevenLabs] Provider metadata rejected for conversation %s",
+            conversation_id,
+        )
+        return _binding_error_response("voice_session_validation_failed")
+    except ElevenLabsSessionBindingError:
+        logger.warning(
+            "[ElevenLabs] Session binding rejected for conversation %s",
+            conversation_id,
+        )
+        return _binding_error_response("voice_session_binding_conflict")
+    except httpx.HTTPError:
+        logger.warning(
+            "[ElevenLabs] Provider error validating session %s",
+            session_id,
             exc_info=True,
         )
+        return JSONResponse(
+            content={"error": "Unable to validate the ElevenLabs session"},
+            status_code=502,
+        )
+
+    if newly_bound:
+        try:
+            await record_wellbeing_activity(
+                user_id=current_user.id,
+                conversation_id=conversation_id,
+                activity_type="voice_call_started",
+                metadata={"elevenlabs_session_id": session_id},
+            )
+        except Exception:
+            logger.warning(
+                "[wellbeing] Failed to record ElevenLabs session start for conversation_id=%s",
+                conversation_id,
+                exc_info=True,
+            )
 
     watchdog_hint_eval_id = payload.get("watchdog_hint_eval_id")
-    if watchdog_hint_eval_id is not None:
+    if newly_bound and watchdog_hint_eval_id is not None:
         prompt_id = conversation.get("role_id")
         if prompt_id is not None:
             try:
@@ -163,7 +223,10 @@ async def complete_elevenlabs_session(
         return JSONResponse(content={"error": "ElevenLabs integration is disabled"}, status_code=503)
 
     payload = await request.json()
-    requested_session_id = (payload.get("session_id") or "").strip()
+    raw_session_id = payload.get("session_id")
+    requested_session_id = (
+        raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+    )
 
     is_admin_user = await _is_admin_user(current_user)
     conversation = await elevenlabs_service.validate_conversation_access(
@@ -176,14 +239,17 @@ async def complete_elevenlabs_session(
     if conversation.get("locked"):
         return JSONResponse(content={"error": "This conversation is locked"}, status_code=403)
 
-    session_id = requested_session_id or (conversation.get("elevenlabs_session_id") or "").strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
+    try:
+        binding = await elevenlabs_service.get_bound_session(
+            conversation_id,
+            requested_session_id,
+            conversation["user_id"],
+        )
+    except ElevenLabsSessionBindingError:
+        return _binding_error_response("voice_session_binding_mismatch")
 
-    if (
-        (conversation.get("elevenlabs_status") or "").lower() == "completed"
-        and (conversation.get("elevenlabs_session_id") or "").strip() == session_id
-    ):
+    session_id = binding["session_id"]
+    if binding.get("transcript_saved_at"):
         return JSONResponse(content={"messages_saved": 0, "status": "already_completed"})
 
     max_retries = 5
@@ -193,18 +259,33 @@ async def complete_elevenlabs_session(
         status = await elevenlabs_service.check_conversation_status(session_id)
 
         if status is None:
-            logger.error("[ElevenLabs] Conversation %s not found or error checking status", session_id)
-            await elevenlabs_service.mark_session_status(conversation_id, session_id, "failed")
+            logger.error("[ElevenLabs] Unable to check provider session %s", session_id)
             return JSONResponse(
                 content={
-                    "error": "Conversation not found",
-                    "detail": "The conversation may not exist or API key lacks access",
+                    "error": "Unable to check ElevenLabs session",
+                    "detail": "Try again later.",
                 },
-                status_code=404,
+                status_code=502,
             )
 
-        finished_statuses = ["completed", "ended", "finished", "disconnected", "terminated"]
-        active_statuses = ["active", "in_progress", "ongoing", "started", "connected"]
+        finished_statuses = {
+            "done",
+            "completed",
+            "ended",
+            "finished",
+            "disconnected",
+            "terminated",
+        }
+        active_statuses = {
+            "initiated",
+            "in-progress",
+            "processing",
+            "active",
+            "in_progress",
+            "ongoing",
+            "started",
+            "connected",
+        }
 
         if status in finished_statuses:
             logger.info("[ElevenLabs] Conversation %s is ready for transcript fetch (status: %s)", session_id, status)
@@ -221,7 +302,6 @@ async def complete_elevenlabs_session(
                 await asyncio.sleep(retry_delay)
             else:
                 logger.warning("[ElevenLabs] Conversation %s still active after %d retries", session_id, max_retries)
-                await elevenlabs_service.mark_session_status(conversation_id, session_id, "active")
                 return JSONResponse(
                     content={
                         "error": "Conversation still active",
@@ -229,40 +309,76 @@ async def complete_elevenlabs_session(
                     },
                     status_code=425,
                 )
+        elif status == "failed":
+            await _mark_session_failed(
+                conversation_id,
+                session_id,
+                conversation["user_id"],
+            )
+            return JSONResponse(
+                content={"error": "The ElevenLabs session failed"},
+                status_code=502,
+            )
         else:
             logger.warning("[ElevenLabs] Unknown conversation status: %s", status)
-            break
+            return JSONResponse(
+                content={
+                    "error": "ElevenLabs session is not ready",
+                    "detail": f"Status: {status}. Try again later.",
+                },
+                status_code=425,
+            )
 
     try:
         transcript = await elevenlabs_service.fetch_full_transcript(session_id)
     except httpx.HTTPStatusError as exc:
         logger.error("[ElevenLabs] API error while fetching transcript for session %s: %s", session_id, exc)
-        await elevenlabs_service.mark_session_status(conversation_id, session_id, "failed")
+        await _mark_session_failed(
+            conversation_id,
+            session_id,
+            conversation["user_id"],
+        )
         return JSONResponse(
-            content={"error": "Failed to fetch ElevenLabs transcript", "detail": exc.response.text},
+            content={
+                "error": "Failed to fetch ElevenLabs transcript",
+                "detail": "The provider did not return a transcript.",
+            },
             status_code=502,
         )
     except httpx.HTTPError as exc:
         logger.error("[ElevenLabs] HTTP error while fetching transcript for session %s: %s", session_id, exc)
-        await elevenlabs_service.mark_session_status(conversation_id, session_id, "failed")
+        await _mark_session_failed(
+            conversation_id,
+            session_id,
+            conversation["user_id"],
+        )
         return JSONResponse(
-            content={"error": "Failed to fetch ElevenLabs transcript", "detail": str(exc)},
+            content={
+                "error": "Failed to fetch ElevenLabs transcript",
+                "detail": "The provider could not be reached.",
+            },
             status_code=502,
         )
 
     try:
-        saved, last_user_id, last_bot_id = await elevenlabs_service.save_transcript_to_db(
+        saved, last_user_id, last_bot_id, already_saved = await elevenlabs_service.save_transcript_to_db(
             conversation_id,
             session_id,
             conversation["user_id"],
             transcript,
         )
+    except ElevenLabsSessionBindingError:
+        return _binding_error_response("voice_session_binding_mismatch")
     except Exception as exc:
         logger.exception("[ElevenLabs] Failed to persist transcript for conversation %s", conversation_id)
-        await elevenlabs_service.mark_session_status(conversation_id, session_id, "failed")
+        await _mark_session_failed(
+            conversation_id,
+            session_id,
+            conversation["user_id"],
+        )
         raise HTTPException(status_code=500, detail="Failed to store ElevenLabs transcript") from exc
 
-    if session_id:
+    if session_id and not already_saved:
         try:
             download_elevenlabs_audio_task.send(conversation_id, session_id, conversation["user_id"])
             logger.info("[ElevenLabs] Enqueued audio download for conversation %s (session %s)", conversation_id, session_id)
@@ -303,7 +419,12 @@ async def complete_elevenlabs_session(
                 exc_info=True,
             )
 
-    return JSONResponse(content={"messages_saved": saved, "status": "completed"})
+    return JSONResponse(
+        content={
+            "messages_saved": saved,
+            "status": "already_completed" if already_saved else "completed",
+        }
+    )
 
 
 @router.post("/api/conversations/{conversation_id}/elevenlabs/stop")
@@ -319,11 +440,18 @@ async def stop_elevenlabs_session(
         return JSONResponse(content={"error": "ElevenLabs integration is disabled"}, status_code=503)
 
     payload = await request.json()
-    requested_session_id = (payload.get("session_id") or "").strip()
-    status = (payload.get("status") or "failed").strip().lower()
+    raw_session_id = payload.get("session_id")
+    requested_session_id = (
+        raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+    )
+    raw_status = payload.get("status")
+    status = raw_status.strip().lower() if isinstance(raw_status, str) else "failed"
 
-    if status not in {"failed", "completed"}:
-        status = "failed"
+    if status != "failed":
+        raise HTTPException(
+            status_code=400,
+            detail="Only failed sessions may be updated through this endpoint",
+        )
 
     is_admin_user = await _is_admin_user(current_user)
     conversation = await elevenlabs_service.validate_conversation_access(
@@ -336,9 +464,19 @@ async def stop_elevenlabs_session(
     if conversation.get("locked"):
         return JSONResponse(content={"error": "This conversation is locked"}, status_code=403)
 
-    session_id = requested_session_id or (conversation.get("elevenlabs_session_id") or "").strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    await elevenlabs_service.mark_session_status(conversation_id, session_id, status)
+    try:
+        binding = await elevenlabs_service.get_bound_session(
+            conversation_id,
+            requested_session_id,
+            conversation["user_id"],
+        )
+        session_id = binding["session_id"]
+        await elevenlabs_service.mark_session_status(
+            conversation_id,
+            session_id,
+            status,
+            conversation["user_id"],
+        )
+    except ElevenLabsSessionBindingError:
+        return _binding_error_response("voice_session_binding_mismatch")
     return JSONResponse(content={"status": status, "session_id": session_id})

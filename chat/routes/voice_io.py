@@ -2,7 +2,6 @@ import asyncio
 import hashlib
 import io
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,19 +21,22 @@ from auth import (
 from captcha_service import get_captcha_config
 from clients import deepgram, stt_engine, stt_fallback_enabled
 from common import (
-    Cost,
     GOOGLE_CLIENT_ID,
     READONLY_MODE,
     SECRET_KEY,
     cache_directory,
     decode_jwt_cached,
-    deduct_balance,
-    has_sufficient_balance,
-    record_daily_usage,
     templates,
     validate_path_within_directory,
 )
-from database import DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, get_db_connection, is_lock_error
+from database import get_db_connection
+from integrations.media import (
+    BillableSTTProviderError,
+    finalize_failed_stt_attempt,
+    reserve_stt_attempt,
+    settle_stt_attempt,
+)
+from storage_quota import StorageQuotaExceededError, ensure_generation_headroom
 from log_config import logger
 from models import ConnectionManager, User
 from rediscfg import redis_client
@@ -76,16 +78,25 @@ async def websocket_endpoint(websocket: WebSocket):
         current_user = await get_current_user_from_websocket(websocket)
         if current_user is None:
             await websocket.close(code=4401, reason="Session expired")
+            manager.disconnect(websocket)
             return
 
         if READONLY_MODE:
             await websocket.close(code=1013, reason="Read-only mode active")
+            manager.disconnect(websocket)
             return
 
         while True:
             import orjson
 
             message = await websocket.receive_text()
+            current_user = await get_current_user_from_websocket(websocket)
+            if current_user is None:
+                if manager.active_connections[websocket]["task"]:
+                    manager.active_connections[websocket]["task"].cancel()
+                await websocket.close(code=4401, reason="Session expired")
+                manager.disconnect(websocket)
+                return
             data = orjson.loads(message)
             action = data.get("action")
 
@@ -177,7 +188,16 @@ async def initiate_download_pdf(
         logger.error("Error verifying if user is admin: %s", exc)
         raise HTTPException(status_code=500, detail="Error verifying permissions.")
 
-    await require_conversation_access(conversation_id, current_user)
+    owner_id = await require_conversation_access(conversation_id, current_user)
+
+    # Storage-quota soft pre-check: exports charge the conversation OWNER's
+    # quota (an admin may export another user's conversation, but the file lands
+    # under and is ledgered against the owner). Runs before enqueueing the task.
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            await ensure_generation_headroom(conn, owner_id)
+    except StorageQuotaExceededError as exc:
+        raise HTTPException(status_code=413, detail=exc.message)
 
     lock_key = f"pdf_lock:{conversation_id}"
     try:
@@ -208,7 +228,16 @@ async def initiate_download_mp3(
         logger.error("Error verifying if user is admin: %s", exc)
         raise HTTPException(status_code=500, detail="Error verifying permissions.")
 
-    await require_conversation_access(conversation_id, current_user)
+    owner_id = await require_conversation_access(conversation_id, current_user)
+
+    # Storage-quota soft pre-check: exports charge the conversation OWNER's
+    # quota (an admin may export another user's conversation, but the file lands
+    # under and is ledgered against the owner). Runs before enqueueing the task.
+    try:
+        async with get_db_connection(readonly=True) as conn:
+            await ensure_generation_headroom(conn, owner_id)
+    except StorageQuotaExceededError as exc:
+        raise HTTPException(status_code=413, detail=exc.message)
 
     lock_key = f"mp3_lock:{conversation_id}:{current_user.id}"
     try:
@@ -277,8 +306,13 @@ async def transcribe_with_elevenlabs(audio_content: bytes = None):
                     if response.status != 200:
                         error_text = await response.text()
                         raise Exception(f"ElevenLabs API error: {response.status} - {error_text}")
-                    result = await response.json()
-                    return result.get("text", "")
+                    try:
+                        result = await response.json()
+                        return result.get("text", "")
+                    except Exception as exc:
+                        raise BillableSTTProviderError(
+                            "ElevenLabs returned an unusable STT response"
+                        ) from exc
             raise Exception("No audio content available")
     except Exception as exc:
         logger.error("Error transcribing with ElevenLabs: %s", str(exc))
@@ -302,85 +336,20 @@ async def transcribe_with_deepgram(audio_content: bytes = None, user_agent: str 
         else:
             raise Exception("No audio content or media URL provided")
 
-        data = result.to_dict()
-        if not data:
-            raise Exception("No response from Deepgram")
-        return data["results"]["channels"][0]["alternatives"][0]["transcript"]
+        try:
+            data = result.to_dict()
+            if not data:
+                raise ValueError("No response from Deepgram")
+            return data["results"]["channels"][0]["alternatives"][0][
+                "transcript"
+            ]
+        except Exception as exc:
+            raise BillableSTTProviderError(
+                "Deepgram returned an unusable STT response"
+            ) from exc
     except Exception as exc:
         logger.error("Error transcribing with Deepgram: %s", str(exc))
         raise
-
-
-async def cost_stt(user_id: int, duration_in_minutes: float):
-    total_stt_cost = Cost.STT_COST_PER_MINUTE * duration_in_minutes
-    if not await deduct_balance(user_id, total_stt_cost):
-        return
-
-    last_lock_error = None
-    for attempt in range(DB_MAX_RETRIES):
-        retry_needed = False
-        wait_time = 0.0
-        async with get_db_connection() as conn:
-            transaction_started = False
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-                transaction_started = True
-                await conn.execute(
-                    """
-                    INSERT INTO SERVICE_USAGE (user_id, service_id, usage_quantity, cost)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (user_id, Cost.STT_SERVICE_ID, duration_in_minutes, total_stt_cost),
-                )
-                await conn.execute(
-                    """
-                    UPDATE USER_DETAILS
-                    SET total_cost = total_cost + ?, total_stt_cost = total_stt_cost + ?
-                    WHERE user_id = ?
-                    """,
-                    (total_stt_cost, total_stt_cost, user_id),
-                )
-                await record_daily_usage(
-                    user_id=user_id,
-                    usage_type="stt",
-                    cost=total_stt_cost,
-                    units=duration_in_minutes,
-                    conn=conn,
-                )
-                await conn.commit()
-                return
-            except sqlite3.OperationalError as exc:
-                if transaction_started:
-                    try:
-                        await conn.rollback()
-                    except Exception:
-                        pass
-                if is_lock_error(exc) and attempt < DB_MAX_RETRIES - 1:
-                    wait_time = DB_RETRY_DELAY_BASE * (attempt + 1)
-                    last_lock_error = exc
-                    retry_needed = True
-                else:
-                    logger.error("Error executing STT cost query: %s", exc)
-                    return
-            except Exception as exc:
-                if transaction_started:
-                    try:
-                        await conn.rollback()
-                    except Exception:
-                        pass
-                logger.error("Error executing STT cost query: %s", exc)
-                return
-
-        if retry_needed:
-            await asyncio.sleep(wait_time)
-
-    if last_lock_error:
-        logger.error(
-            "Could not register STT cost for user_id=%s after %s retries: %s",
-            user_id,
-            DB_MAX_RETRIES,
-            last_lock_error,
-        )
 
 
 async def transcribe(request: Request, audio: UploadFile = File(None), user_id: int = None):
@@ -415,38 +384,85 @@ async def transcribe(request: Request, audio: UploadFile = File(None), user_id: 
             raise HTTPException(status_code=400, detail="No audio")
 
         duration_min = audio_duration / 60
-        total_stt_cost = Cost.STT_COST_PER_MINUTE * duration_min
-        if not await has_sufficient_balance(user_id, total_stt_cost):
-            raise HTTPException(status_code=402, detail="Insufficient balance")
-
+        primary_engine = (
+            "elevenlabs"
+            if str(stt_engine).lower() == "elevenlabs"
+            else "deepgram"
+        )
         user_agent = request.headers.get("user-agent")
-        try:
-            if stt_engine == "elevenlabs":
-                prompt = await transcribe_with_elevenlabs(audio_content=content)
-            else:
-                prompt = await transcribe_with_deepgram(audio_content=content, user_agent=user_agent)
-        except Exception as primary_error:
-            if stt_fallback_enabled:
-                logger.warning("Primary STT engine (%s) failed: %s", stt_engine, str(primary_error))
-                fallback_engine = "deepgram" if stt_engine == "elevenlabs" else "elevenlabs"
-                try:
-                    if fallback_engine == "elevenlabs":
-                        prompt = await transcribe_with_elevenlabs(audio_content=content)
-                    else:
-                        prompt = await transcribe_with_deepgram(audio_content=content, user_agent=user_agent)
-                    logger.info("Fallback to %s successful", fallback_engine)
-                except Exception as fallback_error:
-                    logger.error("Both STT engines failed. Primary: %s, Fallback: %s", str(primary_error), str(fallback_error))
-                    raise primary_error
-            else:
-                raise primary_error
 
-        await cost_stt(user_id, audio_duration / 60)
+        async def transcribe_with_engine(engine: str):
+            if engine == "elevenlabs":
+                return await transcribe_with_elevenlabs(audio_content=content)
+            return await transcribe_with_deepgram(
+                audio_content=content,
+                user_agent=user_agent,
+            )
+
+        primary_reservation_id = await reserve_stt_attempt(
+            user_id=user_id,
+            engine=primary_engine,
+            configured_engine=primary_engine,
+            duration_min=duration_min,
+            context=primary_engine,
+        )
+        try:
+            prompt = await transcribe_with_engine(primary_engine)
+        except BaseException as primary_error:
+            await finalize_failed_stt_attempt(
+                primary_reservation_id,
+                primary_error,
+                context=f"failed {primary_engine}",
+            )
+            if not isinstance(primary_error, Exception) or not stt_fallback_enabled:
+                raise
+
+            logger.warning(
+                "Primary STT engine (%s) failed: %s",
+                primary_engine,
+                primary_error,
+            )
+            fallback_engine = (
+                "deepgram" if primary_engine == "elevenlabs" else "elevenlabs"
+            )
+            fallback_reservation_id = await reserve_stt_attempt(
+                user_id=user_id,
+                engine=fallback_engine,
+                configured_engine=primary_engine,
+                duration_min=duration_min,
+                context=f"fallback {fallback_engine}",
+            )
+            try:
+                prompt = await transcribe_with_engine(fallback_engine)
+            except BaseException as fallback_error:
+                await finalize_failed_stt_attempt(
+                    fallback_reservation_id,
+                    fallback_error,
+                    context=f"failed fallback {fallback_engine}",
+                )
+                if not isinstance(fallback_error, Exception):
+                    raise
+                logger.error(
+                    "Both STT engines failed. Primary: %s, Fallback: %s",
+                    primary_error,
+                    fallback_error,
+                )
+                raise primary_error from fallback_error
+
+            await settle_stt_attempt(
+                fallback_reservation_id,
+                context=f"fallback {fallback_engine}",
+            )
+            logger.info("Fallback to %s successful", fallback_engine)
+            return prompt
+
+        await settle_stt_attempt(
+            primary_reservation_id,
+            context=primary_engine,
+        )
         return prompt
-    except HTTPException as exc:
-        if exc.detail == "User ID could not be determined":
-            raise
-        raise HTTPException(status_code=500, detail=str(exc))
+    except HTTPException:
+        raise
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=exc.response.status_code, detail=f"HTTP error: {exc}")
     except Exception as exc:

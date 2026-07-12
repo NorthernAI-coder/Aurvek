@@ -26,6 +26,7 @@ from PIL import Image as PilImage
 
 import database
 from log_config import logger
+from storage_quota import StorageQuotaExceededError, ensure_upload_fits
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -81,6 +82,45 @@ async def ensure_file_storage_schema(conn: aiosqlite.Connection | None = None) -
     await _ensure_schema_on_connection(conn)
 
 
+async def _enforce_upload_quota(
+    conn: aiosqlite.Connection,
+    *,
+    user_id: int,
+    blob_id: int,
+    size_bytes: int,
+) -> StorageQuotaExceededError | None:
+    """Run the dedupe-aware upload quota gate inside the caller's transaction.
+
+    Returns None when the ingest fits and the caller may insert the attachment.
+    On a quota rejection it COMMITS the open transaction -- persisting the
+    just-created, momentarily zero-referenced FILE_BLOBS row -- and returns the
+    error. The blob's physical file was written non-transactionally by
+    _get_or_create_blob, so rolling back here would strand that file with no row
+    left to prune it. Commit now, then prune after the transaction closes
+    (_drop_rejected_upload_blob): that is the only orphan-free order.
+    """
+    try:
+        await ensure_upload_fits(conn, user_id, blob_id, size_bytes)
+    except StorageQuotaExceededError as exc:
+        await conn.commit()
+        return exc
+    return None
+
+
+async def _drop_rejected_upload_blob(
+    blob_id: int, quota_error: StorageQuotaExceededError
+) -> None:
+    """Prune a rejected upload's zero-referenced blob, then re-raise.
+
+    Must run only AFTER the ingest transaction has committed and released its
+    connection: prune_unreferenced_blobs opens its own connection with
+    BEGIN IMMEDIATE and would block against a still-open writer. It deletes the
+    row + file + variants iff nothing else references the blob (no-op otherwise).
+    """
+    await prune_unreferenced_blobs([blob_id])
+    raise quota_error
+
+
 async def create_pending_pdf_attachment(
     *,
     user_id: int,
@@ -91,6 +131,7 @@ async def create_pending_pdf_attachment(
     declared_mime: str = "application/pdf",
 ) -> PendingAttachment:
     filename = _clean_filename(filename, "document.pdf")
+    quota_error: StorageQuotaExceededError | None = None
     async with database.get_db_connection() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -103,24 +144,30 @@ async def create_pending_pdf_attachment(
                 extension=".pdf",
                 page_count=page_count,
             )
-            public_id = _new_public_id()
-            await _insert_attachment(
-                conn,
-                public_id=public_id,
-                blob_id=blob_id,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                message_id=None,
-                attachment_type="pdf",
-                original_filename=filename,
-                display_name=filename,
-                declared_mime=declared_mime,
-                status="pending",
+            quota_error = await _enforce_upload_quota(
+                conn, user_id=user_id, blob_id=blob_id, size_bytes=len(data)
             )
-            await conn.commit()
+            if quota_error is None:
+                public_id = _new_public_id()
+                await _insert_attachment(
+                    conn,
+                    public_id=public_id,
+                    blob_id=blob_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=None,
+                    attachment_type="pdf",
+                    original_filename=filename,
+                    display_name=filename,
+                    declared_mime=declared_mime,
+                    status="pending",
+                )
+                await conn.commit()
         except Exception:
             await conn.rollback()
             raise
+    if quota_error is not None:
+        await _drop_rejected_upload_blob(blob_id, quota_error)
 
     block = {
         "type": "document_url",
@@ -146,6 +193,7 @@ async def create_pending_text_attachment(
     filename = _clean_filename(filename, "document.txt")
     text_bytes = text_content.encode("utf-8")
     line_count = text_content.count("\n") + 1 if text_content else 0
+    quota_error: StorageQuotaExceededError | None = None
     async with database.get_db_connection() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -158,24 +206,30 @@ async def create_pending_text_attachment(
                 extension=".txt",
                 text_line_count=line_count,
             )
-            public_id = _new_public_id()
-            await _insert_attachment(
-                conn,
-                public_id=public_id,
-                blob_id=blob_id,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                message_id=None,
-                attachment_type="text",
-                original_filename=filename,
-                display_name=filename,
-                declared_mime=declared_mime or "text/plain",
-                status="pending",
+            quota_error = await _enforce_upload_quota(
+                conn, user_id=user_id, blob_id=blob_id, size_bytes=len(text_bytes)
             )
-            await conn.commit()
+            if quota_error is None:
+                public_id = _new_public_id()
+                await _insert_attachment(
+                    conn,
+                    public_id=public_id,
+                    blob_id=blob_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=None,
+                    attachment_type="text",
+                    original_filename=filename,
+                    display_name=filename,
+                    declared_mime=declared_mime or "text/plain",
+                    status="pending",
+                )
+                await conn.commit()
         except Exception:
             await conn.rollback()
             raise
+    if quota_error is not None:
+        await _drop_rejected_upload_blob(blob_id, quota_error)
 
     block = {
         "type": "text_file",
@@ -203,6 +257,7 @@ async def create_pending_image_attachment(
     filename = _clean_filename(filename, "image")
     extension = _extension_for_mime(mime_detected, default=".webp")
     thumb = await asyncio.to_thread(_make_image_thumbnail, data, mime_detected)
+    quota_error: StorageQuotaExceededError | None = None
     async with database.get_db_connection() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -214,35 +269,41 @@ async def create_pending_image_attachment(
                 mime_detected=mime_detected or "application/octet-stream",
                 extension=extension,
             )
-            if thumb is not None:
-                await _get_or_create_variant(
-                    conn,
-                    blob_id=blob_id,
-                    variant=THUMB_VARIANT,
-                    data=thumb,
-                    mime_detected="image/webp",
-                    extension=".webp",
-                    width=min(width or 256, 256) if width else None,
-                    height=min(height or 256, 256) if height else None,
-                )
-            public_id = _new_public_id()
-            await _insert_attachment(
-                conn,
-                public_id=public_id,
-                blob_id=blob_id,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                message_id=None,
-                attachment_type="image",
-                original_filename=filename,
-                display_name=filename,
-                declared_mime=declared_mime or mime_detected,
-                status="pending",
+            quota_error = await _enforce_upload_quota(
+                conn, user_id=user_id, blob_id=blob_id, size_bytes=len(data)
             )
-            await conn.commit()
+            if quota_error is None:
+                if thumb is not None:
+                    await _get_or_create_variant(
+                        conn,
+                        blob_id=blob_id,
+                        variant=THUMB_VARIANT,
+                        data=thumb,
+                        mime_detected="image/webp",
+                        extension=".webp",
+                        width=min(width or 256, 256) if width else None,
+                        height=min(height or 256, 256) if height else None,
+                    )
+                public_id = _new_public_id()
+                await _insert_attachment(
+                    conn,
+                    public_id=public_id,
+                    blob_id=blob_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    message_id=None,
+                    attachment_type="image",
+                    original_filename=filename,
+                    display_name=filename,
+                    declared_mime=declared_mime or mime_detected,
+                    status="pending",
+                )
+                await conn.commit()
         except Exception:
             await conn.rollback()
             raise
+    if quota_error is not None:
+        await _drop_rejected_upload_blob(blob_id, quota_error)
 
     block = {
         "type": "image_url",
@@ -1044,6 +1105,7 @@ async def _ensure_schema_on_connection(conn: aiosqlite.Connection) -> None:
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_conversation ON FILE_ATTACHMENTS(conversation_id, id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_message ON FILE_ATTACHMENTS(message_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_blob ON FILE_ATTACHMENTS(blob_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_user_blob ON FILE_ATTACHMENTS(user_id, blob_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_legacy_url ON FILE_ATTACHMENTS(legacy_url)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_attachments_pending ON FILE_ATTACHMENTS(status, created_at)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_legacy_cleanup_status ON FILE_LEGACY_CLEANUP_CANDIDATES(cleanup_status, created_at)")

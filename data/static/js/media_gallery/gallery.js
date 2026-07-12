@@ -147,11 +147,20 @@ function deleteImages(imageIds, attachmentRefs = []) {
 
 // Delete single image from viewer
 function deleteCurrentImage(url, index, imageData) {
+    const attachmentRef = imageData?.attachment_ref || null;
+    const imageId = imageData?.id;
+    if (!attachmentRef && (imageId === undefined || imageId === null)) {
+        NotificationModal.error('Delete Error', 'The displayed image could not be identified.');
+        return;
+    }
+
     NotificationModal.confirm('Delete Image', 'Are you sure you want to delete this image?', () => {
-        if (imageData.attachment_ref) {
-            deleteImages([], [imageData.attachment_ref]);
+        // Use the immutable identity captured when this image finished loading.
+        // Navigation while the confirmation modal is open cannot change it.
+        if (attachmentRef) {
+            deleteImages([], [attachmentRef]);
         } else {
-            deleteImages([imageData.id]);
+            deleteImages([imageId]);
         }
     }, null, { type: 'error', confirmText: 'Delete' });
 }

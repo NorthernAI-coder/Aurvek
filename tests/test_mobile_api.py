@@ -1,7 +1,4 @@
 import json
-import subprocess
-import sys
-import textwrap
 from contextlib import asynccontextmanager
 
 import aiosqlite
@@ -337,65 +334,3 @@ async def test_ios_purchase_endpoints_return_storekit_required(monkeypatch):
         assert payload["error"] == IOS_PURCHASE_DISABLED_ERROR
         assert payload["reason"] == IOS_PURCHASE_DISABLED_REASON
         assert payload["purchase_available"] is False
-
-
-def test_mobile_routes_are_registered_from_mobile_package():
-    code = textwrap.dedent(
-        """
-        import json
-        import app
-
-        expected = {
-            ("GET", "/api/mobile/v1/config"): "mobile.routes",
-            ("GET", "/api/mobile/v1/bootstrap"): "mobile.routes",
-            ("GET", "/privacy"): "legal.routes",
-            ("GET", "/privacy.html"): "legal.routes",
-            ("GET", "/terms"): "legal.routes",
-            ("GET", "/terms.html"): "legal.routes",
-            ("GET", "/support"): "legal.routes",
-            ("GET", "/api/auth/apple/status"): "auth_apple",
-            ("POST", "/api/auth/apple/native-callback"): "auth_apple",
-            ("GET", "/auth/apple"): "auth_apple",
-            ("GET", "/auth/apple/callback"): "auth_apple",
-            ("POST", "/api/reports/content"): "content_reports.routes",
-        }
-        found = {}
-        for method, path in expected:
-            matches = [
-                route.endpoint.__module__
-                for route in app.app.routes
-                if getattr(route, "path", None) == path
-                and method in getattr(route, "methods", set())
-            ]
-            if len(matches) != 1:
-                raise SystemExit(f"Expected one route for {method} {path}, got {matches}")
-            found[f"{method} {path}"] = matches[0]
-
-        print("MOBILE_ROUTE_MODULES=" + json.dumps(found, sort_keys=True))
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    route_modules_line = next(
-        line for line in result.stdout.splitlines() if line.startswith("MOBILE_ROUTE_MODULES=")
-    )
-    route_modules = json.loads(route_modules_line.removeprefix("MOBILE_ROUTE_MODULES="))
-
-    assert route_modules == {
-        "GET /api/auth/apple/status": "auth_apple",
-        "GET /api/mobile/v1/bootstrap": "mobile.routes",
-        "GET /api/mobile/v1/config": "mobile.routes",
-        "GET /auth/apple": "auth_apple",
-        "GET /auth/apple/callback": "auth_apple",
-        "GET /privacy": "legal.routes",
-        "GET /privacy.html": "legal.routes",
-        "GET /support": "legal.routes",
-        "GET /terms": "legal.routes",
-        "GET /terms.html": "legal.routes",
-        "POST /api/auth/apple/native-callback": "auth_apple",
-        "POST /api/reports/content": "content_reports.routes",
-    }

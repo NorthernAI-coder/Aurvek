@@ -1277,7 +1277,11 @@ async def record_user_action(
                     (session["id"],),
                 )
                 refreshed_session = _row_to_dict(await cursor.fetchone())
-                if refreshed_session and refreshed_session.get("status") == "active":
+                if (
+                    refreshed_session
+                    and refreshed_session.get("status") == "active"
+                    and (refreshed_session.get("pause_reason") or "") == "strict_strong"
+                ):
                     await _close_session(
                         conn,
                         refreshed_session,

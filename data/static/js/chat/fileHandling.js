@@ -40,6 +40,39 @@ const COMPRESSIBLE_TYPES = new Set([
 // Tracks in-flight compression operations. Exported for chat.js send guard.
 let compressionInProgress = 0;
 
+function trackAttachmentPreview(file, element) {
+    if (file && element) {
+        element._aurvekAttachedFile = file;
+    }
+    return element;
+}
+
+function removeAttachedFileBatch(files) {
+    const batch = new Set(Array.from(files || []));
+    if (batch.size === 0) return;
+
+    attachedFiles = attachedFiles.filter(file => !batch.has(file));
+
+    const imagePreviews = document.getElementById('image-previews');
+    if (!imagePreviews) return;
+    Array.from(imagePreviews.children).forEach(preview => {
+        if (batch.has(preview._aurvekAttachedFile)) {
+            preview.remove();
+        }
+    });
+    imagePreviews.classList.toggle('hidden', imagePreviews.children.length === 0);
+    const fileInput = document.getElementById('chat-files');
+    if (fileInput) fileInput.value = '';
+}
+
+function attachmentIsStillQueued(file) {
+    return attachedFiles.includes(file);
+}
+
+window.trackAttachmentPreview = trackAttachmentPreview;
+window.removeAttachedFileBatch = removeAttachedFileBatch;
+window.attachmentIsStillQueued = attachmentIsStillQueued;
+
 function getCompressionTargetBytes() {
     const sizeMb = Number(Config.max_api_image_size_mb);
     if (Number.isFinite(sizeMb) && sizeMb > 0) {
@@ -219,9 +252,11 @@ async function handlePasteEvent(event) {
             attachedFiles.push(processed);
             const reader = new FileReader();
             reader.onload = function(event){
+                if (!attachmentIsStillQueued(processed)) return;
                 const img = document.createElement('img');
                 img.src = event.target.result;
                 img.className = 'preview-image';
+                trackAttachmentPreview(processed, img);
                 document.getElementById('image-previews').appendChild(img);
                 document.getElementById('image-previews').classList.remove('hidden');
             };
@@ -491,7 +526,6 @@ function markAttachmentUploadFailed(rendered, message) {
 function createAttachmentUploadEcho(file, targetConversationId = null, displayOptions = {}) {
     const chatMessagesContainer = document.getElementById('chat-messages-container');
     const chatWindow = document.getElementById('chat-window');
-    const imagePreviews = document.getElementById('image-previews');
     const userMessageElement = document.createElement('div');
     userMessageElement.classList.add('message', 'user');
     if (targetConversationId !== null) {
@@ -572,12 +606,6 @@ function createAttachmentUploadEcho(file, targetConversationId = null, displayOp
 
     chatMessagesContainer.appendChild(userMessageElement);
     if (chatWindow) chatWindow.scrollTop = chatWindow.scrollHeight;
-    if (imagePreviews) {
-        imagePreviews.innerHTML = '';
-        imagePreviews.classList.add('hidden');
-    }
-    const fileInput = document.getElementById('chat-files');
-    if (fileInput) fileInput.value = '';
 
     return { element: userMessageElement, progressWrap, progressFill, status };
 }
@@ -868,11 +896,12 @@ async function uploadSingleAttachment(file, conversationId, rendered, options = 
 }
 
 async function uploadAttachmentsForMessage(files, conversationId, displayOptions = {}) {
+    const uploadBatch = Object.freeze(Array.from(files || []));
     const renderedAttachmentElements = [];
     renderedAttachmentElements.cancelled = false;
     renderedAttachmentElements.attachmentRefs = [];
 
-    if (!files || files.length === 0) {
+    if (uploadBatch.length === 0) {
         return renderedAttachmentElements;
     }
 
@@ -885,7 +914,7 @@ async function uploadAttachmentsForMessage(files, conversationId, displayOptions
         }
     }
 
-    for (const file of files) {
+    for (const file of uploadBatch) {
         if (!isAcceptedFileType(file) || !validateFileSize(file)) {
             if (!isAcceptedFileType(file)) {
                 NotificationModal.warning('Invalid File', 'Only image, PDF, and text files are allowed.');
@@ -963,6 +992,7 @@ async function handleFileSelect(event) {
                 nameSpan.textContent = file.name;
                 pdfPreview.appendChild(iconSpan);
                 pdfPreview.appendChild(nameSpan);
+                trackAttachmentPreview(file, pdfPreview);
                 imagePreviews.appendChild(pdfPreview);
                 attachedFiles.push(file);
             } else if (isTextFile(file)) {
@@ -977,6 +1007,7 @@ async function handleFileSelect(event) {
                 name.textContent = file.name;
                 previewItem.appendChild(icon);
                 previewItem.appendChild(name);
+                trackAttachmentPreview(file, previewItem);
                 imagePreviews.appendChild(previewItem);
                 attachedFiles.push(file);
             } else {
@@ -986,9 +1017,11 @@ async function handleFileSelect(event) {
 
                 const reader = new FileReader();
                 reader.onload = function (e) {
+                    if (!attachmentIsStillQueued(processed)) return;
                     const img = document.createElement('img');
                     img.src = e.target.result;
                     img.className = 'preview-image';
+                    trackAttachmentPreview(processed, img);
                     imagePreviews.appendChild(img);
                 };
                 reader.onerror = function (e) {

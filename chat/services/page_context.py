@@ -22,8 +22,10 @@ from prompt_access import get_user_accessible_prompts
 from save_images import generate_img_token
 
 from chat.services.attachment_uploads import ATTACHMENT_UPLOAD_CHUNK_SIZE_BYTES
+from chat.services.avatar_urls import get_signed_bot_avatar_urls
 from chat.services.deletion import purge_stale_incognito_conversations_for_user
 from chat.services.privacy import ensure_conversation_privacy_schema
+from integrations.devices.service import get_conversation_binding_summaries
 
 
 async def handle_recent_conversation(current_user: User, recent_conversation):
@@ -124,13 +126,10 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             token = generate_img_token(profile_picture_url, new_expiration, current_user)
             user_profile_picture = f"{CLOUDFLARE_BASE_URL}{profile_picture_url}?token={token}"
 
-        bot_profile_picture = full_data["bot_picture"]
-        if bot_profile_picture:
-            current_time = datetime.now(timezone.utc)
-            new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
-            bot_picture_url = f"{bot_profile_picture}_32.webp"
-            token = generate_img_token(bot_picture_url, new_expiration, current_user)
-            bot_profile_picture = f"{CLOUDFLARE_BASE_URL}{bot_picture_url}?token={token}"
+        bot_avatar_urls = get_signed_bot_avatar_urls(
+            full_data["bot_picture"],
+            current_user,
+        )
 
         prompts = await get_user_accessible_prompts(
             current_user,
@@ -245,6 +244,10 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
         conversations_rows = await cursor.fetchall()
 
         all_init_conversations = list(initial_ext_conversations) + list(conversations_rows)
+        binding_summaries = await get_conversation_binding_summaries(
+            effective_user_id,
+            [row[0] for row in all_init_conversations if not row[4]],
+        )
         initial_conversations = [
             {
                 "id": row[0],
@@ -261,6 +264,9 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
                 "allowed_llms": orjson.loads(row[11]) if row[11] else None,
                 "is_paid": bool(row[12]),
                 "last_activity": row[13],
+                "external_bindings": (
+                    None if row[4] else binding_summaries.get(int(row[0]))
+                ),
             }
             for row in all_init_conversations
         ]
@@ -288,7 +294,7 @@ async def handle_get_request(request, user_id, current_user, conn, admin_view=Fa
             "can_send_files": current_user.can_send_files,
             "can_generate_images": full_data["allow_image_generation"],
             "user_profile_picture": user_profile_picture,
-            "bot_profile_picture": bot_profile_picture,
+            **bot_avatar_urls,
             "current_alter_ego_id": full_data["current_alter_ego_id"],
             "prompt_description": full_data["prompt_description"],
             "api_key_mode": api_key_mode,

@@ -3,6 +3,7 @@
 import orjson
 import os
 import asyncio
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,7 @@ import aiofiles
 
 from common import custom_unescape, generate_user_hash, sanitize_name, users_directory
 from database import get_db_connection, DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, is_lock_error
+from storage_quota import record_generated_file
 from log_config import logger
 from wellbeing_service import record_voice_transcript_activity
 
@@ -29,6 +31,15 @@ USE_SIGNED_URL = os.getenv("ELEVENLABS_USE_SIGNED_URL", "true").lower() == "true
 CONTEXT_MESSAGE_LIMIT = int(os.getenv("ELEVENLABS_CONTEXT_LIMIT", "20"))  # Increased from 10 to 20
 MAX_CONTEXT_CHARACTERS = int(os.getenv("ELEVENLABS_CONTEXT_MAX_CHARS", "8000"))  # Increased from 6000 to 8000
 HTTP_TIMEOUT_SECONDS = float(os.getenv("ELEVENLABS_HTTP_TIMEOUT", "30"))
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
+
+
+class ElevenLabsSessionBindingError(ValueError):
+    """Raised when a call session is not bound to the requested Aurvek chat."""
+
+
+class ElevenLabsProviderSessionError(ElevenLabsSessionBindingError):
+    """Raised when ElevenLabs metadata does not match the expected call binding."""
 
 
 class ElevenLabsService:
@@ -126,7 +137,9 @@ class ElevenLabsService:
             "recent_messages": recent_messages,
             "status": conversation.get("elevenlabs_status"),
             "session_id": conversation.get("elevenlabs_session_id"),
-            "user_id": current_user_id,
+            # Bind provider metadata to the conversation owner. This also keeps
+            # admin-initiated calls scoped to the chat they are acting on.
+            "user_id": conversation["user_id"],
         }
 
         # Watchdog: include steering hint and CAS token if available
@@ -150,45 +163,346 @@ class ElevenLabsService:
             return None
         return conversation
 
-    async def mark_session_started(self, conversation_id: int, session_id: str) -> None:
-        async with get_db_connection() as conn:
-            await conn.execute(
-                """
-                UPDATE CONVERSATIONS
-                SET elevenlabs_session_id = ?, elevenlabs_status = 'active'
-                WHERE id = ?
-                """,
-                (session_id, conversation_id),
+    async def register_session(
+        self,
+        conversation_id: int,
+        session_id: str,
+        user_id: int,
+    ) -> bool:
+        """Validate and persist an immutable provider/Aurvek call binding.
+
+        Returns ``True`` when a new binding was created and ``False`` for an
+        idempotent retry of the same active binding.
+        """
+        session_id = (session_id or "").strip()
+        if not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise ElevenLabsSessionBindingError("Invalid ElevenLabs session id")
+
+        async with get_db_connection(readonly=True) as conn:
+            conversation = await self._load_conversation(conn, conversation_id)
+            if not conversation or conversation["user_id"] != user_id:
+                raise ElevenLabsSessionBindingError(
+                    "Conversation does not match the session owner"
+                )
+            agent_info = await self._resolve_agent(conn, conversation.get("role_id"))
+            if not agent_info:
+                raise ElevenLabsSessionBindingError(
+                    "Conversation has no ElevenLabs agent"
+                )
+
+        provider_details = None
+        for attempt in range(4):
+            provider_details = await self.fetch_session_details(session_id)
+            if provider_details is not None:
+                break
+            if attempt < 3:
+                await asyncio.sleep(0.25 * (2**attempt))
+        if provider_details is None:
+            raise ElevenLabsProviderSessionError(
+                "ElevenLabs session is not available"
             )
-            await conn.commit()
+
+        self._validate_provider_session_binding(
+            provider_details,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            agent_id=agent_info["agent_id"],
+        )
+
+        async with get_db_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    """
+                    SELECT conversation_id, user_id, agent_id, status
+                    FROM ELEVENLABS_CALL_SESSIONS
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                )
+                existing = await cursor.fetchone()
+                if existing:
+                    if (
+                        existing["conversation_id"] != conversation_id
+                        or existing["user_id"] != user_id
+                        or existing["agent_id"] != agent_info["agent_id"]
+                    ):
+                        raise ElevenLabsSessionBindingError(
+                            "ElevenLabs session is already bound elsewhere"
+                        )
+                    if existing["status"] != "active":
+                        raise ElevenLabsSessionBindingError(
+                            "ElevenLabs session is already closed"
+                        )
+
+                    cursor = await conn.execute(
+                        """
+                        SELECT elevenlabs_session_id
+                        FROM CONVERSATIONS
+                        WHERE id = ? AND user_id = ?
+                        """,
+                        (conversation_id, user_id),
+                    )
+                    current = await cursor.fetchone()
+                    if (
+                        not current
+                        or (current["elevenlabs_session_id"] or "").strip()
+                        != session_id
+                    ):
+                        raise ElevenLabsSessionBindingError(
+                            "Conversation no longer points to this session"
+                        )
+                    await conn.commit()
+                    return False
+
+                cursor = await conn.execute(
+                    """
+                    SELECT session_id
+                    FROM ELEVENLABS_CALL_SESSIONS
+                    WHERE conversation_id = ? AND status = 'active'
+                    """,
+                    (conversation_id,),
+                )
+                active_binding = await cursor.fetchone()
+                if active_binding:
+                    raise ElevenLabsSessionBindingError(
+                        "Conversation already has an active voice session"
+                    )
+
+                cursor = await conn.execute(
+                    """
+                    SELECT elevenlabs_session_id, elevenlabs_status
+                    FROM CONVERSATIONS
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (conversation_id, user_id),
+                )
+                current = await cursor.fetchone()
+                if not current:
+                    raise ElevenLabsSessionBindingError(
+                        "Conversation does not match the session owner"
+                    )
+                current_session = (current["elevenlabs_session_id"] or "").strip()
+                if current["elevenlabs_status"] == "active" and current_session:
+                    raise ElevenLabsSessionBindingError(
+                        "Conversation already has an active voice session"
+                    )
+
+                await conn.execute(
+                    """
+                    INSERT INTO ELEVENLABS_CALL_SESSIONS (
+                        session_id, conversation_id, user_id, agent_id, status
+                    ) VALUES (?, ?, ?, ?, 'active')
+                    """,
+                    (session_id, conversation_id, user_id, agent_info["agent_id"]),
+                )
+                cursor = await conn.execute(
+                    """
+                    UPDATE CONVERSATIONS
+                    SET elevenlabs_session_id = ?, elevenlabs_status = 'active'
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (session_id, conversation_id, user_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ElevenLabsSessionBindingError(
+                        "Conversation does not match the session owner"
+                    )
+                await conn.commit()
+            except sqlite3.IntegrityError as exc:
+                await conn.rollback()
+                raise ElevenLabsSessionBindingError(
+                    "ElevenLabs session conflicts with an existing binding"
+                ) from exc
+            except Exception:
+                await conn.rollback()
+                raise
+
         logger.info(
-            "[ElevenLabs] Session %s marked as active for conversation %s",
+            "[ElevenLabs] Session %s bound to conversation %s",
             session_id,
             conversation_id,
         )
+        return True
+
+    async def get_bound_session(
+        self,
+        conversation_id: int,
+        requested_session_id: str,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """Return the persisted current binding, rejecting client mismatches."""
+        requested_session_id = (requested_session_id or "").strip()
+        if requested_session_id and not SESSION_ID_PATTERN.fullmatch(
+            requested_session_id
+        ):
+            raise ElevenLabsSessionBindingError("Invalid ElevenLabs session id")
+
+        async with get_db_connection(readonly=True) as conn:
+            cursor = await conn.execute(
+                """
+                SELECT
+                    c.elevenlabs_session_id AS current_session_id,
+                    s.session_id,
+                    s.conversation_id,
+                    s.user_id,
+                    s.agent_id,
+                    s.status,
+                    s.transcript_saved_at
+                FROM CONVERSATIONS AS c
+                LEFT JOIN ELEVENLABS_CALL_SESSIONS AS s
+                    ON s.session_id = c.elevenlabs_session_id
+                WHERE c.id = ? AND c.user_id = ?
+                """,
+                (conversation_id, user_id),
+            )
+            row = await cursor.fetchone()
+
+        if not row:
+            raise ElevenLabsSessionBindingError(
+                "Conversation does not match the session owner"
+            )
+        current_session_id = (row["current_session_id"] or "").strip()
+        if not current_session_id or not row["session_id"]:
+            raise ElevenLabsSessionBindingError(
+                "Conversation has no bound ElevenLabs session"
+            )
+        if requested_session_id and requested_session_id != current_session_id:
+            raise ElevenLabsSessionBindingError(
+                "Requested session does not match this conversation"
+            )
+        if (
+            row["conversation_id"] != conversation_id
+            or row["user_id"] != user_id
+        ):
+            raise ElevenLabsSessionBindingError(
+                "Stored session binding does not match this conversation"
+            )
+        return dict(row)
 
     async def mark_session_status(
         self,
         conversation_id: int,
         session_id: str,
         status: str,
-    ) -> None:
+        user_id: int,
+    ) -> bool:
+        if status not in {"active", "failed", "completed"}:
+            raise ValueError("Invalid ElevenLabs session status")
+
         async with get_db_connection() as conn:
-            await conn.execute(
-                """
-                UPDATE CONVERSATIONS
-                SET elevenlabs_session_id = ?, elevenlabs_status = ?
-                WHERE id = ?
-                """,
-                (session_id, status, conversation_id),
-            )
-            await conn.commit()
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    """
+                    SELECT status, transcript_saved_at
+                    FROM ELEVENLABS_CALL_SESSIONS
+                    WHERE session_id = ? AND conversation_id = ? AND user_id = ?
+                    """,
+                    (session_id, conversation_id, user_id),
+                )
+                binding = await cursor.fetchone()
+                if not binding:
+                    raise ElevenLabsSessionBindingError(
+                        "Session is not bound to this conversation"
+                    )
+                if status == "completed" and not binding["transcript_saved_at"]:
+                    raise ElevenLabsSessionBindingError(
+                        "A session cannot complete before its transcript is stored"
+                    )
+                if binding["status"] == "completed" and status != "completed":
+                    await conn.commit()
+                    return False
+
+                cursor = await conn.execute(
+                    """
+                    UPDATE ELEVENLABS_CALL_SESSIONS
+                    SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ? AND conversation_id = ? AND user_id = ?
+                    """,
+                    (status, session_id, conversation_id, user_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ElevenLabsSessionBindingError(
+                        "Session is not bound to this conversation"
+                    )
+                cursor = await conn.execute(
+                    """
+                    UPDATE CONVERSATIONS
+                    SET elevenlabs_status = ?
+                    WHERE id = ? AND user_id = ? AND elevenlabs_session_id = ?
+                    """,
+                    (status, conversation_id, user_id, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ElevenLabsSessionBindingError(
+                        "Conversation no longer points to this session"
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
         logger.info(
             "[ElevenLabs] Session %s updated to status '%s' for conversation %s",
             session_id,
             status,
             conversation_id,
         )
+        return True
+
+    async def fetch_session_details(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch provider metadata used to verify a newly reported session."""
+        if not session_id:
+            return None
+
+        url = f"{self.api_base_url}/conversations/{session_id}"
+        api_key = get_elevenlabs_key()
+        if not api_key:
+            raise RuntimeError("ElevenLabs integration is not configured")
+        headers = {"xi-api-key": api_key, "Accept": "application/json"}
+
+        async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            payload = response.json()
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _validate_provider_session_binding(
+        provider_details: Dict[str, Any],
+        *,
+        session_id: str,
+        conversation_id: int,
+        user_id: int,
+        agent_id: str,
+    ) -> None:
+        initiation_data = (
+            provider_details.get("conversation_initiation_client_data") or {}
+        )
+        dynamic_variables = initiation_data.get("dynamic_variables") or {}
+        provider_conversation_id = dynamic_variables.get(
+            "aurvek_conversation_id"
+        )
+        provider_user_id = dynamic_variables.get("aurvek_user_id")
+        if provider_user_id is None:
+            provider_user_id = dynamic_variables.get("user_id")
+
+        matches = (
+            str(provider_details.get("conversation_id") or "") == session_id
+            and str(provider_details.get("agent_id") or "") == str(agent_id)
+            and str(provider_conversation_id or "") == str(conversation_id)
+            and str(provider_user_id or "") == str(user_id)
+        )
+        if not matches:
+            raise ElevenLabsProviderSessionError(
+                "ElevenLabs session metadata does not match this conversation"
+            )
 
     async def check_conversation_status(self, session_id: str) -> Optional[str]:
         """Check the status of a conversation before fetching transcript."""
@@ -238,7 +552,6 @@ class ElevenLabsService:
         logger.info("[ElevenLabs] Fetching transcript from URL: %s", url)
         logger.info("[ElevenLabs] Session ID: %s", session_id)
         logger.info("[ElevenLabs] API Base URL: %s", self.api_base_url)
-        logger.info("[ElevenLabs] Using API key: %s...%s", api_key[:10] if api_key else "NONE", api_key[-4:] if api_key else "")
 
         async with httpx.AsyncClient(timeout=self.http_timeout) as client:
             response = await client.get(url, headers=headers)
@@ -268,10 +581,12 @@ class ElevenLabsService:
         user_id: int,
         transcript: List[Dict[str, Any]],
     ) -> tuple:
-        """Save transcript to DB. Returns (saved_count, last_user_message_id, last_bot_message_id)."""
-        if not transcript:
-            await self.mark_session_status(conversation_id, session_id, "completed")
-            return (0, None, None)
+        """Store a transcript once per bound provider session.
+
+        Returns ``(saved_count, last_user_id, last_bot_id, already_saved)``.
+        The session row is the idempotency key and is checked while holding the
+        same write transaction that inserts the transcript turns.
+        """
 
         base_time = datetime.now(timezone.utc)
         last_lock_error: Optional[Exception] = None
@@ -288,6 +603,24 @@ class ElevenLabsService:
                 try:
                     await conn.execute("BEGIN IMMEDIATE")
                     transaction_started = True
+
+                    cursor = await conn.execute(
+                        """
+                        SELECT transcript_saved_at
+                        FROM ELEVENLABS_CALL_SESSIONS
+                        WHERE session_id = ? AND conversation_id = ? AND user_id = ?
+                        """,
+                        (session_id, conversation_id, user_id),
+                    )
+                    binding = await cursor.fetchone()
+                    if not binding:
+                        raise ElevenLabsSessionBindingError(
+                            "Session is not bound to this conversation"
+                        )
+                    if binding["transcript_saved_at"]:
+                        await conn.rollback()
+                        transaction_started = False
+                        return (0, None, None, True)
 
                     for index, turn in enumerate(transcript):
                         message_text = self._extract_transcript_text(turn)
@@ -314,37 +647,67 @@ class ElevenLabsService:
                             last_bot_message_id = inserted_id
                         saved_messages += 1
 
-                    await conn.execute(
+                    cursor = await conn.execute(
+                        """
+                        UPDATE ELEVENLABS_CALL_SESSIONS
+                        SET status = 'completed',
+                            transcript_saved_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE session_id = ?
+                          AND conversation_id = ?
+                          AND user_id = ?
+                          AND transcript_saved_at IS NULL
+                        """,
+                        (session_id, conversation_id, user_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ElevenLabsSessionBindingError(
+                            "Transcript was already stored for this session"
+                        )
+                    cursor = await conn.execute(
                         """
                         UPDATE CONVERSATIONS
-                        SET elevenlabs_session_id = ?, elevenlabs_status = 'completed'
+                        SET elevenlabs_status = 'completed'
                         WHERE id = ?
+                          AND user_id = ?
+                          AND elevenlabs_session_id = ?
                         """,
-                        (session_id, conversation_id),
+                        (conversation_id, user_id, session_id),
                     )
+                    if cursor.rowcount != 1:
+                        raise ElevenLabsSessionBindingError(
+                            "Conversation no longer points to this session"
+                        )
                     # Update conversation last_activity for sort ordering
                     await conn.execute("UPDATE CONVERSATIONS SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))
                     await conn.commit()
+                    transaction_started = False
 
                     logger.info(
                         "[ElevenLabs] Stored %s transcript turns for conversation %s",
                         saved_messages,
                         conversation_id,
                     )
-                    try:
-                        await record_voice_transcript_activity(
-                            user_id=user_id,
-                            conversation_id=conversation_id,
-                            transcript=transcript,
-                            session_id=session_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "[wellbeing] Failed to record voice transcript activity for conversation %s",
-                            conversation_id,
-                            exc_info=True,
-                        )
-                    return (saved_messages, last_user_message_id, last_bot_message_id)
+                    if transcript:
+                        try:
+                            await record_voice_transcript_activity(
+                                user_id=user_id,
+                                conversation_id=conversation_id,
+                                transcript=transcript,
+                                session_id=session_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "[wellbeing] Failed to record voice transcript activity for conversation %s",
+                                conversation_id,
+                                exc_info=True,
+                            )
+                    return (
+                        saved_messages,
+                        last_user_message_id,
+                        last_bot_message_id,
+                        False,
+                    )
 
                 except sqlite3.OperationalError as exc:
                     if transaction_started:
@@ -517,6 +880,25 @@ class ElevenLabsService:
                     logger.warning('[ElevenLabs] Could not remove empty audio file at %s', file_path)
             logger.warning('[ElevenLabs] Empty audio response for session %s', session_id)
             return None
+
+        # Ledger the WAV so it counts against the owner's storage quota (one row
+        # per file on disk). WAV is COUNT-ONLY: there is no
+        # ensure_generation_headroom gate anywhere in this call flow -- the call
+        # already happened and losing the recording is worse than a one-file
+        # overshoot. Fail fast: written first, ledgered immediately after -- if
+        # the ledger insert fails we delete the file and re-raise so an
+        # unaccounted artifact never exists.
+        try:
+            async with get_db_connection() as ledger_conn:
+                await record_generated_file(ledger_conn, conversation_id, 'wav', file_path, bytes_written)
+                await ledger_conn.commit()
+        except Exception:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    logger.warning('[ElevenLabs] Could not remove unaccounted audio file at %s', file_path)
+            raise
 
         relative_path = os.path.relpath(file_path, start=users_directory)
         logger.info('[ElevenLabs] Saved conversation audio to %s (%d bytes)', relative_path, bytes_written)

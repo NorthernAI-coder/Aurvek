@@ -67,7 +67,7 @@
         <label class="form-label" for="gransabio_url">GranSabio URL</label>
         <div class="d-flex gap-2">
             <input class="form-control" type="url" id="gransabio_url" name="gransabio_url"
-                   value="{{ config.url or '' }}" placeholder="http://10.0.100.20:8000">
+                   value="{{ config.url or '' }}" placeholder="http://127.0.0.1:8000">
             <button type="button" class="btn btn-outline-secondary flex-shrink-0" id="testConnectionBtn" onclick="testConnection()">
                 <span id="testSpinner" class="spinner-border spinner-border-sm me-1" style="display: none;"></span>
                 <i class="fas fa-satellite-dish me-1" id="testIcon"></i> Test

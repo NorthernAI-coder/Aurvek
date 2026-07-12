@@ -8,10 +8,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from auth import get_current_user, unauthenticated_response
 from admin_audit import log_admin_action
+from billing.usage_reservations import (
+    serialize_user_billing_response,
+    serialize_user_billing_stream,
+)
 from common import (
     API_KEY_MODE_OWN_ONLY,
-    AVATAR_TOKEN_EXPIRE_HOURS,
-    CLOUDFLARE_BASE_URL,
     MAX_PDF_SIZE_MB,
     MAX_RAW_UPLOAD_SIZE_MB,
     MAX_TEXT_FILE_SIZE_MB,
@@ -26,9 +28,8 @@ from ai_runtime.multi_ai.service import process_multi_ai_message
 from ai_runtime.provider_health import provider_from_machine, touch_provider_activity
 from log_config import logger
 from models import User
-from save_images import generate_img_token
-
 from chat.services.attachment_uploads import parse_attachment_refs_value
+from chat.services.avatar_urls import get_signed_bot_avatar_urls
 from chat.services.file_inputs import is_text_file
 from chat.services.message_rendering import process_message
 from chat.services.message_requests import validate_message_request
@@ -208,15 +209,10 @@ async def get_messages(
             empty_user_ids,
         )
 
-    from datetime import datetime, timezone, timedelta
-
-    bot_profile_picture = conv_row["bot_picture"] if conv_row else None
-    if bot_profile_picture:
-        current_time = datetime.now(timezone.utc)
-        new_expiration = current_time + timedelta(hours=AVATAR_TOKEN_EXPIRE_HOURS)
-        bot_picture_url = f"{bot_profile_picture}_32.webp"
-        token = generate_img_token(bot_picture_url, new_expiration, current_user)
-        bot_profile_picture = f"{CLOUDFLARE_BASE_URL}{bot_picture_url}?token={token}"
+    bot_avatar_urls = get_signed_bot_avatar_urls(
+        conv_row["bot_picture"] if conv_row else None,
+        current_user,
+    )
 
     conversation_info = {
         "id": conv_row["id"],
@@ -224,7 +220,7 @@ async def get_messages(
         "machine": conv_row["machine"],
         "model": conv_row["model"],
         "provider_health": touch_provider_activity(provider_from_machine(conv_row["machine"], conv_row["model"])),
-        "bot_profile_picture": bot_profile_picture,
+        **bot_avatar_urls,
         "prompt_description": conv_row["prompt_description"],
         "is_paid": bool(conv_row["is_paid"]),
         "is_incognito": bool(conv_row["is_incognito"]),
@@ -463,14 +459,17 @@ async def save_message(
                 return JSONResponse(content={"error": "No message provided"}, status_code=400)
 
             return StreamingResponse(
-                process_multi_ai_message(
-                    request=request,
-                    conversation_id=conversation_id,
-                    current_user=current_user,
-                    user_message=multi_user_message,
-                    model_ids=parsed_model_ids,
-                    thinking_budget_tokens=thinking_budget_tokens,
-                    user_api_keys=user_api_keys,
+                serialize_user_billing_stream(
+                    current_user.id,
+                    process_multi_ai_message(
+                        request=request,
+                        conversation_id=conversation_id,
+                        current_user=current_user,
+                        user_message=multi_user_message,
+                        model_ids=parsed_model_ids,
+                        thinking_budget_tokens=thinking_budget_tokens,
+                        user_api_keys=user_api_keys,
+                    ),
                 ),
                 media_type="text/event-stream",
             )
@@ -529,20 +528,23 @@ async def save_message(
     if text_compressed:
         text_compressed_bytes = await text_compressed.read()
 
-    return await process_save_message(
-        request=request,
-        conversation_id=conversation_id,
-        current_user=current_user,
-        text_compressed=text_compressed_bytes,
-        text_plain=text_plain,
-        files=files,
-        full_response=full_response,
-        is_whatsapp=is_whatsapp,
-        thinking_budget_tokens=thinking_budget_tokens,
-        user_api_keys=user_api_keys,
-        prevalidated=True,
-        pdf_page_start=pdf_page_start,
-        pdf_page_end=pdf_page_end,
-        pdf_retry_token=pdf_retry_token,
-        attachment_refs=parsed_attachment_refs,
+    return await serialize_user_billing_response(
+        current_user.id,
+        process_save_message(
+            request=request,
+            conversation_id=conversation_id,
+            current_user=current_user,
+            text_compressed=text_compressed_bytes,
+            text_plain=text_plain,
+            files=files,
+            full_response=full_response,
+            is_whatsapp=is_whatsapp,
+            thinking_budget_tokens=thinking_budget_tokens,
+            user_api_keys=user_api_keys,
+            prevalidated=True,
+            pdf_page_start=pdf_page_start,
+            pdf_page_end=pdf_page_end,
+            pdf_retry_token=pdf_retry_token,
+            attachment_refs=parsed_attachment_refs,
+        ),
     )

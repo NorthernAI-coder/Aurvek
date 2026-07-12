@@ -70,18 +70,14 @@ async def free_credit_payment(
 
     try:
         data = await request.json()
-        original_amount = float(data["originalAmount"])
         discount_code = (data.get("discount_code", "") or "").strip()
-    except KeyError as exc:
-        raise HTTPException(status_code=422, detail=f"Missing field in request data: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid request data: {exc}") from exc
 
     result = await credit_free_wallet_topup(
         user_id=current_user.id,
-        original_amount=original_amount,
         discount_code=discount_code,
-        description_prefix="Free credit (100% discount)",
+        description_prefix="Wallet credit code",
         reference_prefix="free_credit",
     )
     return JSONResponse(
@@ -89,6 +85,7 @@ async def free_credit_payment(
             {
                 "message": "Free credit applied successfully",
                 "new_balance": result["new_balance"],
+                "grant_amount": result["grant_amount"],
                 "redirectUrl": "/",
             }
         )

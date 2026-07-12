@@ -1,4 +1,20 @@
+import math
+
 from ai_runtime.dependencies import *
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    estimate_structured_billing_tokens,
+    estimate_structured_usage_tokens,
+    get_user_billing_availability,
+    get_variable_billing_rates,
+    refund_fixed_usage,
+    reserve_ai_usage,
+    revalidate_user_billing,
+    extend_ai_reservation,
+    settle_accumulated_ai_reservation_usage,
+)
+from storage_quota import StorageQuotaExceededError, platform_reply_quota_message
 from tools import tools
 from ai_runtime.attachments.media import format_image_for_provider, hydrate_image_for_context
 from ai_runtime.attachments.pdf import (
@@ -53,7 +69,13 @@ from ai_runtime.providers.openrouter import call_openrouter_api
 from ai_runtime.providers.xai import call_xai_responses_api
 from ai_runtime.streaming import _stream_with_sse_keepalives
 from ai_runtime.tooling.catalog import tools_in_app
-from ai_runtime.tooling.execution import _build_tool_response_messages, handle_function_call
+from ai_runtime.tooling.execution import (
+    TOOL_CALL_SERIALIZATION_BYTES_PER_OUTPUT_TOKEN,
+    TOOL_RESULT_MAX_BYTES,
+    _build_tool_response_messages,
+    handle_function_call,
+    truncate_tool_result_for_ai,
+)
 from ai_runtime.tooling.formatters import (
     tools_for_claude,
     tools_for_gemini,
@@ -63,6 +85,75 @@ from ai_runtime.tooling.formatters import (
 )
 from ai_runtime.watchdog.prompting import _build_escalated_hint_block, _sanitize_watchdog_directive
 from ai_runtime.watchdog.takeover import watchdog_takeover_response
+
+
+# --- Storage-quota skip signalling ------------------------------------------
+# process_save_message runs the upload gate deep inside create_pending_* (via
+# file_storage). When an inbound platform/device attachment is quota-rejected it
+# is skipped rather than aborting the whole message, and the fact is stamped on
+# the returned response as headers. serialize_user_billing_response copies
+# raw_headers into its wrapper, so the Telegram/WhatsApp handlers recover the
+# notice from either the streaming success response or the media-only 413.
+STORAGE_QUOTA_SKIP_HEADER = "X-Storage-Quota-Exceeded"
+STORAGE_QUOTA_USAGE_HEADER = "X-Storage-Quota-Usage-Bytes"
+STORAGE_QUOTA_LIMIT_HEADER = "X-Storage-Quota-Limit-Bytes"
+
+
+def _storage_quota_skip_headers(exc: StorageQuotaExceededError) -> dict[str, str]:
+    return {
+        STORAGE_QUOTA_SKIP_HEADER: "1",
+        STORAGE_QUOTA_USAGE_HEADER: str(exc.usage_bytes),
+        STORAGE_QUOTA_LIMIT_HEADER: str(exc.quota_bytes),
+    }
+
+
+def storage_quota_notice_from_response(response) -> str | None:
+    """Platform reply string if ``response`` carries the quota-skip header, else None.
+
+    Lets the Telegram/WhatsApp handlers tell the user a file could not be
+    received because their storage is full, without the header ever mattering to
+    the web SSE consumer (which ignores it).
+    """
+    headers = getattr(response, "headers", None)
+    if headers is None or headers.get(STORAGE_QUOTA_SKIP_HEADER) != "1":
+        return None
+    try:
+        usage_bytes = int(headers.get(STORAGE_QUOTA_USAGE_HEADER) or 0)
+        quota_bytes = int(headers.get(STORAGE_QUOTA_LIMIT_HEADER) or 0)
+    except (TypeError, ValueError):
+        return None
+    return platform_reply_quota_message(usage_bytes, quota_bytes)
+
+
+def _resolve_tool_call_billing_usage(
+    tool_call: dict,
+    *,
+    input_fallback: int,
+    output_cap: int,
+    pre_tool_content: str = "",
+) -> tuple[int, int]:
+    """Use provider usage for a tool call, falling back conservatively."""
+    usage = tool_call.pop("_billing_usage", None) or {}
+    try:
+        input_tokens = max(0, int(usage.get("input_tokens") or 0))
+    except (TypeError, ValueError):
+        input_tokens = 0
+    try:
+        output_tokens = max(0, int(usage.get("output_tokens") or 0))
+    except (TypeError, ValueError):
+        output_tokens = 0
+    if input_tokens == 0:
+        input_tokens = max(1, int(input_fallback or 0))
+    if output_tokens == 0:
+        output_tokens = min(
+            max(1, int(output_cap or 1)),
+            estimate_structured_usage_tokens(
+                tool_call.get("name"),
+                tool_call.get("arguments"),
+                pre_tool_content,
+            ),
+        )
+    return input_tokens, output_tokens
 
 async def process_save_message(
     request: Request,
@@ -80,6 +171,7 @@ async def process_save_message(
     pdf_page_end: Optional[int] = None,
     pdf_retry_token: Optional[str] = None,
     attachment_refs: Optional[list[str]] = None,
+    strip_device_action_blocks: bool = False,
 ):
     """
     Pure business logic function for processing and saving messages.
@@ -175,14 +267,19 @@ async def process_save_message(
     message_list_to_send = []
     pending_attachment_refs: list[str] = []
     discardable_attachment_refs: list[str] = []
+    # Set when an inbound attachment is dropped because it would exceed the
+    # user's storage quota. The message keeps processing; the skip is surfaced
+    # to platform handlers via response headers (or a 413 for a media-only
+    # message where every attachment was rejected).
+    storage_quota_skip: StorageQuotaExceededError | None = None
 
     async def _attachment_error_response(message: str, status_code: int = 400):
         await discard_pending_attachments(discardable_attachment_refs, "message_upload_aborted")
         return JSONResponse(content={'success': False, 'message': message}, status_code=status_code)
 
-    async def _attachment_json_error_response(content: dict, status_code: int = 400):
+    async def _attachment_json_error_response(content: dict, status_code: int = 400, headers: dict | None = None):
         await discard_pending_attachments(discardable_attachment_refs, "message_upload_aborted")
-        return JSONResponse(content=content, status_code=status_code)
+        return JSONResponse(content=content, status_code=status_code, headers=headers)
 
     logger.debug("Before entering into get_db_connection")
 
@@ -437,7 +534,9 @@ async def process_save_message(
                         )
                     input_tokens += _estimate_pdf_input_tokens_for_preflight(page_count_for_cost, machine)
 
-        current_balance = await get_balance(current_user.id)
+        billing_availability = await get_user_billing_availability(current_user.id)
+        current_balance = billing_availability["available"]
+        billing_preflight_amount = 0.0
         model_output_cap, output_limit_fallback_used = _model_output_cap(llm_max_output_tokens)
 
         # GranSabio early detection
@@ -457,10 +556,9 @@ async def process_save_message(
             if files:
                 return await _attachment_error_response('File attachments are not supported with GranSabio mode. Send text only.')
             is_byok = False
-            from common import get_effective_billing_info
-            billing_info = await get_effective_billing_info(current_user.id)
-            if billing_info['effective_balance'] <= 0:
+            if current_balance <= 0:
                 return await _attachment_error_response('Insufficient balance.', status_code=402)
+            billing_preflight_amount = min(current_balance, 1e-12)
             output_tokens = model_output_cap
             _log_output_limit_decision(
                 source="single_gransabio",
@@ -514,6 +612,8 @@ async def process_save_message(
                 # BYOK: no API cost to platform. Only need balance for paid prompt markup.
                 if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
                     return await _attachment_error_response('Insufficient balance for creator markup.', status_code=402)
+                if prompt_is_paid:
+                    billing_preflight_amount = BYOK_MIN_BALANCE_PAID_PROMPT
                 # For free prompts with BYOK, no balance needed at all
                 output_tokens = model_output_cap
                 logger.debug(f"BYOK mode: max_tokens={output_tokens}, Balance: {current_balance}")
@@ -548,6 +648,8 @@ async def process_save_message(
                     # Free model: no API cost. Only need balance for paid prompt markup.
                     if prompt_is_paid and current_balance < BYOK_MIN_BALANCE_PAID_PROMPT:
                         return await _attachment_error_response('Insufficient balance for creator markup.', status_code=402)
+                    if prompt_is_paid:
+                        billing_preflight_amount = BYOK_MIN_BALANCE_PAID_PROMPT
                     output_tokens = model_output_cap
                     total_cost = 0
                     logger.debug(f"Free model: max_tokens={output_tokens}, Balance: {current_balance}")
@@ -575,6 +677,7 @@ async def process_save_message(
                         return await _attachment_error_response('Insufficient balance to send the message.', status_code=402)
                     output_cost = (output_tokens / 1000000) * output_token_cost
                     total_cost = input_cost + output_cost
+                    billing_preflight_amount = total_cost
 
                     if total_cost >= current_balance:
                         return await _attachment_error_response('Insufficient balance to send the message.', status_code=402)
@@ -735,6 +838,11 @@ async def process_save_message(
                         page_count=page_count,
                         declared_mime=pdf.get('content_type') or 'application/pdf',
                     )
+                except StorageQuotaExceededError as exc:
+                    # Over quota: skip this PDF but keep processing the rest of
+                    # the message. The blob was already pruned by file_storage.
+                    storage_quota_skip = exc
+                    continue
                 except Exception as exc:
                     logger.error("[process_save_message] Could not save PDF attachment: %s", exc)
                     return await _attachment_error_response('Failed to save PDF.', status_code=500)
@@ -795,6 +903,10 @@ async def process_save_message(
                             filename=filename,
                             declared_mime=tf.get('content_type') or 'text/plain',
                         )
+                    except StorageQuotaExceededError as exc:
+                        # Over quota: skip this text file, keep processing the rest.
+                        storage_quota_skip = exc
+                        continue
                     except Exception as exc:
                         logger.error("[process_save_message] Could not save text attachment: %s", exc)
                         return await _attachment_error_response('Failed to save text file.', status_code=500)
@@ -864,6 +976,10 @@ async def process_save_message(
                         width=w,
                         height=h,
                     )
+                except StorageQuotaExceededError as exc:
+                    # Over quota: skip this image, keep processing the rest.
+                    storage_quota_skip = exc
+                    continue
                 except Exception as e:
                     logger.error(f"[process_save_message] Could not save image: {e}")
                     return await _attachment_error_response('Failed to save image.', status_code=500)
@@ -892,6 +1008,25 @@ async def process_save_message(
             }
             message_list_to_save.append(message_content)
             message_list_to_send.append(message_content)
+
+        if storage_quota_skip is not None and not message_list_to_send:
+            # Media-only message whose every attachment was quota-rejected:
+            # nothing is left to answer, so fail the whole request (413). The
+            # skip headers let platform handlers reply "storage full". The body
+            # uses the platform wording: this 413 is only reached by inbound
+            # platform media (web uploads reject earlier, in the complete
+            # endpoint), so "delete some files" web phrasing would be wrong.
+            return await _attachment_json_error_response(
+                {
+                    'success': False,
+                    'message': platform_reply_quota_message(
+                        storage_quota_skip.usage_bytes,
+                        storage_quota_skip.quota_bytes,
+                    ),
+                },
+                status_code=413,
+                headers=_storage_quota_skip_headers(storage_quota_skip),
+            )
 
         message_to_save = orjson.dumps(message_list_to_save).decode()
     else:
@@ -1121,6 +1256,10 @@ async def process_save_message(
                     byok=is_byok,
                     pending_attachment_refs=pending_attachment_refs,
                     perf_trace=perf_trace,
+                    strip_device_action_blocks=strip_device_action_blocks,
+                    billing_preflight_amount=billing_preflight_amount,
+                    input_token_cost_per_million=input_token_cost,
+                    output_token_cost_per_million=output_token_cost,
                 )
                 async for chunk in _stream_with_sse_keepalives(response_stream):
                     yield chunk
@@ -1130,7 +1269,16 @@ async def process_save_message(
             finally:
                 await discard_pending_attachments(discardable_attachment_refs, "stream_finished")
 
-    return StreamingResponse(stream_response(), media_type='text/event-stream')
+    quota_skip_headers = (
+        _storage_quota_skip_headers(storage_quota_skip)
+        if storage_quota_skip is not None
+        else None
+    )
+    return StreamingResponse(
+        stream_response(),
+        media_type='text/event-stream',
+        headers=quota_skip_headers,
+    )
 
 async def get_ai_response(
     message,
@@ -1152,12 +1300,18 @@ async def get_ai_response(
     byok: bool = False,
     pending_attachment_refs: Optional[list[str]] = None,
     perf_trace: ChatPerfTrace | None = None,
+    strip_device_action_blocks: bool = False,
+    billing_preflight_amount: float = 0.0,
+    input_token_cost_per_million: float | None = None,
+    output_token_cost_per_million: float | None = None,
 ):
     logger.info(f"*** Enters {machine}")
     logger.debug(f"Parameters received: conversation_id={conversation_id}, model={model}, max_tokens={max_tokens}")
     #logger.info(f"message en get_ai_response: {message}")
 
     user_id = current_user.id
+    ai_reservation_id = None
+    ai_reserved_maximum = 0.0
     logger.debug(f"User ID: {user_id}")
     context_messages = flatten_multi_ai_context(context_messages)
     context_messages = filter_invalid_context_messages(context_messages)
@@ -1393,6 +1547,7 @@ async def get_ai_response(
                                             event_type=pre_event_type,
                                             source="pre",
                                             pending_attachment_refs=pending_attachment_refs,
+                                            strip_device_action_blocks=strip_device_action_blocks,
                                         ):
                                             yield chunk
                                         return
@@ -1474,6 +1629,7 @@ async def get_ai_response(
                                         event_type=pending_hint_event_type,
                                         source="post",
                                         pending_attachment_refs=pending_attachment_refs,
+                                        strip_device_action_blocks=strip_device_action_blocks,
                                     ):
                                         yield chunk
                                     return
@@ -1811,6 +1967,13 @@ async def get_ai_response(
                         yield f"data: {orjson.dumps({'error': 'Invalid GranSabio configuration for this prompt (corrupted JSON). Contact admin.'}).decode()}\n\n"
                         return
 
+                    if not await revalidate_user_billing(
+                        current_user.id,
+                        billing_preflight_amount,
+                    ):
+                        yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                        return
+
                     async for chunk in generate_via_gransabio(
                         message=message, context_messages=context_messages,
                         conversation_id=conversation_id, current_user=current_user,
@@ -1821,6 +1984,7 @@ async def get_ai_response(
                         watchdog_hint_active=watchdog_hint_active,
                         watchdog_hint_eval_id=watchdog_hint_eval_id,
                         max_tokens=max_tokens,
+                        strip_device_action_blocks=strip_device_action_blocks,
                     ):
                         yield chunk
                     return  # Don't fall through -- generate_via_gransabio handles its own DB saving
@@ -1837,9 +2001,16 @@ async def get_ai_response(
                 # Filter tools based on web search settings
                 # Priority: disable_web_search > force_web_search > user preference > mode selection
                 filtered_tools = tools
+                if not bool(getattr(current_user, "can_generate_images", False)):
+                    filtered_tools = [
+                        tool
+                        for tool in filtered_tools
+                        if tool.get("function", {}).get("name")
+                        not in {"generateImage", "generateVideo"}
+                    ]
                 if disable_web_search:
                     # Prompt forces web search OFF - remove all search tools
-                    filtered_tools = [t for t in tools if t['function']['name'] != 'query_perplexity']
+                    filtered_tools = [t for t in filtered_tools if t['function']['name'] != 'query_perplexity']
                     web_search_mode = None
                 elif force_web_search:
                     # Prompt forces web search ON - ensure search is active regardless of user pref
@@ -1847,16 +2018,16 @@ async def get_ai_response(
                         web_search_mode = 'native'
                     if web_search_mode == 'native':
                         if machine in NATIVE_SEARCH_PROVIDERS:
-                            filtered_tools = [t for t in tools if t['function']['name'] != 'query_perplexity']
+                            filtered_tools = [t for t in filtered_tools if t['function']['name'] != 'query_perplexity']
                         else:
                             web_search_mode = 'perplexity'
                 elif not user_web_search_enabled:
                     # User disabled web search - remove all search tools
-                    filtered_tools = [t for t in tools if t['function']['name'] != 'query_perplexity']
+                    filtered_tools = [t for t in filtered_tools if t['function']['name'] != 'query_perplexity']
                     web_search_mode = None
                 elif web_search_mode == 'native':
                     if machine in NATIVE_SEARCH_PROVIDERS:
-                        filtered_tools = [t for t in tools if t['function']['name'] != 'query_perplexity']
+                        filtered_tools = [t for t in filtered_tools if t['function']['name'] != 'query_perplexity']
                     else:
                         web_search_mode = 'perplexity'
                 # else: 'perplexity' mode - keep query_perplexity (current behavior)
@@ -1914,6 +2085,7 @@ async def get_ai_response(
                     "web_search_mode": web_search_mode,
                     "byok": byok,
                     "pending_attachment_refs": pending_attachment_refs,
+                    "strip_device_action_blocks": strip_device_action_blocks,
                 }
 
                 # Add tools if available for this provider
@@ -1962,6 +2134,77 @@ async def get_ai_response(
                     logger.error(f"User {current_user.id} in own_only mode without API key for {machine}")
                     yield f"data: {orjson.dumps({'error': 'API key required', 'action': 'configure_api_keys'}).decode()}\n\n"
                     return
+
+                if input_token_cost_per_million is None or output_token_cost_per_million is None:
+                    if llm_id is not None:
+                        cost_cursor = await conn_ro.execute(
+                            "SELECT input_token_cost, output_token_cost FROM LLM WHERE id = ?",
+                            (llm_id,),
+                        )
+                    else:
+                        cost_cursor = await conn_ro.execute(
+                            "SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?",
+                            (model,),
+                        )
+                    cost_row = await cost_cursor.fetchone()
+                    if not cost_row:
+                        yield f"data: {orjson.dumps({'error': 'LLM cost configuration is missing'}).decode()}\n\n"
+                        return
+                    input_token_cost_per_million = float(cost_row[0] or 0)
+                    output_token_cost_per_million = float(cost_row[1] or 0)
+
+                provider_input_tokens = max(
+                    estimate_structured_billing_tokens(
+                        full_prompt,
+                        api_messages,
+                        provider_tools,
+                    ),
+                    max(0, int(input_token_fallback or 0)),
+                )
+                billing_rates = await get_variable_billing_rates(
+                    user_id=current_user.id,
+                    prompt_id=prompt_id,
+                    input_cost_per_million=input_token_cost_per_million,
+                    output_cost_per_million=output_token_cost_per_million,
+                    byok=bool(resolved_key),
+                )
+                fresh_availability = await get_user_billing_availability(
+                    current_user.id
+                )
+                if machine == "Claude":
+                    # Claude may make the initial request plus three pause_turn
+                    # continuations. Each continuation repeats the prior context.
+                    maximum_input_charge = (
+                        provider_input_tokens * 4 * billing_rates.input_per_token
+                    )
+                    maximum_output_rate = (
+                        6 * billing_rates.input_per_token
+                        + 4 * billing_rates.output_per_token
+                    )
+                else:
+                    maximum_input_charge = (
+                        provider_input_tokens * billing_rates.input_per_token
+                    )
+                    maximum_output_rate = billing_rates.output_per_token
+
+                available_for_output = (
+                    fresh_availability["available"] - maximum_input_charge
+                )
+                if available_for_output < -1e-12:
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                    return
+                if maximum_output_rate > 0:
+                    affordable_output = math.floor(
+                        max(0.0, available_for_output) / maximum_output_rate
+                    )
+                    max_tokens = min(max_tokens, affordable_output)
+                if max_tokens < 1:
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                    return
+                billing_preflight_amount = (
+                    maximum_input_charge + max_tokens * maximum_output_rate
+                )
+                kwargs["max_tokens"] = max_tokens
                 if perf_trace:
                     event = perf_trace.sse(
                         "provider_call_start",
@@ -1991,6 +2234,29 @@ async def get_ai_response(
                     except orjson.JSONDecodeError:
                         return False
                     return chunk_data.get("type") == "perf_trace"
+
+                if not await revalidate_user_billing(
+                    current_user.id,
+                    billing_preflight_amount,
+                ):
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                    return
+
+                try:
+                    ai_reserved_maximum = billing_preflight_amount
+                    ai_reservation_id = await reserve_ai_usage(
+                        user_id=current_user.id,
+                        maximum_amount=billing_preflight_amount,
+                    )
+                except InsufficientBalanceError:
+                    yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                    return
+                except BillingReservationError:
+                    logger.exception("Could not reserve AI usage")
+                    yield f"data: {orjson.dumps({'error': 'AI billing is temporarily unavailable'}).decode()}\n\n"
+                    return
+                kwargs["billing_reservation_id"] = ai_reservation_id
+                billing_preflight_amount = 0.0
 
                 # Peek at first chunk to detect image download errors
                 first_chunk = None
@@ -2078,6 +2344,74 @@ async def get_ai_response(
                 if collected_tool_call:
                     function_name = collected_tool_call['name']
                     function_arguments = collected_tool_call['arguments']
+                    initial_tool_input_tokens, initial_tool_output_tokens = (
+                        _resolve_tool_call_billing_usage(
+                            collected_tool_call,
+                            input_fallback=provider_input_tokens,
+                            output_cap=max_tokens,
+                            pre_tool_content=pre_tool_content,
+                        )
+                    )
+                    initial_tool_total_tokens = (
+                        initial_tool_input_tokens + initial_tool_output_tokens
+                    )
+
+                    second_input_tokens = (
+                        provider_input_tokens + TOOL_RESULT_MAX_BYTES + 2_048
+                    )
+                    if machine == "Claude":
+                        second_call_maximum = (
+                            second_input_tokens
+                            * 4
+                            * billing_rates.input_per_token
+                            + max_tokens
+                            * (
+                                6 * billing_rates.input_per_token
+                                + 4 * billing_rates.output_per_token
+                                + 4
+                                * TOOL_CALL_SERIALIZATION_BYTES_PER_OUTPUT_TOKEN
+                                * billing_rates.input_per_token
+                            )
+                        )
+                    else:
+                        second_call_maximum = (
+                            second_input_tokens * billing_rates.input_per_token
+                            + max_tokens
+                            * (
+                                billing_rates.output_per_token
+                                + TOOL_CALL_SERIALIZATION_BYTES_PER_OUTPUT_TOKEN
+                                * billing_rates.input_per_token
+                            )
+                        )
+                    first_call_actual_upper = (
+                        initial_tool_input_tokens * billing_rates.input_per_token
+                        + initial_tool_output_tokens
+                        * billing_rates.output_per_token
+                    )
+                    additional_hold = max(
+                        0.0,
+                        first_call_actual_upper
+                        + second_call_maximum
+                        - ai_reserved_maximum,
+                    )
+
+                    async def _extend_for_tool_follow_up() -> str | None:
+                        nonlocal ai_reserved_maximum
+                        if not ai_reservation_id or additional_hold <= 0:
+                            return None
+                        try:
+                            await extend_ai_reservation(
+                                reservation_id=ai_reservation_id,
+                                user_id=current_user.id,
+                                additional_amount=additional_hold,
+                            )
+                            ai_reserved_maximum += additional_hold
+                        except InsufficientBalanceError:
+                            return "Insufficient balance for the tool follow-up"
+                        except BillingReservationError:
+                            logger.exception("Could not extend AI tool-call billing")
+                            return "AI billing is temporarily unavailable"
+                        return None
 
                     logger.info(f"[get_ai_response] - Processing tool call: {function_name}")
 
@@ -2085,13 +2419,18 @@ async def get_ai_response(
                         # === SECOND PASS FLOW ===
                         # The AI decided to search the web. We call Perplexity silently,
                         # feed the results back to the AI, and let it formulate its own answer.
-                        from tools.perplexity import get_perplexity_result
+                        from tools.perplexity import get_billed_perplexity_result
 
                         query = function_arguments.get('query', '') if isinstance(function_arguments, dict) else str(function_arguments)
 
                         if not query.strip():
                             logger.warning("[get_ai_response] - Perplexity second pass: empty query")
                             yield f"data: {orjson.dumps({'error': 'Web search query was empty'}).decode()}\n\n"
+                            return
+
+                        follow_up_error = await _extend_for_tool_follow_up()
+                        if follow_up_error:
+                            yield f"data: {orjson.dumps({'error': follow_up_error}).decode()}\n\n"
                             return
 
                         logger.debug(f"[get_ai_response] - Perplexity second pass for query: {query[:100]}")
@@ -2101,7 +2440,11 @@ async def get_ai_response(
 
                         try:
                             # 2. Get Perplexity results (non-streaming)
-                            perplexity_result = await get_perplexity_result(query)
+                            perplexity_result = await get_billed_perplexity_result(
+                                query,
+                                user_id=current_user.id,
+                                prompt_id=prompt_id,
+                            )
                             logger.info(f"[get_ai_response] - Perplexity result length: {len(perplexity_result)}")
                         except Exception as e:
                             logger.error(f"[get_ai_response] - Perplexity second pass failed: {e}")
@@ -2131,6 +2474,12 @@ async def get_ai_response(
                         yield f"data: {orjson.dumps({'searching': False}).decode()}\n\n"
 
                         # 6. Stream the second pass response from the original AI
+                        if not await revalidate_user_billing(
+                            current_user.id,
+                            billing_preflight_amount,
+                        ):
+                            yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                            return
                         async for chunk in api_func(**second_kwargs):
                             yield chunk
                         # api_func handles save_to_db internally
@@ -2177,6 +2526,7 @@ async def get_ai_response(
                         # but keeping tools causes Claude to re-call the tool instead of answering.
                         # Plain text avoids both problems.
                         if machine == "Claude":
+                            help_result = truncate_tool_result_for_ai(help_result)
                             api_messages.append({"role": "assistant", "content": [{"type": "text", "text": f"I looked up platform help information."}]})
                             api_messages.append({"role": "user", "content": [{"type": "text", "text": f"Here is the platform help result. Use it to answer my question:\n\n{help_result}"}]})
                         else:
@@ -2193,15 +2543,27 @@ async def get_ai_response(
                                 api_messages.pop(0)
 
                         # 6. Stream the AI's answer incorporating KB results
+                        follow_up_error = await _extend_for_tool_follow_up()
+                        if follow_up_error:
+                            yield f"data: {orjson.dumps({'error': follow_up_error}).decode()}\n\n"
+                            return
+                        if not await revalidate_user_billing(
+                            current_user.id,
+                            billing_preflight_amount,
+                        ):
+                            yield f"data: {orjson.dumps({'error': 'Insufficient balance'}).decode()}\n\n"
+                            return
                         async for chunk in api_func(**second_kwargs):
                             yield chunk
                         return
 
                     else:
                         # === EXISTING FLOW for all other tools ===
-                        input_tokens = estimate_message_tokens(message)
-                        total_tokens = input_tokens + max_tokens
-
+                        if function_name == "atFieldActivate":
+                            follow_up_error = await _extend_for_tool_follow_up()
+                            if follow_up_error:
+                                yield f"data: {orjson.dumps({'error': follow_up_error}).decode()}\n\n"
+                                return
                         async for chunk in handle_function_call(
                             function_name,
                             function_arguments,
@@ -2213,9 +2575,9 @@ async def get_ai_response(
                             conversation_id,
                             current_user,
                             request,
-                            input_tokens,
-                            max_tokens,
-                            total_tokens,
+                            initial_tool_input_tokens,
+                            initial_tool_output_tokens,
+                            initial_tool_total_tokens,
                             None,
                             user_id,
                             machine,
@@ -2233,6 +2595,11 @@ async def get_ai_response(
                             byok=byok,
                             thinking_budget_tokens=thinking_budget_tokens,
                             pending_attachment_refs=pending_attachment_refs,
+                            strip_device_action_blocks=strip_device_action_blocks,
+                            billing_preflight_amount=billing_preflight_amount,
+                            billing_reservation_id=ai_reservation_id,
+                            billing_first_call_accumulated=bool(ai_reservation_id),
+                            billing_followup_hold_amount=additional_hold,
                         ):
                             yield chunk
 
@@ -2242,3 +2609,30 @@ async def get_ai_response(
         logger.error(f"[get_ai_response] - Error getting response from {machine}: {e}")
         logger.error(f"[get_ai_response] - Traceback: {traceback.format_exc()}")
         yield None
+    finally:
+        if ai_reservation_id:
+            try:
+                await settle_accumulated_ai_reservation_usage(
+                    reservation_id=ai_reservation_id,
+                    user_id=current_user.id,
+                    input_cost_per_million=float(
+                        input_token_cost_per_million or 0.0
+                    ),
+                    output_cost_per_million=float(
+                        output_token_cost_per_million or 0.0
+                    ),
+                    prompt_id=prompt_id,
+                    byok=byok,
+                )
+            except BillingReservationError:
+                logger.exception(
+                    "Could not capture unfinished AI usage %s",
+                    ai_reservation_id,
+                )
+            try:
+                await refund_fixed_usage(ai_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not release unfinished AI reservation %s",
+                    ai_reservation_id,
+                )

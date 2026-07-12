@@ -3,6 +3,26 @@
 let phoneInputJS;
 let audioPlayer = null;
 let alterEgoModal;
+let phoneChallengeId = null;
+let challengePhoneNumber = null;
+let phoneChallengeApproved = false;
+
+function resetPhoneVerificationState() {
+    phoneChallengeId = null;
+    challengePhoneNumber = null;
+    phoneChallengeApproved = false;
+    const phoneInput = document.getElementById('phone');
+    const verificationInput = document.getElementById('verificationCode');
+    const verificationIdInput = document.getElementById('phoneVerificationId');
+    const verificationContainer = document.getElementById('verificationCodeContainer');
+    if (phoneInput) delete phoneInput.dataset.verified;
+    if (verificationInput) {
+        verificationInput.value = '';
+        verificationInput.disabled = false;
+    }
+    if (verificationIdInput) verificationIdInput.value = '';
+    if (verificationContainer) verificationContainer.style.display = 'none';
+}
 
 document.addEventListener('DOMContentLoaded', function() {
     initAfterLoginPreference();
@@ -12,7 +32,6 @@ document.addEventListener('DOMContentLoaded', function() {
     loadAlterEgos(currentAlterEgoId);
     setupEventListeners();
     initializeProfileHandlers();
-    setupUsernameValidation();
 
     alterEgoModal = new bootstrap.Modal(document.getElementById('alterEgoModal'));
 
@@ -217,6 +236,7 @@ function setupEventListeners() {
     const sendCodeButton = document.getElementById('sendCodeButton');
     const verificationCodeContainer = document.getElementById('verificationCodeContainer');
     const verificationCodeInput = document.getElementById('verificationCode');
+    const phoneVerificationIdInput = document.getElementById('phoneVerificationId');
     const editProfileForm = document.getElementById('editProfileForm');
 
     const verifyCodeButton = document.createElement('button');
@@ -233,6 +253,10 @@ function setupEventListeners() {
         e.preventDefault();
         const phoneNumber = phoneInputJS.getNumber(intlTelInputUtils.numberFormat.E164);
         const code = verificationCodeInput.value;
+        if (!phoneChallengeId || challengePhoneNumber !== phoneNumber) {
+            NotificationModal.error('Error', 'Request a new code for this phone number.');
+            return;
+        }
 
         try {
             const response = await secureFetch('/api/verify-code', {
@@ -240,7 +264,12 @@ function setupEventListeners() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ phone: phoneNumber, code: code }),
+                body: JSON.stringify({
+                    challenge_id: phoneChallengeId,
+                    phone: phoneNumber,
+                    purpose: 'profile_phone_change',
+                    code: code
+                }),
             });
             if (!response) return; // Session expired
             const result = await response.json();
@@ -249,8 +278,10 @@ function setupEventListeners() {
                 verifyCodeButton.style.display = 'none';
                 verificationCodeInput.disabled = true;
                 phoneInput.dataset.verified = 'true';
+                phoneChallengeApproved = true;
+                phoneVerificationIdInput.value = phoneChallengeId;
             } else {
-                NotificationModal.error('Error', 'Verification failed. Please check the code and try again.');
+                NotificationModal.error('Error', result.detail || 'Verification failed. Please check the code and try again.');
                 verificationCodeInput.value = '';
             }
         } catch (error) {
@@ -260,6 +291,7 @@ function setupEventListeners() {
     });
 
     phoneInput.addEventListener('input', function() {
+        resetPhoneVerificationState();
         if (this.value) {
             sendCodeButton.style.display = 'block';
         } else {
@@ -277,7 +309,7 @@ function setupEventListeners() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ phone: phoneNumber, user_id: currentUserId }),
+                body: JSON.stringify({ phone: phoneNumber }),
             });
             if (!checkResponse) return; // Session expired
             const checkResult = await checkResponse.json();
@@ -292,12 +324,21 @@ function setupEventListeners() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ phone: phoneNumber }),
+                body: JSON.stringify({
+                    phone: phoneNumber,
+                    purpose: 'profile_phone_change'
+                }),
             });
             if (!response) return; // Session expired
             const result = await response.json();
             if (response.ok) {
                 if (result.status === 'pending') {
+                    phoneChallengeId = result.challenge_id;
+                    challengePhoneNumber = phoneNumber;
+                    phoneChallengeApproved = false;
+                    phoneVerificationIdInput.value = '';
+                    verificationCodeInput.value = '';
+                    verificationCodeInput.disabled = false;
                     verificationCodeContainer.style.display = 'block';
                     NotificationModal.success('Success', 'Verification code sent successfully!');
                 } else {
@@ -329,7 +370,7 @@ async function handleFormSubmit(event) {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ phone: fullPhoneNumber, user_id: currentUserId }),
+                body: JSON.stringify({ phone: fullPhoneNumber }),
             });
             if (!checkResponse) return; // Session expired
             const checkResult = await checkResponse.json();
@@ -340,10 +381,16 @@ async function handleFormSubmit(event) {
             }
 
             const phoneInput = document.getElementById('phone');
-            if (phoneInput.dataset.verified !== 'true') {
+            if (
+                phoneInput.dataset.verified !== 'true'
+                || !phoneChallengeApproved
+                || challengePhoneNumber !== fullPhoneNumber
+                || !phoneChallengeId
+            ) {
                 NotificationModal.error('Error', 'Please verify your new phone number before submitting.');
                 return;
             }
+            formData.set('phone_verification_id', phoneChallengeId);
         } catch (error) {
             console.error('Error:', error);
             NotificationModal.error('Error', 'An error occurred while checking the phone number.');
@@ -376,6 +423,14 @@ async function handleFormSubmit(event) {
             currentUserVoiceId = formData.get('sample_voice_id');
             originalPhoneNumber = fullPhoneNumber;
             currentAlterEgoId = formData.get('alter_ego_id');
+            if (data.reauthenticate) {
+                FormGuard.markClean('#editProfileForm');
+                NotificationModal.success('Success', 'Phone number updated. Please sign in again.');
+                setTimeout(() => {
+                    window.location.href = '/login';
+                }, 1200);
+                return;
+            }
             // Save after-login and web search preferences alongside profile
             Promise.all([saveAfterLoginPreference(), saveWebSearchSettings()])
                 .then(function() {
@@ -970,65 +1025,6 @@ document.getElementById('deleteAccountBtn').addEventListener('click', (e) => {
         }
     });
 });
-
-function setupUsernameValidation() {
-    const usernameInput = document.getElementById('username');
-    const originalUsername = usernameInput.value;
-    let timeoutId;
-
-    usernameInput.addEventListener('input', function() {
-        clearTimeout(timeoutId);
-        const username = this.value.trim();
-
-        if (username.toLowerCase() === originalUsername.toLowerCase()) {
-            this.setCustomValidity('');
-            return;
-        }
-
-        timeoutId = setTimeout(async () => {
-            try {
-                const response = await secureFetch('/api/check-username', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ username })
-                });
-
-                if (!response) return; // Session expired
-                const data = await response.json();
-
-                if (data.exists) {
-                    this.setCustomValidity('This username is already taken');
-                    showUsernameError('This username is already taken');
-                } else {
-                    this.setCustomValidity('');
-                    hideUsernameError();
-                }
-            } catch (error) {
-                console.error('Error checking username:', error);
-            }
-        }, 500);
-    });
-}
-
-function showUsernameError(message) {
-    let errorDiv = document.querySelector('.username-error');
-    if (!errorDiv) {
-        errorDiv = document.createElement('div');
-        errorDiv.className = 'username-error text-danger mt-1';
-        const usernameInput = document.getElementById('username');
-        usernameInput.parentNode.appendChild(errorDiv);
-    }
-    errorDiv.textContent = message;
-}
-
-function hideUsernameError() {
-    const errorDiv = document.querySelector('.username-error');
-    if (errorDiv) {
-        errorDiv.remove();
-    }
-}
 
 // After Login preference management
 function initAfterLoginPreference() {

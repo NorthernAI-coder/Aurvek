@@ -1,8 +1,10 @@
 import re
+from pathlib import PurePosixPath
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from auth import get_current_user
 from auth_flows import handle_login_request
 from captcha_service import get_captcha_config
 from common import GOOGLE_CLIENT_ID, is_internal_ip, slugify, templates
@@ -10,6 +12,14 @@ from database import get_db_connection
 from log_config import logger
 from marketplace.config import require_public_landings_enabled, marketplace_public_landings_enabled
 from marketplace.landing.cache import get_landing_path_cached
+from marketplace.landing.isolation import (
+    build_creator_content_url,
+    creator_content_unavailable_response,
+    is_creator_content_request,
+    is_host_isolated_from_primary,
+    sign_content_token,
+    verify_content_token,
+)
 from marketplace.landing.paths import build_prompt_filesystem_path, get_active_custom_domain
 from marketplace.landing.rendering import (
     file_response_for_landing_static,
@@ -33,8 +43,34 @@ def _valid_page_name(page: str) -> bool:
     return bool(re.match(r"^[a-zA-Z0-9_-]+$", page))
 
 
+def _valid_resource_path(resource_path: str) -> bool:
+    if not resource_path or "\\" in resource_path or resource_path.startswith("/"):
+        return False
+    return ".." not in PurePosixPath(resource_path).parts
+
+
+async def _can_preview_prompt(request: Request, prompt_id: int) -> bool:
+    current_user = await get_current_user(request)
+    if current_user is None:
+        return False
+    if await current_user.is_admin:
+        return True
+    async with get_db_connection(readonly=True) as conn:
+        cursor = await conn.execute(
+            "SELECT created_by_user_id FROM PROMPTS WHERE id = ?",
+            (prompt_id,),
+        )
+        row = await cursor.fetchone()
+    return bool(row and int(row[0]) == int(current_user.id))
+
+
 @router.get("/p/{public_id}/{slug}/static/{resource_path:path}")
-async def public_landing_static(public_id: str, slug: str, resource_path: str):
+async def public_landing_static(
+    public_id: str,
+    slug: str,
+    resource_path: str,
+    request: Request = None,
+):
     """
     Serve static resources for public prompt landing pages.
     """
@@ -43,15 +79,26 @@ async def public_landing_static(public_id: str, slug: str, resource_path: str):
 
         if not _valid_public_id(public_id):
             raise HTTPException(status_code=400, detail="Invalid public_id format")
+        if not _valid_resource_path(resource_path):
+            raise HTTPException(status_code=404, detail="Resource not found")
 
         landing_data = await get_landing_path_cached(public_id)
+        if slug != slugify(landing_data["prompt_name"]):
+            raise HTTPException(status_code=404, detail="Resource not found")
 
-        custom_domain = await get_active_custom_domain(landing_data["prompt_id"])
-        if custom_domain:
-            return RedirectResponse(
-                url=f"https://{custom_domain}/static/{resource_path}",
-                status_code=301,
+        if not is_creator_content_request(request):
+            custom_domain = await get_active_custom_domain(landing_data["prompt_id"])
+            if custom_domain and is_host_isolated_from_primary(custom_domain):
+                return RedirectResponse(
+                    url=f"https://{custom_domain}/static/{resource_path}",
+                    status_code=302,
+                )
+            isolated_url = build_creator_content_url(
+                f"/p/{public_id}/{slug}/static/{resource_path}"
             )
+            if not isolated_url:
+                return creator_content_unavailable_response()
+            return RedirectResponse(url=isolated_url, status_code=302)
 
         static_root = landing_data["path"] / "static"
         static_path = static_root / resource_path
@@ -103,10 +150,6 @@ async def register_page_user(request: Request, public_id: str, slug: str):
     if slug != canonical_slug:
         raise HTTPException(status_code=404, detail="Page not found")
 
-    custom_domain = await get_active_custom_domain(prompt["id"])
-    if custom_domain:
-        return RedirectResponse(url=f"https://{custom_domain}/register", status_code=301)
-
     base_url = f"/p/{public_id}/{canonical_slug}"
     response = templates.TemplateResponse(
         "register_public.html",
@@ -141,10 +184,6 @@ async def login_page_user(request: Request, public_id: str, slug: str):
     canonical_slug = slugify(prompt["name"])
     if slug != canonical_slug:
         raise HTTPException(status_code=404, detail="Page not found")
-
-    custom_domain = await get_active_custom_domain(prompt["id"])
-    if custom_domain:
-        return RedirectResponse(url=f"https://{custom_domain}/login", status_code=301)
 
     base_url = f"/p/{public_id}/{canonical_slug}"
     response = await handle_login_request(
@@ -184,15 +223,62 @@ async def public_landing_page(
             raise HTTPException(status_code=404, detail="Page not found")
 
         is_preview = request.query_params.get("preview") == "1"
+        is_embed = request.query_params.get("embed") == "1"
 
-        if not is_preview:
+        if is_creator_content_request(request):
+            if is_preview:
+                token = request.query_params.get("preview_token")
+                expected = {
+                    "purpose": "prompt_preview",
+                    "prompt_id": int(landing_data["prompt_id"]),
+                    "page": page,
+                }
+                if verify_content_token(token, expected=expected) is None:
+                    raise HTTPException(status_code=404, detail="Page not found")
+        elif is_preview:
+            if not await _can_preview_prompt(request, landing_data["prompt_id"]):
+                raise HTTPException(status_code=403, detail="Access denied")
+            preview_token = sign_content_token(
+                {
+                    "purpose": "prompt_preview",
+                    "prompt_id": int(landing_data["prompt_id"]),
+                    "page": page,
+                },
+                ttl_seconds=300,
+            )
+            isolated_url = build_creator_content_url(
+                f"/p/{public_id}/{canonical_slug}/{'' if page == 'home' else page}",
+                {"preview": 1, "preview_token": preview_token},
+            )
+            if not isolated_url or not preview_token:
+                return creator_content_unavailable_response()
+            return RedirectResponse(
+                url=isolated_url,
+                status_code=302,
+                headers={"Cache-Control": "no-store"},
+            )
+        else:
             custom_domain = await get_active_custom_domain(landing_data["prompt_id"])
-            if custom_domain:
+            if custom_domain and is_host_isolated_from_primary(custom_domain):
                 redirect_path = "/" if page == "home" else f"/{page}"
+                if is_embed:
+                    redirect_path += "?embed=1"
                 return RedirectResponse(
                     url=f"https://{custom_domain}{redirect_path}",
-                    status_code=301,
+                    status_code=302,
                 )
+            isolated_path = (
+                f"/p/{public_id}/{canonical_slug}/"
+                if page == "home"
+                else f"/p/{public_id}/{canonical_slug}/{page}"
+            )
+            isolated_url = build_creator_content_url(
+                isolated_path,
+                {"embed": 1} if is_embed else None,
+            )
+            if not isolated_url:
+                return creator_content_unavailable_response()
+            return RedirectResponse(url=isolated_url, status_code=302)
 
         html_path = landing_data["path"] / f"{page}.html"
 

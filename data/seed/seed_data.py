@@ -120,6 +120,15 @@ SERVICES = [
     {"id": 5, "name": "TTS-OPENAI", "unit": "characters", "cost_per_unit": 0.000015, "type": "TTS"},
     {"id": 6, "name": "STT-ELEVENLABS", "unit": "minutes", "cost_per_unit": 0.005, "type": "STT"},
     {"id": 7, "name": "STT-DEEPGRAM", "unit": "minutes", "cost_per_unit": 0.0059, "type": "STT"},
+    {"id": 8, "name": "IMAGE-DALL-E-3-STANDARD-SQUARE", "unit": "image", "cost_per_unit": 0.04, "type": "Images"},
+    {"id": 9, "name": "IMAGE-DALL-E-3-STANDARD-WIDE", "unit": "image", "cost_per_unit": 0.08, "type": "Images"},
+    {"id": 10, "name": "IMAGE-GEMINI-2.5-FLASH", "unit": "image", "cost_per_unit": 0.039, "type": "Images"},
+    {"id": 11, "name": "IMAGE-IDEOGRAM-V2", "unit": "image", "cost_per_unit": 0.0, "type": "Images"},
+    {"id": 12, "name": "IMAGE-POE", "unit": "image", "cost_per_unit": 0.0, "type": "Images"},
+    {"id": 13, "name": "IMAGE-OPENAI-GPT-IMAGE", "unit": "image", "cost_per_unit": 0.0, "type": "Images"},
+    {"id": 14, "name": "VIDEO-VEO-3.1-FAST-8S-720P", "unit": "video", "cost_per_unit": 0.80, "type": "Video"},
+    {"id": 15, "name": "VIDEO-VEO-3.1-STANDARD-8S-720P", "unit": "video", "cost_per_unit": 3.20, "type": "Video"},
+    {"id": 16, "name": "VIDEO-VEO-3.1-LITE-8S-720P", "unit": "video", "cost_per_unit": 0.40, "type": "Video"},
 ]
 
 VOICES = [

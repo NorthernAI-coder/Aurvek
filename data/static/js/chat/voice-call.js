@@ -82,10 +82,23 @@
         let configData = null;
         let conversationRef = null;
         let activeSessionId = null;
+        let callConversationId = null;
         let currentState = 'idle';
         let muteState = false;
         let completing = false;
         let loadingConfig = false;
+        let sessionStartRejected = false;
+
+        function getSelectedConversationId() {
+            if (typeof currentConversationId === 'undefined' || currentConversationId === null) {
+                return null;
+            }
+            return String(currentConversationId);
+        }
+
+        function isSameConversation(first, second) {
+            return first !== null && second !== null && String(first) === String(second);
+        }
 
         function setOverlayVisible(show) {
             if (!overlay) {
@@ -242,7 +255,7 @@
         }
 
         function buildConversationConfig() {
-            if (!configData) {
+            if (!configData || !isSameConversation(configData.conversation_id, callConversationId)) {
                 return null;
             }
             const Conversation = resolveConversation();
@@ -288,6 +301,7 @@
             // Add user ID for ElevenLabs agent tracking
             if (configData.user_id) {
                 dynamicVariables.user_id = String(configData.user_id);
+                dynamicVariables.aurvek_user_id = String(configData.user_id);
             }
 
             // Watchdog: inject steering hint as dynamic variable if available
@@ -328,14 +342,14 @@
             return options;
         }
 
-        async function fetchConfig(force = false) {
+        async function fetchConfig(force = false, conversationId = getSelectedConversationId()) {
             if (loadingConfig) {
                 return null;
             }
-            if (configData && !force) {
+            if (configData && !force && isSameConversation(configData.conversation_id, conversationId)) {
                 return configData;
             }
-            if (typeof currentConversationId === 'undefined' || currentConversationId === null) {
+            if (conversationId === null) {
                 setState('error', 'Select a chat before starting the call.', {
                     helper: 'Choose a conversation and try again.'
                 });
@@ -345,7 +359,7 @@
             loadingConfig = true;
             setState('loading', 'Requesting ElevenLabs configuration...');
             try {
-                const response = await secureFetch(`/api/conversations/${currentConversationId}/elevenlabs/config`);
+                const response = await secureFetch(`/api/conversations/${conversationId}/elevenlabs/config`);
                 if (!response) {
                     throw new Error('No response received');
                 }
@@ -365,6 +379,9 @@
                     return null;
                 }
                 const data = await response.json();
+                if (!isSameConversation(data.conversation_id, conversationId)) {
+                    throw new Error('Configuration does not match the requested conversation');
+                }
                 configData = data;
                 if (promptTag && promptAvatar && promptName) {
                     if (data.prompt_name) {
@@ -379,10 +396,16 @@
                         promptAvatar.title = data.prompt_name;
 
                         // If there's a bot profile picture, overlay it
-                        if (botProfilePicture) {
+                        const voiceAvatarUrl = (
+                            typeof botProfilePictureFullsize !== 'undefined' && botProfilePictureFullsize
+                        ) || (
+                            typeof botProfilePicture128 !== 'undefined' && botProfilePicture128
+                        ) || (
+                            typeof botProfilePicture !== 'undefined' && botProfilePicture
+                        ) || '';
+                        if (voiceAvatarUrl) {
                             const avatarImg = document.createElement('img');
-                            // Use fullsize image for best quality
-                            avatarImg.src = botProfilePicture.replace('_32', '_fullsize');
+                            avatarImg.src = voiceAvatarUrl;
                             avatarImg.alt = data.prompt_name;
                             avatarImg.title = data.prompt_name;
                             promptAvatar.appendChild(avatarImg);
@@ -415,13 +438,20 @@
         }
 
         async function markSessionStarted(sessionId) {
+            const conversationId = callConversationId;
+            if (conversationId === null || !sessionId) {
+                return {
+                    ok: false,
+                    message: 'The voice session is missing its conversation binding.'
+                };
+            }
             try {
                 const sessionBody = { session_id: sessionId };
                 // Watchdog: send CAS token so backend can consume the hint
                 if (configData && configData.watchdog_hint_eval_id != null) {
                     sessionBody.watchdog_hint_eval_id = configData.watchdog_hint_eval_id;
                 }
-                const response = await secureFetch(`/api/conversations/${currentConversationId}/elevenlabs/session`, {
+                const response = await secureFetch(`/api/conversations/${conversationId}/elevenlabs/session`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -457,18 +487,22 @@
             }
         }
 
-        async function markSessionStatus(status) {
-            if (!activeSessionId) {
+        async function markSessionStatus(
+            status,
+            conversationId = callConversationId,
+            sessionId = activeSessionId
+        ) {
+            if (conversationId === null || !sessionId) {
                 return;
             }
             try {
-                const response = await secureFetch(`/api/conversations/${currentConversationId}/elevenlabs/stop`, {
+                const response = await secureFetch(`/api/conversations/${conversationId}/elevenlabs/stop`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({
-                        session_id: activeSessionId,
+                        session_id: sessionId,
                         status
                     })
                 });
@@ -501,9 +535,17 @@
                 window.ChatWarmup.signal('voice_call', {});
             }
 
+            const targetConversationId = getSelectedConversationId();
+            if (targetConversationId === null) {
+                setState('error', 'Select a chat before starting the call.');
+                return;
+            }
+            callConversationId = targetConversationId;
+
             // Force refresh to get fresh watchdog hint from backend
-            const config = await fetchConfig(true);
+            const config = await fetchConfig(true, targetConversationId);
             if (!config) {
+                callConversationId = null;
                 return;
             }
             const hasMic = await ensureMicPermission();
@@ -511,20 +553,39 @@
                 setState('ready', 'Microphone access required.', {
                     helper: 'Grant browser permissions and try again.'
                 });
+                callConversationId = null;
+                return;
+            }
+            if (!isSameConversation(getSelectedConversationId(), targetConversationId)) {
+                configData = null;
+                callConversationId = null;
+                setState('error', 'The selected chat changed before the call started.', {
+                    helper: 'Open the voice panel again in the chat you want to call.'
+                });
                 return;
             }
             const sessionConfig = buildConversationConfig();
             if (!sessionConfig) {
                 setState('error', 'Could not prepare call configuration.');
+                callConversationId = null;
                 return;
             }
 
             muteState = false;
+            sessionStartRejected = false;
             updateMuteUI();
             setState('connecting', 'Connecting to ElevenLabs...');
 
             try {
-                conversationRef = await Conversation.startSession(sessionConfig);
+                const startedConversation = await Conversation.startSession(sessionConfig);
+                conversationRef = startedConversation;
+                // Some SDK versions invoke onConnect before startSession resolves.
+                // If server-side binding rejected that callback, close the handle
+                // as soon as it becomes available instead of orphaning the call.
+                if (sessionStartRejected && startedConversation?.endSession) {
+                    await startedConversation.endSession();
+                    conversationRef = null;
+                }
             } catch (error) {
                 console.error('Error starting ElevenLabs conversation:', error);
                 setState('error', 'Could not start ElevenLabs call.', {
@@ -532,6 +593,9 @@
                 });
                 await markSessionStatus('failed');
                 conversationRef = null;
+                activeSessionId = null;
+                callConversationId = null;
+                sessionStartRejected = false;
             }
         }
 
@@ -550,15 +614,20 @@
         }
 
         async function completeSession() {
-            if (!activeSessionId) {
+            if (!activeSessionId || callConversationId === null) {
                 setState('ready', 'The call has ended.');
                 conversationRef = null;
+                activeSessionId = null;
+                callConversationId = null;
+                sessionStartRejected = false;
                 lockChatInputs(false);
                 return;
             }
             if (completing) {
                 return;
             }
+            const completedConversationId = callConversationId;
+            const completedSessionId = activeSessionId;
             completing = true;
             setState('updating', 'Saving call transcript...', {
                 helper: 'This may take a few seconds.'
@@ -567,12 +636,12 @@
                 // Wait longer for ElevenLabs to process the conversation
                 await wait(4000);  // Increased from 2200ms to 4000ms
 
-                const response = await secureFetch(`/api/conversations/${currentConversationId}/elevenlabs/complete`, {
+                const response = await secureFetch(`/api/conversations/${completedConversationId}/elevenlabs/complete`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ session_id: activeSessionId })
+                    body: JSON.stringify({ session_id: completedSessionId })
                 });
                 if (!response) {
                     throw new Error('No response received');
@@ -590,14 +659,14 @@
                     setState('error', detail, {
                         helper: 'You can retry downloading the transcript later.'
                     });
-                    await markSessionStatus('failed');
+                    await markSessionStatus('failed', completedConversationId, completedSessionId);
                     return;
                 }
                 const data = await response.json();
                 const saved = data && typeof data.messages_saved === 'number' ? data.messages_saved : 0;
 
                 // Refresh the chat messages if we saved something
-                if (saved > 0) {
+                if (saved > 0 && isSameConversation(getSelectedConversationId(), completedConversationId)) {
                     // Show loading state in overlay
                     setState('updating', 'Updating chat...', {
                         helper: 'Syncing messages in main chat.'
@@ -622,7 +691,7 @@
                     if (!refreshed && typeof loadMessages === 'function') {
                         try {
                             // Force reload messages without clearing the chat when helper is unavailable
-                            await loadMessages(currentConversationId);
+                            await loadMessages(completedConversationId);
                             refreshed = true;
                         } catch (error) {
                             console.error('Error refreshing messages after voice call:', error);
@@ -662,13 +731,12 @@
                         helper: 'You can start another call whenever you want.'
                     });
                 }
-                await markSessionStatus('completed');
             } catch (error) {
                 console.error('Error completing ElevenLabs session:', error);
                 setState('error', 'Could not save call transcript.', {
                     helper: 'You can retry from the voice window.'
                 });
-                await markSessionStatus('failed');
+                await markSessionStatus('failed', completedConversationId, completedSessionId);
             } finally {
                 completing = false;
                 conversationRef = null;
@@ -676,6 +744,7 @@
                 muteState = false;
                 updateMuteUI();
                 activeSessionId = null;
+                callConversationId = null;
                 // Reset config to avoid reusing stale watchdog hints on consecutive calls
                 configData = null;
                 closeButton.disabled = false;
@@ -686,6 +755,7 @@
             activeSessionId = extractSessionId(info);
             const sessionResult = await markSessionStarted(activeSessionId);
             if (!sessionResult.ok) {
+                sessionStartRejected = true;
                 const shouldRefreshWellbeing = sessionResult.error === 'wellbeing_pause_active'
                     || sessionResult.error === 'wellbeing_pause_required';
                 if (shouldRefreshWellbeing && window.WellbeingReminders && typeof window.WellbeingReminders.refresh === 'function') {
@@ -693,6 +763,8 @@
                 }
                 const ref = conversationRef;
                 activeSessionId = null;
+                callConversationId = null;
+                configData = null;
                 conversationRef = null;
                 setState('error', sessionResult.message || 'A break pause is required before starting a voice call.', {
                     helper: shouldRefreshWellbeing ? 'Use the break reminder prompt before continuing.' : 'Try again when ready.'

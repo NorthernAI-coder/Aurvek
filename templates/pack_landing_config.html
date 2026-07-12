@@ -132,13 +132,14 @@
 
         <!-- AI Wizard Section -->
         <div class="section-container text-center">
-            <button type="button" class="btn btn-primary btn-lg" onclick="openAIWizard()">
+            <button type="button" class="btn btn-primary btn-lg" onclick="openAIWizard()" {% if not wizard_available %}disabled{% endif %}>
                 <i class="fas fa-magic me-2"></i> Generate with AI
             </button>
+            {% if wizard_available %}
             <p class="text-muted mt-2 mb-0">Let AI create or modify your landing page</p>
-            <small class="text-muted">
-                Requires <a href="https://docs.anthropic.com/en/docs/claude-code/getting-started" target="_blank" rel="noopener">Claude Code CLI</a>
-            </small>
+            {% else %}
+            <p class="text-muted mt-2 mb-0">Disabled until a verified OS sandbox is configured.</p>
+            {% endif %}
         </div>
 
         <!-- Tabs -->

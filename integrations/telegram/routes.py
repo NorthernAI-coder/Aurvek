@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from auth import get_user_from_phone_number, get_user_from_telegram_chat_id
+from billing.usage_reservations import serialize_user_billing_response
 from clients import async_telegram
 from common import (
     TELEGRAM_RATE_LIMIT_GLOBAL,
@@ -28,7 +29,7 @@ from prompt_access import get_user_accessible_prompts
 from prompts import can_user_access_prompt
 from tools.tts import handle_tts_request
 
-from ai_runtime.messages import process_save_message
+from ai_runtime.messages import process_save_message, storage_quota_notice_from_response
 
 
 router = APIRouter()
@@ -693,16 +694,21 @@ async def telegram_webhook(request: Request):
 
         # --- Normal (non-GranSabio) path continues below ---
         files = files_list if files_list else None
-        response = await process_save_message(
-            request=request,
-            conversation_id=conversation_id,
-            current_user=current_user,
-            text_plain=user_message,
-            files=files,
-            full_response=False,
-            is_whatsapp=True,  # Same non-streaming behavior as WhatsApp
-            thinking_budget_tokens=None
+        response = await serialize_user_billing_response(
+            current_user.id,
+            process_save_message(
+                request=request,
+                conversation_id=conversation_id,
+                current_user=current_user,
+                text_plain=user_message,
+                files=files,
+                full_response=False,
+                is_whatsapp=True,  # Same non-streaming behavior as WhatsApp
+                thinking_budget_tokens=None,
+            ),
         )
+
+        quota_notice = storage_quota_notice_from_response(response)
 
         if isinstance(response, StreamingResponse):
             accumulated_text = ""
@@ -755,16 +761,23 @@ async def telegram_webhook(request: Request):
                 else:
                     for chunk in _chunk_telegram_response(accumulated_text):
                         await async_telegram.send_message(chat_id, chunk)
+
+            if quota_notice:
+                await async_telegram.send_message(chat_id, quota_notice)
         else:
             # Handle non-streaming responses (rate limit, insufficient balance, etc.)
-            status_code = response.status_code if hasattr(response, 'status_code') else 500
-            error_messages = {
-                429: "You've sent too many messages. Please wait a moment.",
-                402: "Insufficient balance. Please top up your account.",
-                403: "This conversation is not available.",
-            }
-            user_msg = error_messages.get(status_code, "Sorry, your message could not be processed. Please try again.")
-            await async_telegram.send_message(chat_id, user_msg)
+            if quota_notice:
+                # Media-only message rejected for lack of storage: tell the user.
+                await async_telegram.send_message(chat_id, quota_notice)
+            else:
+                status_code = response.status_code if hasattr(response, 'status_code') else 500
+                error_messages = {
+                    429: "You've sent too many messages. Please wait a moment.",
+                    402: "Insufficient balance. Please top up your account.",
+                    403: "This conversation is not available.",
+                }
+                user_msg = error_messages.get(status_code, "Sorry, your message could not be processed. Please try again.")
+                await async_telegram.send_message(chat_id, user_msg)
 
         # Log outgoing response
         await _log_telegram('out', current_user.id, chat_id, 'text', answer_mode)

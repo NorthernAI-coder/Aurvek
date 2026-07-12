@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry Aurvek nginx blocklist synchronization
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=aurvek-nginx-blocklist-sync.service
+
+[Install]
+WantedBy=timers.target

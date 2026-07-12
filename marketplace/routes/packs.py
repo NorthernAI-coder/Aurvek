@@ -51,6 +51,13 @@ from save_images import resize_image_cover
 from security_guard_llm import check_security, is_security_guard_enabled
 from marketplace.landing.wizard import is_claude_available, list_prompt_files, list_welcome_files, delete_all_landing_files, delete_all_welcome_files
 from marketplace.landing.jobs import start_job, get_job, get_active_job_for_pack, get_active_welcome_job_for_pack
+from marketplace.landing.isolation import (
+    build_creator_content_url,
+    creator_content_unavailable_response,
+    is_creator_content_request,
+    sign_content_token,
+    verify_content_token,
+)
 from marketplace.services.entitlements import (
     active_entitlement_condition,
     grant_pack_entitlement,
@@ -265,6 +272,62 @@ async def _require_pack_owner(pack_row, current_user: User):
         raise HTTPException(status_code=403, detail="Access denied")
 
 
+def _valid_landing_resource_path(resource_path: str) -> bool:
+    if not resource_path or "\\" in resource_path or resource_path.startswith("/"):
+        return False
+    return ".." not in Path(resource_path).parts
+
+
+async def _can_preview_pack(request: Request, creator_id: int) -> bool:
+    current_user = await get_current_user(request)
+    if current_user is None:
+        return False
+    return bool(await current_user.is_admin or int(current_user.id) == int(creator_id))
+
+
+async def _require_wizard_security_check(text: str, *, label: str, pack_id: int) -> None:
+    """Run the wizard guard fail-closed; the OS sandbox remains the boundary."""
+    try:
+        result = await check_security(text)
+    except Exception as exc:
+        logger.error(
+            "Security Guard error for %s on pack %s (blocking): %s",
+            label,
+            pack_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="AI Wizard security check is temporarily unavailable",
+        ) from exc
+
+    if not result.get("checked"):
+        logger.error(
+            "Security Guard unavailable for %s on pack %s: %s",
+            label,
+            pack_id,
+            result.get("reason", "unknown error"),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="AI Wizard security check is temporarily unavailable",
+        )
+    if not result.get("allowed"):
+        logger.warning(
+            "Security Guard BLOCKED %s for pack %s: %s",
+            label,
+            pack_id,
+            result.get("reason", "blocked"),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Your request was blocked by security check",
+                "reason": result.get("reason", "blocked"),
+            },
+        )
+
+
 def _validate_tags(tags_input) -> Optional[str]:
     """Validate and sanitize tags (accepts JSON string or list). Returns cleaned JSON or None."""
     if not tags_input:
@@ -308,7 +371,8 @@ def _inject_pack_analytics(html_content: str, pack_id: int) -> str:
     window._aurvek_analytics_loaded = true;
     fetch('/api/analytics/track-visit', {{
         method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
+        mode: 'no-cors',
+        headers: {{'Content-Type': 'text/plain;charset=UTF-8'}},
         body: JSON.stringify({{
             pack_id: {pack_id},
             page_path: window.location.pathname,
@@ -1338,6 +1402,7 @@ async def admin_pack_landing_config(
     public_url_full = f"{base_url}{public_url_path}" if public_id else "#"
 
     pack_dict = dict(pack_row)
+    wizard_available, _ = is_claude_available()
     context = await get_template_context(request, current_user)
     context.update({
         "pack": pack_dict,
@@ -1346,6 +1411,7 @@ async def admin_pack_landing_config(
         "has_home_page": has_home_page,
         "public_url": public_url_full,
         "public_url_path": public_url_path,
+        "wizard_available": wizard_available,
     })
     return templates.TemplateResponse("pack_landing_config.html", context)
 
@@ -1365,12 +1431,12 @@ async def pack_ai_wizard_generate(
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
 
-    # Verify Claude CLI is available
+    # The wizard is available only through a verified OS sandbox runner.
     claude_available, _ = is_claude_available()
     if not claude_available:
         raise HTTPException(
             status_code=503,
-            detail="AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex",
+            detail="AI Wizard is disabled until a verified OS sandbox is configured",
         )
 
     try:
@@ -1397,22 +1463,11 @@ async def pack_ai_wizard_generate(
     timeout_minutes = max(1, min(60, timeout_minutes))
     timeout_seconds = timeout_minutes * 60
 
-    # Security guard check on user description
-    try:
-        security_result = await check_security(description)
-        if security_result["checked"] and not security_result["allowed"]:
-            logger.warning(
-                "Security Guard BLOCKED pack landing wizard for pack %s: %s",
-                pack_id, security_result["reason"],
-            )
-            raise HTTPException(status_code=403, detail={
-                "message": "Your request was blocked by security check",
-                "reason": security_result["reason"],
-            })
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Security Guard check error (allowing request): %s", e)
+    await _require_wizard_security_check(
+        description,
+        label="pack landing wizard",
+        pack_id=pack_id,
+    )
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1498,7 +1553,7 @@ async def pack_ai_wizard_modify(
     if not claude_available:
         raise HTTPException(
             status_code=503,
-            detail="AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex",
+            detail="AI Wizard is disabled until a verified OS sandbox is configured",
         )
 
     try:
@@ -1516,22 +1571,11 @@ async def pack_ai_wizard_modify(
     timeout_minutes = max(1, min(60, timeout_minutes))
     timeout_seconds = timeout_minutes * 60
 
-    # Security guard check
-    try:
-        security_result = await check_security(instructions)
-        if security_result["checked"] and not security_result["allowed"]:
-            logger.warning(
-                "Security Guard BLOCKED pack landing modify for pack %s: %s",
-                pack_id, security_result["reason"],
-            )
-            raise HTTPException(status_code=403, detail={
-                "message": "Your request was blocked by security check",
-                "reason": security_result["reason"],
-            })
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Security Guard check error (allowing request): %s", e)
+    await _require_wizard_security_check(
+        instructions,
+        label="pack landing modify",
+        pack_id=pack_id,
+    )
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1688,12 +1732,12 @@ async def pack_welcome_wizard_generate(
         raise HTTPException(status_code=401, detail="Not authenticated")
     await _require_admin_or_user(current_user)
 
-    # Verify Claude CLI is available
+    # The wizard is available only through a verified OS sandbox runner.
     claude_available, _ = is_claude_available()
     if not claude_available:
         raise HTTPException(
             status_code=503,
-            detail="AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex",
+            detail="AI Wizard is disabled until a verified OS sandbox is configured",
         )
 
     try:
@@ -1720,22 +1764,11 @@ async def pack_welcome_wizard_generate(
     timeout_minutes = max(1, min(60, timeout_minutes))
     timeout_seconds = timeout_minutes * 60
 
-    # Security guard check on user description
-    try:
-        security_result = await check_security(description)
-        if security_result["checked"] and not security_result["allowed"]:
-            logger.warning(
-                "Security Guard BLOCKED pack welcome wizard for pack %s: %s",
-                pack_id, security_result["reason"],
-            )
-            raise HTTPException(status_code=403, detail={
-                "message": "Your request was blocked by security check",
-                "reason": security_result["reason"],
-            })
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Security Guard check error (allowing request): %s", e)
+    await _require_wizard_security_check(
+        description,
+        label="pack welcome wizard",
+        pack_id=pack_id,
+    )
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -1813,7 +1846,7 @@ async def pack_welcome_wizard_modify(
     if not claude_available:
         raise HTTPException(
             status_code=503,
-            detail="AI Wizard requires Claude Code CLI. Install: irm https://claude.ai/install.ps1 | iex",
+            detail="AI Wizard is disabled until a verified OS sandbox is configured",
         )
 
     try:
@@ -1831,22 +1864,11 @@ async def pack_welcome_wizard_modify(
     timeout_minutes = max(1, min(60, timeout_minutes))
     timeout_seconds = timeout_minutes * 60
 
-    # Security guard check
-    try:
-        security_result = await check_security(instructions)
-        if security_result["checked"] and not security_result["allowed"]:
-            logger.warning(
-                "Security Guard BLOCKED pack welcome modify for pack %s: %s",
-                pack_id, security_result["reason"],
-            )
-            raise HTTPException(status_code=403, detail={
-                "message": "Your request was blocked by security check",
-                "reason": security_result["reason"],
-            })
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Security Guard check error (allowing request): %s", e)
+    await _require_wizard_security_check(
+        instructions,
+        label="pack welcome modify",
+        pack_id=pack_id,
+    )
 
     async with get_db_connection(readonly=True) as conn:
         pack_row = await get_pack(conn, pack_id)
@@ -3420,12 +3442,19 @@ async def pack_register_page(request: Request, public_id: str, slug: str):
 
 
 @router.get("/pack/{public_id}/{slug}/static/{resource_path:path}")
-async def pack_landing_static(public_id: str, slug: str, resource_path: str):
+async def pack_landing_static(
+    public_id: str,
+    slug: str,
+    resource_path: str,
+    request: Request = None,
+):
     """Serve static resources (CSS, JS, images) for custom pack landing pages."""
     try:
         require_public_landings_enabled()
 
         if not re.match(r'^[a-zA-Z0-9]{8}$', public_id):
+            return _landing_404()
+        if not _valid_landing_resource_path(resource_path):
             return _landing_404()
 
         cached = await get_pack_landing_cached(public_id)
@@ -3437,6 +3466,16 @@ async def pack_landing_static(public_id: str, slug: str, resource_path: str):
 
         if slug != cached["slug"]:
             return _landing_404()
+        if not cached["has_custom_landing"]:
+            return _landing_404()
+
+        if not is_creator_content_request(request):
+            isolated_url = build_creator_content_url(
+                f"/pack/{public_id}/{slug}/static/{resource_path}"
+            )
+            if not isolated_url:
+                return creator_content_unavailable_response()
+            return RedirectResponse(isolated_url, status_code=302)
 
         pack_dir = cached["path"]
         static_path = pack_dir / "static" / resource_path
@@ -3490,15 +3529,59 @@ async def pack_landing_page(request: Request, public_id: str, slug: str):
 
         pack_id = cached["pack_id"]
         is_preview = request.query_params.get("preview") == "1"
+        is_embed = request.query_params.get("embed") == "1"
 
         # Check for custom landing page first
         if cached["has_custom_landing"]:
+            if is_creator_content_request(request):
+                if is_preview:
+                    expected = {
+                        "purpose": "pack_preview",
+                        "pack_id": int(pack_id),
+                    }
+                    if verify_content_token(
+                        request.query_params.get("preview_token"),
+                        expected=expected,
+                    ) is None:
+                        return _landing_404()
+            elif is_preview:
+                if not await _can_preview_pack(request, cached["created_by_user_id"]):
+                    raise HTTPException(status_code=403, detail="Access denied")
+                preview_token = sign_content_token(
+                    {"purpose": "pack_preview", "pack_id": int(pack_id)},
+                    ttl_seconds=300,
+                )
+                isolated_url = build_creator_content_url(
+                    f"/pack/{public_id}/{slug}/",
+                    {"preview": 1, "preview_token": preview_token},
+                )
+                if not isolated_url or not preview_token:
+                    return creator_content_unavailable_response()
+                return RedirectResponse(
+                    isolated_url,
+                    status_code=302,
+                    headers={"Cache-Control": "no-store"},
+                )
+            else:
+                isolated_url = build_creator_content_url(
+                    f"/pack/{public_id}/{slug}/",
+                    {"embed": 1} if is_embed else None,
+                )
+                if not isolated_url:
+                    return creator_content_unavailable_response()
+                return RedirectResponse(isolated_url, status_code=302)
+
             html_path = cached["path"] / "home.html"
             if html_path.is_file():
                 html_content = html_path.read_text(encoding="utf-8")
                 if not is_preview:
                     html_content = _inject_pack_analytics(html_content, pack_id)
                 return HTMLResponse(content=html_content)
+
+        if is_creator_content_request(request):
+            return _landing_404()
+        if is_preview and not await _can_preview_pack(request, cached["created_by_user_id"]):
+            raise HTTPException(status_code=403, detail="Access denied")
 
         # Default: render Jinja2 template (pack_items still queried fresh)
         async with get_db_connection(readonly=True) as conn:

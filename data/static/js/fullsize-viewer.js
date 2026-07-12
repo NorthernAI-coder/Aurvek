@@ -28,6 +28,29 @@ const FullsizeViewer = (function() {
     let currentIndex = 0;
     let container = null;
     let initialized = false;
+    let renderGeneration = 0;
+    let pendingImage = null;
+    let displayedResource = null;
+
+    function cancelPendingImage() {
+        if (!pendingImage) return;
+        pendingImage.onload = null;
+        pendingImage.onerror = null;
+        try { pendingImage.src = ''; } catch (error) { /* already released */ }
+        pendingImage = null;
+    }
+
+    function setDeleteEnabled(enabled) {
+        if (!container) return;
+        const deleteBtn = container.querySelector('.fullsize-viewer-delete');
+        if (deleteBtn) deleteBtn.disabled = !enabled;
+    }
+
+    function snapshotImageData(index) {
+        const item = config.images[index];
+        if (!item || typeof item === 'string') return item || null;
+        return Object.freeze({ ...item });
+    }
 
     // Inject HTML into DOM
     function injectHTML() {
@@ -117,6 +140,7 @@ const FullsizeViewer = (function() {
         // Show/hide buttons
         downloadBtn.style.display = config.showDownload ? 'inline-flex' : 'none';
         deleteBtn.style.display = config.showDelete ? 'inline-flex' : 'none';
+        deleteBtn.disabled = !displayedResource;
 
         // Hide controls container if both buttons are hidden
         const hasVisibleButtons = config.showDownload || config.showDelete;
@@ -138,29 +162,28 @@ const FullsizeViewer = (function() {
 
     function show(url, index = 0) {
         if (!initialized) init();
+        if (typeof url !== 'string' || !url) return;
 
         const image = container.querySelector('.fullsize-viewer-image');
         const spinner = container.querySelector('.fullsize-viewer-spinner');
 
         currentIndex = index;
+        const generation = ++renderGeneration;
+        const imageData = snapshotImageData(index);
+        const requestedResource = Object.freeze({
+            generation,
+            index,
+            requestedUrl: url,
+            imageData,
+        });
+        cancelPendingImage();
+        displayedResource = null;
+        setDeleteEnabled(false);
 
         // Show container and spinner
         container.classList.add('active');
         spinner.style.display = 'flex';
         image.style.opacity = '0';
-
-        // Preload image
-        const img = new Image();
-        img.onload = function() {
-            spinner.style.display = 'none';
-            image.src = this.src;
-            image.style.opacity = '1';
-        };
-        img.onerror = function() {
-            spinner.style.display = 'none';
-            image.src = url; // Try original URL
-            image.style.opacity = '1';
-        };
 
         // Try fullsize version first (if transformUrl enabled), fallback to original
         let finalUrl = url;
@@ -171,13 +194,59 @@ const FullsizeViewer = (function() {
                                    .replace('_32.webp', '_fullsize.webp');
             finalUrl = fullsizeUrl !== url ? fullsizeUrl : url;
         }
-        img.src = finalUrl;
+
+        const loadCandidate = (candidateUrl, allowFallback) => {
+            if (generation !== renderGeneration) return;
+            const loader = new Image();
+            pendingImage = loader;
+            loader.onload = function() {
+                if (
+                    generation !== renderGeneration
+                    || pendingImage !== loader
+                    || !container.classList.contains('active')
+                ) {
+                    return;
+                }
+
+                pendingImage = null;
+                const loadedUrl = this.currentSrc || this.src || candidateUrl;
+                spinner.style.display = 'none';
+                image.src = loadedUrl;
+                image.style.opacity = '1';
+                displayedResource = Object.freeze({
+                    ...requestedResource,
+                    loadedUrl,
+                });
+                setDeleteEnabled(true);
+            };
+            loader.onerror = function() {
+                if (generation !== renderGeneration || pendingImage !== loader) return;
+                pendingImage = null;
+                if (allowFallback && candidateUrl !== url) {
+                    loadCandidate(url, false);
+                    return;
+                }
+
+                spinner.style.display = 'none';
+                image.src = '';
+                image.style.opacity = '0';
+                displayedResource = null;
+                setDeleteEnabled(false);
+            };
+            loader.src = candidateUrl;
+        };
+
+        loadCandidate(finalUrl, finalUrl !== url);
 
         updateUI();
     }
 
     function close() {
         if (!container) return;
+        renderGeneration += 1;
+        cancelPendingImage();
+        displayedResource = null;
+        setDeleteEnabled(false);
         container.classList.remove('active');
         const image = container.querySelector('.fullsize-viewer-image');
         image.src = '';
@@ -202,14 +271,13 @@ const FullsizeViewer = (function() {
     }
 
     function download() {
-        const image = container.querySelector('.fullsize-viewer-image');
-        if (!image.src) return;
+        if (!displayedResource || displayedResource.generation !== renderGeneration) return;
 
         const link = document.createElement('a');
-        link.href = image.src;
+        link.href = displayedResource.loadedUrl;
 
         // Extract filename from URL or generate random
-        const urlParts = image.src.split('/');
+        const urlParts = displayedResource.loadedUrl.split('/');
         const filename = urlParts[urlParts.length - 1] || `image_${Date.now()}.webp`;
         link.download = filename;
 
@@ -219,19 +287,19 @@ const FullsizeViewer = (function() {
     }
 
     function deleteImage() {
-        if (!config.onDelete) return;
+        if (
+            !config.onDelete
+            || !displayedResource
+            || displayedResource.generation !== renderGeneration
+        ) return;
 
-        const image = container.querySelector('.fullsize-viewer-image');
-        const url = typeof config.images[currentIndex] === 'string'
-            ? config.images[currentIndex]
-            : (config.images[currentIndex]?.url || image.src);
-
-        config.onDelete(url, currentIndex, config.images[currentIndex]);
+        const resource = displayedResource;
+        config.onDelete(resource.requestedUrl, resource.index, resource.imageData);
     }
 
     // Method to update images array (for dynamic content)
     function setImages(images) {
-        config.images = images;
+        config.images = Array.isArray(images) ? images : [];
         updateUI();
     }
 
@@ -246,6 +314,7 @@ const FullsizeViewer = (function() {
         setImages,
         // Expose for external access if needed
         getCurrentIndex: () => currentIndex,
+        getDisplayedResource: () => displayedResource ? { ...displayedResource } : null,
         getConfig: () => ({ ...config })
     };
 })();

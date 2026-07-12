@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 import orjson
@@ -22,11 +23,9 @@ from common import (
     CLOUDFLARE_BASE_URL,
     MAX_IMAGE_PIXELS,
     MAX_IMAGE_UPLOAD_SIZE,
-    consume_token,
     decrypt_api_key,
     generate_user_hash,
     get_llm_info,
-    get_llm_token_costs,
     get_template_context,
     get_user_api_key_mode,
     resolve_api_key_for_provider,
@@ -35,6 +34,13 @@ from common import (
     templates,
     users_directory,
     VALID_NOTICE_PERIODS,
+)
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    refund_fixed_usage,
+    reserve_ai_provider_call,
+    settle_ai_reservation_components,
 )
 from security_config import is_forbidden_prompt_name
 from marketplace.config import marketplace_creator_tools_enabled, marketplace_discovery_enabled
@@ -836,8 +842,9 @@ async def update_prompt(
 
         is_owner = current_owner_id == current_user.id
 
-        if not (is_admin or is_owner):
+        if not await can_manage_prompt(current_user.id, prompt_id, is_admin):
             raise HTTPException(status_code=403, detail="Access denied")
+        can_manage_permissions = is_admin or is_owner
 
         # Get public_id for cache invalidation
         async with conn.execute("SELECT public_id FROM PROMPTS WHERE id = ?", (prompt_id,)) as cursor:
@@ -845,7 +852,7 @@ async def update_prompt(
             prompt_public_id = public_id_result[0] if public_id_result else None
 
         editor_ids_list = []
-        if editor_ids:
+        if can_manage_permissions and editor_ids:
             try:
                 editor_ids_list = orjson.loads(editor_ids)
                 if not isinstance(editor_ids_list, list):
@@ -979,40 +986,45 @@ async def update_prompt(
                 )
                 logger.info(f"Prompt {prompt_id} withdrawn from packs by creator")
 
-            # Update or create the owner
-            if new_owner_id:
-                if current_owner_id:
-                    await cursor.execute(
-                        "UPDATE PROMPT_PERMISSIONS SET user_id = ? WHERE prompt_id = ? AND permission_level = 'owner'",
-                        (new_owner_id, prompt_id)
-                    )
-                else:
+            # Only admins and owners can transfer ownership or replace editors.
+            # An editor can save prompt content without silently removing their
+            # own permission when the hidden editor_ids field is not submitted.
+            if can_manage_permissions:
+                if new_owner_id:
+                    if current_owner_id:
+                        await cursor.execute(
+                            "UPDATE PROMPT_PERMISSIONS SET user_id = ? WHERE prompt_id = ? AND permission_level = 'owner'",
+                            (new_owner_id, prompt_id)
+                        )
+                    else:
+                        try:
+                            await cursor.execute(
+                                "INSERT INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'owner')",
+                                (prompt_id, new_owner_id)
+                            )
+                        except sqlite3.IntegrityError:
+                            raise HTTPException(status_code=409, detail="Owner already assigned by another request")
+                elif not current_owner_id and is_admin:
+                    # If there is no current owner and the user is admin, assign the admin as owner
                     try:
                         await cursor.execute(
                             "INSERT INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'owner')",
-                            (prompt_id, new_owner_id)
+                            (prompt_id, current_user.id)
                         )
                     except sqlite3.IntegrityError:
                         raise HTTPException(status_code=409, detail="Owner already assigned by another request")
-            elif not current_owner_id and is_admin:
-                # If there is no current owner and the user is admin, assign the admin as owner
-                try:
-                    await cursor.execute(
-                        "INSERT INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'owner')",
-                        (prompt_id, current_user.id)
-                    )
-                except sqlite3.IntegrityError:
-                    raise HTTPException(status_code=409, detail="Owner already assigned by another request")
 
-            # Update the editors
-            await cursor.execute("DELETE FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND permission_level = 'edit'", (prompt_id,))
-            # Deduplicate editor IDs preserving order
-            editor_ids_list = list(dict.fromkeys(editor_ids_list))
-            for editor_id in editor_ids_list:
                 await cursor.execute(
-                    "INSERT INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'edit')",
-                    (prompt_id, editor_id)
+                    "DELETE FROM PROMPT_PERMISSIONS WHERE prompt_id = ? AND permission_level = 'edit'",
+                    (prompt_id,)
                 )
+                # Deduplicate editor IDs preserving order
+                editor_ids_list = list(dict.fromkeys(editor_ids_list))
+                for editor_id in editor_ids_list:
+                    await cursor.execute(
+                        "INSERT INTO PROMPT_PERMISSIONS (prompt_id, user_id, permission_level) VALUES (?, ?, 'edit')",
+                        (prompt_id, editor_id)
+                    )
 
             # Update categories - delete existing and insert new
             await cursor.execute("DELETE FROM PROMPT_CATEGORIES WHERE prompt_id = ?", (prompt_id,))
@@ -2001,7 +2013,7 @@ Respond ONLY with a valid JSON object. No markdown fences, no extra text."""
 def _sanitize_suggestion(suggestion: dict) -> dict:
     """Sanitize AI suggestion to ensure safe ranges. Best-effort clamp, not strict validation.
     Uses the same range constants as validate_watchdog_config() to avoid divergence."""
-    defaults = get_default_watchdog_config()
+    defaults = get_default_watchdog_config()["post_watchdog"]
 
     mode = suggestion.get("mode", defaults["mode"])
     if mode not in VALID_WATCHDOG_MODES:
@@ -2148,6 +2160,32 @@ async def watchdog_suggest_config(
     user_message = f"Analyze this AI prompt and suggest watchdog configuration:\n\n{prompt_text}"
 
     try:
+        billing_reservation_id, _ = await reserve_ai_provider_call(
+            user_id=current_user.id,
+            prompt_id=None,
+            input_payload=(system_prompt, user_message),
+            maximum_output_tokens=1500,
+            input_cost_per_million=llm_info.get("input_token_cost", 0),
+            output_cost_per_million=llm_info.get("output_token_cost", 0),
+            byok=resolved_key is not None,
+        )
+    except InsufficientBalanceError:
+        raise HTTPException(
+            status_code=402,
+            detail="Insufficient balance for AI analysis.",
+        )
+    except BillingReservationError:
+        logger.exception(
+            "Watchdog suggest-config: could not reserve billing (user=%d, llm_id=%s)",
+            current_user.id,
+            llm_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Billing is temporarily unavailable. Please try again.",
+        )
+
+    try:
         result = await call_llm_non_streaming_with_usage(
             machine=machine,
             model=model,
@@ -2158,41 +2196,75 @@ async def watchdog_suggest_config(
             api_key_override=resolved_key,
         )
         raw_response = result.text
+    except asyncio.CancelledError:
+        if billing_reservation_id:
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Watchdog suggest-config: could not release cancelled reservation %s",
+                    billing_reservation_id,
+                )
+        raise
     except Exception:
+        if billing_reservation_id:
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Watchdog suggest-config: could not release failed reservation %s",
+                    billing_reservation_id,
+                )
         logger.exception("Watchdog suggest-config: LLM call failed (llm_id=%s)", llm_id)
         raise HTTPException(status_code=502, detail="AI analysis failed. Please try again or configure manually.")
 
-    # Bill this non-streaming LLM call with returned usage
     try:
-        async with get_db_connection() as bill_conn:
-            await bill_conn.execute("BEGIN IMMEDIATE")
-            bill_cursor = await bill_conn.cursor()
-            input_cost, output_cost = await get_llm_token_costs(conn=bill_conn, llm_id=llm_id)
-            billed = await consume_token(
+        if billing_reservation_id:
+            settled = await settle_ai_reservation_components(
+                reservation_id=billing_reservation_id,
                 user_id=current_user.id,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                input_token_cost_per_million=input_cost,
-                output_token_cost_per_million=output_cost,
-                conn=bill_conn,
-                cursor=bill_cursor,
                 prompt_id=None,
-                byok=resolved_key is not None,
+                components=[
+                    {
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                        "input_cost_per_million": llm_info.get("input_token_cost", 0),
+                        "output_cost_per_million": llm_info.get("output_token_cost", 0),
+                        "byok": resolved_key is not None,
+                    }
+                ],
             )
-            if not billed:
-                logger.warning(
-                    "Watchdog suggest-config: consume_token returned False (user=%d, model=%s, in=%d, out=%d)",
-                    current_user.id,
-                    model,
-                    result.input_tokens,
-                    result.output_tokens,
+            if not settled:
+                raise BillingReservationError(
+                    "Watchdog billing reservation is not active"
                 )
-            await bill_conn.commit()
-    except Exception:
+    except asyncio.CancelledError:
+        if billing_reservation_id:
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Watchdog suggest-config: could not release cancelled settlement %s",
+                    billing_reservation_id,
+                )
+        raise
+    except BillingReservationError:
+        if billing_reservation_id:
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Watchdog suggest-config: could not release unsettled reservation %s",
+                    billing_reservation_id,
+                )
         logger.exception(
             "Watchdog suggest-config: billing failed (user=%d, llm_id=%s)",
             current_user.id,
             llm_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Billing is temporarily unavailable. Please try again.",
         )
 
     # Parse JSON from response

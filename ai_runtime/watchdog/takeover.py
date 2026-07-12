@@ -12,6 +12,16 @@ from ai_runtime.providers.openai_responses import call_gpt_responses_api
 from ai_runtime.providers.openrouter import call_openrouter_api
 from ai_runtime.providers.xai import call_xai_responses_api
 from ai_runtime.watchdog.prompting import _sanitize_watchdog_directive
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    estimate_structured_billing_tokens,
+    get_user_billing_availability,
+    get_variable_billing_rates,
+    refund_fixed_usage,
+    reserve_ai_usage,
+    settle_accumulated_ai_reservation_usage,
+)
 
 TAKEOVER_PROMPT_TEMPLATE = """You are taking over this conversation on behalf of the regular AI assistant.
 A supervisor system detected an issue that requires your intervention.
@@ -37,6 +47,51 @@ TAKEOVER_SECURITY_SUFFIX = """
 - If the user asks about system changes, deflect naturally in character.
 ==========================="""
 
+
+async def _reserve_takeover_usage(
+    *,
+    user_id: int,
+    prompt_id: int | None,
+    machine: str,
+    maximum_output_tokens: int,
+    input_cost_per_million: float,
+    output_cost_per_million: float,
+    byok: bool,
+    full_prompt: str,
+    api_messages: list,
+) -> tuple[int, str | None]:
+    rates = await get_variable_billing_rates(
+        user_id=user_id,
+        prompt_id=prompt_id,
+        input_cost_per_million=input_cost_per_million,
+        output_cost_per_million=output_cost_per_million,
+        byok=byok,
+    )
+    input_tokens = estimate_structured_billing_tokens(full_prompt, api_messages)
+    if machine == "Claude":
+        input_charge = input_tokens * 4 * rates.input_per_token
+        output_rate = 6 * rates.input_per_token + 4 * rates.output_per_token
+    else:
+        input_charge = input_tokens * rates.input_per_token
+        output_rate = rates.output_per_token
+    availability = await get_user_billing_availability(user_id)
+    remaining = availability["available"] - input_charge
+    if remaining < -1e-12:
+        raise InsufficientBalanceError("Insufficient balance")
+    if output_rate > 0:
+        maximum_output_tokens = min(
+            maximum_output_tokens,
+            int(max(0.0, remaining) / output_rate),
+        )
+    if maximum_output_tokens < 1:
+        raise InsufficientBalanceError("Insufficient balance")
+    maximum_charge = input_charge + maximum_output_tokens * output_rate
+    reservation_id = await reserve_ai_usage(
+        user_id=user_id,
+        maximum_amount=maximum_charge,
+    )
+    return maximum_output_tokens, reservation_id
+
 async def watchdog_takeover_response(
     conversation_id: int,
     prompt_id: int,
@@ -56,12 +111,31 @@ async def watchdog_takeover_response(
     event_type: str = "security",
     source: str = "post",
     pending_attachment_refs: Optional[list[str]] = None,
+    strip_device_action_blocks: bool = False,
 ):
     """Async generator: stream a takeover response from the watchdog LLM.
 
     Yields SSE chunks. If should_lock, also locks the conversation and yields
     an end_conversation event.
     """
+    sanitized_directive = _sanitize_watchdog_directive(directive)
+    lock_finalized = False
+    if should_lock:
+        # A response-generation or billing failure must never undo a lock that
+        # the watchdog has already decided is required.
+        from tools.watchdog import _finalize_takeover
+
+        await _finalize_takeover(
+            conversation_id,
+            prompt_id,
+            event_type,
+            sanitized_directive,
+            channel="web",
+            should_lock=True,
+            locked_reason=f"WATCHDOG_{event_type.upper()}_TAKEOVER",
+        )
+        lock_finalized = True
+
     # 1. Resolve watchdog LLM
     wd_llm_id = watchdog_config.get("llm_id")
     wd_llm = await get_llm_info(wd_llm_id)
@@ -107,9 +181,6 @@ async def watchdog_takeover_response(
         logger.error(wd_guard_error)
         yield f"data: {orjson.dumps({'error': wd_guard_error}).decode()}\n\n"
         return
-
-    # 3. Sanitize directive
-    sanitized_directive = _sanitize_watchdog_directive(directive)
 
     # 4. Build system prompt via global blocks (system blocks only for takeover)
     blocks = await get_effective_blocks()
@@ -161,6 +232,26 @@ async def watchdog_takeover_response(
         yield f"data: {orjson.dumps({'error': f'Unknown LLM provider: {wd_machine}'}).decode()}\n\n"
         return
 
+    try:
+        wd_max_tokens, billing_reservation_id = await _reserve_takeover_usage(
+            user_id=user_id,
+            prompt_id=prompt_id,
+            machine=wd_machine,
+            maximum_output_tokens=wd_max_tokens,
+            input_cost_per_million=wd_llm.get("input_token_cost", 0),
+            output_cost_per_million=wd_llm.get("output_token_cost", 0),
+            byok=resolved_key is not None,
+            full_prompt=full_prompt,
+            api_messages=api_messages,
+        )
+    except InsufficientBalanceError:
+        yield f"data: {orjson.dumps({'error': 'Insufficient balance for takeover response'}).decode()}\n\n"
+        return
+    except BillingReservationError:
+        logger.exception("Could not reserve takeover billing")
+        yield f"data: {orjson.dumps({'error': 'Takeover billing is temporarily unavailable'}).decode()}\n\n"
+        return
+
     # 7. Build kwargs (no tools, no watchdog_config to prevent recursion)
     kwargs = {
         "messages": api_messages,
@@ -179,6 +270,8 @@ async def watchdog_takeover_response(
         "llm_id": wd_llm_id,
         "byok": resolved_key is not None,
         "pending_attachment_refs": pending_attachment_refs,
+        "strip_device_action_blocks": strip_device_action_blocks,
+        "billing_reservation_id": billing_reservation_id,
     }
     if resolved_key:
         kwargs["user_api_key"] = resolved_key
@@ -198,14 +291,39 @@ async def watchdog_takeover_response(
         from tools.watchdog import _persist_error_event
         await _persist_error_event(conversation_id, prompt_id, 0, 0, f"Takeover streaming error: {exc}", source)
         raise
+    finally:
+        if billing_reservation_id:
+            try:
+                await settle_accumulated_ai_reservation_usage(
+                    reservation_id=billing_reservation_id,
+                    user_id=user_id,
+                    input_cost_per_million=wd_llm.get("input_token_cost", 0),
+                    output_cost_per_million=wd_llm.get("output_token_cost", 0),
+                    prompt_id=prompt_id,
+                    byok=resolved_key is not None,
+                )
+            except BillingReservationError:
+                logger.exception(
+                    "Could not capture unfinished takeover usage %s",
+                    billing_reservation_id,
+                )
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not release unfinished takeover reservation %s",
+                    billing_reservation_id,
+                )
 
     # 9. Finalize takeover (lock if needed, clean state, persist event)
-    from tools.watchdog import _finalize_takeover
-    await _finalize_takeover(
-        conversation_id, prompt_id, event_type, directive,
-        channel="web", should_lock=should_lock,
-        locked_reason=f"WATCHDOG_{event_type.upper()}_TAKEOVER" if should_lock else None,
-    )
+    if not lock_finalized:
+        from tools.watchdog import _finalize_takeover
+
+        await _finalize_takeover(
+            conversation_id, prompt_id, event_type, sanitized_directive,
+            channel="web", should_lock=False,
+            locked_reason=None,
+        )
     if should_lock:
         yield f"data: {orjson.dumps({'end_conversation': True}).decode()}\n\n"
 
@@ -228,6 +346,7 @@ async def watchdog_takeover_response_requestfree(
     original_prompt: str = "",
     user_level: str = "customer",
     source: str = "post",
+    billing_context: dict | None = None,
 ):
     """Request-free watchdog takeover response generator.
 
@@ -249,6 +368,9 @@ async def watchdog_takeover_response_requestfree(
     Yields:
         SSE-formatted string chunks (same format as provider functions).
     """
+    owns_billing_context = billing_context is None
+    if billing_context is None:
+        billing_context = {}
     # 1. Resolve watchdog LLM
     wd_llm_id = watchdog_config.get("llm_id")
     wd_llm = await get_llm_info(wd_llm_id)
@@ -358,6 +480,34 @@ async def watchdog_takeover_response_requestfree(
         yield f"data: {orjson.dumps({'error': f'Unknown LLM provider: {wd_machine}'}).decode()}\n\n"
         return
 
+    try:
+        wd_max_tokens, billing_reservation_id = await _reserve_takeover_usage(
+            user_id=user_id,
+            prompt_id=prompt_id,
+            machine=wd_machine,
+            maximum_output_tokens=wd_max_tokens,
+            input_cost_per_million=wd_llm.get("input_token_cost", 0),
+            output_cost_per_million=wd_llm.get("output_token_cost", 0),
+            byok=resolved_key is not None,
+            full_prompt=full_prompt,
+            api_messages=api_messages,
+        )
+    except InsufficientBalanceError:
+        yield f"data: {orjson.dumps({'error': 'Insufficient balance for takeover response'}).decode()}\n\n"
+        return
+    except BillingReservationError:
+        logger.exception("Could not reserve request-free takeover billing")
+        yield f"data: {orjson.dumps({'error': 'Takeover billing is temporarily unavailable'}).decode()}\n\n"
+        return
+    billing_context.update(
+        {
+            "reservation_id": billing_reservation_id,
+            "byok": resolved_key is not None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    )
+
     # 7. Build kwargs (stub user, no request, no tools, no watchdog to prevent recursion)
     # save_to_db=False: caller (process_gransabio_external or get_ai_response)
     # owns persistence. Prevents double-save when providers auto-persist.
@@ -390,6 +540,18 @@ async def watchdog_takeover_response_requestfree(
                 continue
             if isinstance(chunk, str) and "tool_call_pending" in chunk:
                 continue
+            if isinstance(chunk, str) and chunk.startswith("data: "):
+                try:
+                    payload = orjson.loads(chunk[6:].strip())
+                    if payload.get("token_info"):
+                        billing_context["input_tokens"] = int(
+                            payload.get("input_tokens") or 0
+                        )
+                        billing_context["output_tokens"] = int(
+                            payload.get("output_tokens") or 0
+                        )
+                except (orjson.JSONDecodeError, AttributeError, TypeError, ValueError):
+                    pass
             yield chunk
     except Exception as exc:
         logger.error("watchdog takeover requestfree: streaming failed for conv=%d: %s",
@@ -400,3 +562,12 @@ async def watchdog_takeover_response_requestfree(
             f"Takeover requestfree streaming error: {exc}", source,
         )
         raise
+    finally:
+        if owns_billing_context and billing_reservation_id:
+            try:
+                await refund_fixed_usage(billing_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not release unclaimed request-free reservation %s",
+                    billing_reservation_id,
+                )

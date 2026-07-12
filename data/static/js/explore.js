@@ -15,10 +15,20 @@ const ExploreState = {
     totalPages: 1,
     total: 0,
     limit: 24,
-    loading: false,
+    modalItem: null,
+    modalType: null,
+    modalLandingUrl: '',
     iframeActive: false,
     iframeLandingItems: [],  // items with landings (for left/right nav)
-    iframeCurrentIndex: 0
+    iframeCurrentIndex: 0,
+    previewItem: null,
+    previewType: null,
+    purchaseRequestPending: false
+};
+
+const ExploreRequests = {
+    prompts: { generation: 0, controller: null },
+    packs: { generation: 0, controller: null }
 };
 
 // Debounce utility
@@ -41,17 +51,80 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function setupEventListeners() {
+    window.addEventListener('message', handleLandingPurchaseRequest);
     const searchInput = document.getElementById('exploreSearch');
     if (searchInput) {
-        searchInput.addEventListener('input', debounce(() => {
-            ExploreState.searchQuery = searchInput.value;
-            ExploreState.currentPage = 1;
+        const loadSearchResults = debounce(() => {
             if (ExploreState.activeTab === 'prompts') {
                 loadPrompts();
             } else {
                 loadPacks();
             }
-        }, 300));
+        }, 300);
+
+        searchInput.addEventListener('input', () => {
+            ExploreState.searchQuery = searchInput.value;
+            ExploreState.currentPage = 1;
+            invalidateExploreRequests();
+            loadSearchResults();
+        });
+    }
+
+    const categoryChips = document.getElementById('categoryChips');
+    if (categoryChips) {
+        categoryChips.addEventListener('click', (event) => {
+            const chip = event.target.closest('[data-chip-action]');
+            if (!chip) return;
+
+            if (chip.dataset.chipAction === 'category') {
+                const categoryId = chip.dataset.categoryId
+                    ? Number(chip.dataset.categoryId)
+                    : null;
+                selectCategory(categoryId, chip);
+            } else {
+                selectFilter(chip.dataset.filter || null, chip);
+            }
+        });
+    }
+
+    const grid = document.getElementById('exploreGrid');
+    if (grid) {
+        grid.addEventListener('click', (event) => {
+            const favoriteButton = event.target.closest('[data-favorite-prompt-id]');
+            if (favoriteButton) {
+                event.stopPropagation();
+                toggleExploreFavorite(
+                    Number(favoriteButton.dataset.favoritePromptId),
+                    favoriteButton
+                );
+                return;
+            }
+
+            const card = event.target.closest('[data-explore-item-id]');
+            if (!card) return;
+            const items = card.dataset.exploreItemType === 'prompt'
+                ? ExploreState.prompts
+                : ExploreState.packs;
+            const item = items.find(candidate => (
+                String(candidate.id) === card.dataset.exploreItemId
+            ));
+            if (item) openExploreItem(item, card.dataset.exploreItemType);
+        });
+        grid.addEventListener('error', handleExploreImageError, true);
+    }
+
+    const pagination = document.getElementById('explorePagination');
+    if (pagination) {
+        pagination.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-page]');
+            if (button && !button.disabled) goToPage(Number(button.dataset.page));
+        });
+    }
+
+    const modalContent = document.getElementById('modalContent');
+    if (modalContent) {
+        modalContent.addEventListener('click', handleModalAction);
+        modalContent.addEventListener('error', handleExploreImageError, true);
     }
 
     // Close modal on backdrop click
@@ -72,6 +145,37 @@ function setupEventListeners() {
         }
         if (e.key === 'Escape') closeModal();
     });
+}
+
+function handleLandingPurchaseRequest(event) {
+    const iframe = document.getElementById('landingPreviewIframe');
+    const item = ExploreState.previewItem;
+    if (
+        !ExploreState.iframeActive ||
+        ExploreState.previewType !== 'prompt' ||
+        !iframe ||
+        event.source !== iframe.contentWindow ||
+        !event.data ||
+        event.data.type !== 'aurvek-purchase-request' ||
+        Number(event.data.promptId) !== Number(item && item.id) ||
+        ExploreState.purchaseRequestPending
+    ) {
+        return;
+    }
+
+    ExploreState.purchaseRequestPending = true;
+    const resetPending = () => {
+        ExploreState.purchaseRequestPending = false;
+    };
+    NotificationModal.confirm(
+        'Continue to checkout',
+        `Open the secure Aurvek checkout for "${item.name || 'this prompt'}"?`,
+        () => {
+            resetPending();
+            window.location.assign(`/purchase/prompt/${Number(item.id)}`);
+        },
+        resetPending
+    );
 }
 
 // ============================================================
@@ -117,39 +221,103 @@ async function loadCategories() {
         if (!res.ok) return;
         const data = await res.json();
         ExploreState.categories = data;
-        renderCategories();
+        if (ExploreState.activeTab === 'prompts') renderCategories();
     } catch (err) {
         console.error('Failed to load categories:', err);
     }
 }
 
+function invalidateExploreRequests() {
+    Object.values(ExploreRequests).forEach(requestState => {
+        requestState.generation += 1;
+        if (requestState.controller) requestState.controller.abort();
+        requestState.controller = null;
+    });
+}
+
+function startExploreRequest(resource) {
+    Object.entries(ExploreRequests).forEach(([name, requestState]) => {
+        if (requestState.controller) requestState.controller.abort();
+        requestState.controller = null;
+        if (name !== resource) requestState.generation += 1;
+    });
+
+    const requestState = ExploreRequests[resource];
+    requestState.generation += 1;
+    const controller = new AbortController();
+    requestState.controller = controller;
+
+    return {
+        resource,
+        generation: requestState.generation,
+        controller,
+        snapshot: {
+            activeTab: ExploreState.activeTab,
+            activeFilter: ExploreState.activeFilter,
+            activeCategory: ExploreState.activeCategory,
+            searchQuery: ExploreState.searchQuery.trim(),
+            currentPage: ExploreState.currentPage,
+            limit: ExploreState.limit
+        }
+    };
+}
+
+function isExploreRequestCurrent(request) {
+    const requestState = ExploreRequests[request.resource];
+    const snapshot = request.snapshot;
+    return requestState.generation === request.generation
+        && requestState.controller === request.controller
+        && !request.controller.signal.aborted
+        && ExploreState.activeTab === request.resource
+        && ExploreState.activeTab === snapshot.activeTab
+        && ExploreState.activeFilter === snapshot.activeFilter
+        && ExploreState.activeCategory === snapshot.activeCategory
+        && ExploreState.searchQuery.trim() === snapshot.searchQuery
+        && ExploreState.currentPage === snapshot.currentPage
+        && ExploreState.limit === snapshot.limit;
+}
+
+function finishExploreRequest(request) {
+    const requestState = ExploreRequests[request.resource];
+    if (
+        requestState.generation !== request.generation
+        || requestState.controller !== request.controller
+    ) {
+        return;
+    }
+    requestState.controller = null;
+    if (ExploreState.activeTab === request.resource) showLoading(false);
+}
+
 async function loadPrompts() {
-    if (ExploreState.loading) return;
-    ExploreState.loading = true;
+    const request = startExploreRequest('prompts');
     showLoading(true);
 
     const params = new URLSearchParams({
-        page: ExploreState.currentPage,
-        limit: ExploreState.limit
+        page: request.snapshot.currentPage,
+        limit: request.snapshot.limit
     });
 
-    if (ExploreState.activeCategory) {
-        params.set('category', ExploreState.activeCategory);
+    if (request.snapshot.activeCategory) {
+        params.set('category', request.snapshot.activeCategory);
     }
-    if (ExploreState.activeFilter === 'mine') {
+    if (request.snapshot.activeFilter === 'mine') {
         params.set('mine', '1');
     }
-    if (ExploreState.activeFilter === 'favorites') {
+    if (request.snapshot.activeFilter === 'favorites') {
         params.set('favorites', '1');
     }
-    if (ExploreState.searchQuery.trim()) {
-        params.set('search', ExploreState.searchQuery.trim());
+    if (request.snapshot.searchQuery) {
+        params.set('search', request.snapshot.searchQuery);
     }
 
     try {
-        const res = await fetch(`/api/explore/prompts?${params}`);
+        const res = await fetch(`/api/explore/prompts?${params}`, {
+            signal: request.controller.signal
+        });
         if (!res.ok) throw new Error('Failed to fetch prompts');
         const data = await res.json();
+        if (!isExploreRequestCurrent(request)) return;
 
         ExploreState.prompts = data.prompts;
         ExploreState.total = data.total;
@@ -161,35 +329,38 @@ async function loadPrompts() {
         updateResultsBar();
         buildLandingItemsList();
     } catch (err) {
-        console.error('Failed to load prompts:', err);
-        showEmptyState('Error loading prompts. Please try again.');
+        if (err.name !== 'AbortError' && isExploreRequestCurrent(request)) {
+            console.error('Failed to load prompts:', err);
+            showEmptyState('Error loading prompts. Please try again.');
+        }
     } finally {
-        ExploreState.loading = false;
-        showLoading(false);
+        finishExploreRequest(request);
     }
 }
 
 async function loadPacks() {
-    if (ExploreState.loading) return;
-    ExploreState.loading = true;
+    const request = startExploreRequest('packs');
     showLoading(true);
 
     const params = new URLSearchParams({
-        page: ExploreState.currentPage,
-        limit: ExploreState.limit
+        page: request.snapshot.currentPage,
+        limit: request.snapshot.limit
     });
 
-    if (ExploreState.activeFilter === 'mine') {
+    if (request.snapshot.activeFilter === 'mine') {
         params.set('mine', '1');
     }
-    if (ExploreState.searchQuery.trim()) {
-        params.set('search', ExploreState.searchQuery.trim());
+    if (request.snapshot.searchQuery) {
+        params.set('search', request.snapshot.searchQuery);
     }
 
     try {
-        const res = await fetch(`/api/explore/packs?${params}`);
+        const res = await fetch(`/api/explore/packs?${params}`, {
+            signal: request.controller.signal
+        });
         if (!res.ok) throw new Error('Failed to fetch packs');
         const data = await res.json();
+        if (!isExploreRequestCurrent(request)) return;
 
         ExploreState.packs = data.packs;
         ExploreState.total = data.total;
@@ -201,11 +372,12 @@ async function loadPacks() {
         updateResultsBar();
         buildLandingItemsList();
     } catch (err) {
-        console.error('Failed to load packs:', err);
-        showEmptyState('Error loading packs. Please try again.');
+        if (err.name !== 'AbortError' && isExploreRequestCurrent(request)) {
+            console.error('Failed to load packs:', err);
+            showEmptyState('Error loading packs. Please try again.');
+        }
     } finally {
-        ExploreState.loading = false;
-        showLoading(false);
+        finishExploreRequest(request);
     }
 }
 
@@ -221,15 +393,15 @@ function renderCategories() {
     const noFilter = !ExploreState.activeFilter && !ExploreState.activeCategory;
 
     // "All" chip
-    let html = `<button class="category-chip ${noFilter ? 'active' : ''}" onclick="selectCategory(null, this)">
+    let html = `<button class="category-chip ${noFilter ? 'active' : ''}" data-chip-action="category">
         <i class="fas fa-globe"></i> All
     </button>`;
 
     // Special filter chips
-    html += `<button class="category-chip ${ExploreState.activeFilter === 'mine' ? 'active' : ''}" onclick="selectFilter('mine', this)">
+    html += `<button class="category-chip ${ExploreState.activeFilter === 'mine' ? 'active' : ''}" data-chip-action="filter" data-filter="mine">
         <i class="fas fa-user"></i> My Prompts
     </button>`;
-    html += `<button class="category-chip ${ExploreState.activeFilter === 'favorites' ? 'active' : ''}" onclick="selectFilter('favorites', this)">
+    html += `<button class="category-chip ${ExploreState.activeFilter === 'favorites' ? 'active' : ''}" data-chip-action="filter" data-filter="favorites">
         <i class="fas fa-star"></i> Favorites
     </button>`;
 
@@ -238,8 +410,8 @@ function renderCategories() {
 
     ExploreState.categories.forEach(cat => {
         if (cat.is_age_restricted) return;
-        html += `<button class="category-chip ${ExploreState.activeCategory === cat.id ? 'active' : ''}" data-category="${cat.id}" onclick="selectCategory(${cat.id}, this)">
-            <i class="fas ${cat.icon || 'fa-tag'}"></i> ${escapeHtml(cat.name)}
+        html += `<button class="category-chip ${ExploreState.activeCategory === cat.id ? 'active' : ''}" data-chip-action="category" data-category-id="${escapeAttr(String(cat.id))}">
+            <i class="fas ${escapeAttr(cat.icon || 'fa-tag')}"></i> ${escapeHtml(cat.name)}
             <span class="chip-count">${cat.count}</span>
         </button>`;
     });
@@ -247,8 +419,8 @@ function renderCategories() {
     const ageRestricted = ExploreState.categories.filter(c => c.is_age_restricted);
     if (ageRestricted.length > 0) {
         ageRestricted.forEach(cat => {
-            html += `<button class="category-chip ${ExploreState.activeCategory === cat.id ? 'active' : ''}" data-category="${cat.id}" onclick="selectCategory(${cat.id}, this)" title="Age-restricted content">
-                <i class="fas ${cat.icon || 'fa-tag'}"></i> ${escapeHtml(cat.name)}
+            html += `<button class="category-chip ${ExploreState.activeCategory === cat.id ? 'active' : ''}" data-chip-action="category" data-category-id="${escapeAttr(String(cat.id))}" title="Age-restricted content">
+                <i class="fas ${escapeAttr(cat.icon || 'fa-tag')}"></i> ${escapeHtml(cat.name)}
                 <span class="chip-count">${cat.count}</span>
             </button>`;
         });
@@ -264,10 +436,10 @@ function renderPackChips() {
 
     const noFilter = !ExploreState.activeFilter;
 
-    let html = `<button class="category-chip ${noFilter ? 'active' : ''}" onclick="selectFilter(null, this)">
+    let html = `<button class="category-chip ${noFilter ? 'active' : ''}" data-chip-action="filter">
         <i class="fas fa-globe"></i> All
     </button>`;
-    html += `<button class="category-chip ${ExploreState.activeFilter === 'mine' ? 'active' : ''}" onclick="selectFilter('mine', this)">
+    html += `<button class="category-chip ${ExploreState.activeFilter === 'mine' ? 'active' : ''}" data-chip-action="filter" data-filter="mine">
         <i class="fas fa-user"></i> My Packs
     </button>`;
 
@@ -318,7 +490,7 @@ function renderPrompts() {
     let html = '';
     ExploreState.prompts.forEach(prompt => {
         const avatarHtml = prompt.image_url
-            ? `<img src="${escapeAttr(prompt.image_url)}" alt="" class="card-avatar" loading="lazy" onerror="this.outerHTML=generatePlaceholder('${escapeAttr(prompt.name)}')">`
+            ? `<img src="${escapeAttr(prompt.image_url)}" alt="" class="card-avatar" loading="lazy" data-placeholder-name="${escapeAttr(prompt.name || '')}">`
             : generatePlaceholder(prompt.name);
 
         const descSnippet = prompt.description
@@ -327,7 +499,7 @@ function renderPrompts() {
 
         const tagsHtml = (prompt.categories || [])
             .slice(0, 3)
-            .map(c => `<span class="card-tag"><i class="fas ${c.icon || 'fa-tag'}"></i> ${escapeHtml(c.name)}</span>`)
+            .map(c => `<span class="card-tag"><i class="fas ${escapeAttr(c.icon || 'fa-tag')}"></i> ${escapeHtml(c.name)}</span>`)
             .join('');
 
         let paidBadge = '';
@@ -349,10 +521,10 @@ function renderPrompts() {
         const favClass = prompt.is_favorite ? 'is-favorite' : '';
         const favIcon = prompt.is_favorite ? 'fas' : 'far';
 
-        html += `<div class="prompt-card" onclick='openExploreItem(${JSON.stringify(prompt).replace(/'/g, "&#39;")}, "prompt")'>
+        html += `<div class="prompt-card" data-explore-item-type="prompt" data-explore-item-id="${escapeAttr(String(prompt.id))}">
             ${paidBadge}
             ${visibilityBadge}
-            <button class="explore-fav-btn ${favClass}" onclick="event.stopPropagation(); toggleExploreFavorite(${prompt.id}, this)" title="${prompt.is_favorite ? 'Remove from favorites' : 'Add to favorites'}">
+            <button class="explore-fav-btn ${favClass}" data-favorite-prompt-id="${escapeAttr(String(prompt.id))}" title="${prompt.is_favorite ? 'Remove from favorites' : 'Add to favorites'}">
                 <i class="${favIcon} fa-star"></i>
             </button>
             ${avatarHtml}
@@ -381,7 +553,7 @@ function renderPacks() {
     let html = '';
     ExploreState.packs.forEach(pack => {
         const coverHtml = pack.has_cover_image
-            ? `<div class="pack-card-cover"><img src="/api/packs/${pack.id}/cover/512" alt="" loading="lazy"></div>`
+            ? `<div class="pack-card-cover"><img src="/api/packs/${encodeURIComponent(pack.id)}/cover/512" alt="" loading="lazy"></div>`
             : `<div class="pack-card-cover pack-cover-placeholder"><span>${escapeHtml(pack.name ? pack.name.charAt(0).toUpperCase() : '?')}</span></div>`;
 
         const priceLabel = pack.is_paid ? `$${Number(pack.price).toFixed(2)}` : 'FREE';
@@ -401,7 +573,7 @@ function renderPacks() {
             }
         }
 
-        html += `<div class="pack-card" onclick='openExploreItem(${JSON.stringify(pack).replace(/'/g, "&#39;")}, "pack")'>
+        html += `<div class="pack-card" data-explore-item-type="pack" data-explore-item-id="${escapeAttr(String(pack.id))}">
             ${visibilityBadge}
             ${coverHtml}
             <div class="pack-card-body">
@@ -425,7 +597,22 @@ function renderPacks() {
 
 function generatePlaceholder(name) {
     const initial = name ? name.charAt(0).toUpperCase() : '?';
-    return `<div class="card-avatar-placeholder">${initial}</div>`;
+    return `<div class="card-avatar-placeholder">${escapeHtml(initial)}</div>`;
+}
+
+function handleExploreImageError(event) {
+    const image = event.target;
+    if (!image.classList.contains('card-avatar') && !image.classList.contains('modal-avatar')) {
+        return;
+    }
+
+    const placeholder = document.createElement('div');
+    placeholder.className = image.classList.contains('modal-avatar')
+        ? 'modal-avatar-placeholder'
+        : 'card-avatar-placeholder';
+    const name = image.dataset.placeholderName || '';
+    placeholder.textContent = name ? name.charAt(0).toUpperCase() : '?';
+    image.replaceWith(placeholder);
 }
 
 function showEmptyState(message) {
@@ -474,7 +661,7 @@ function renderPagination() {
     let html = '';
 
     // Previous button
-    html += `<button class="page-btn" ${currentPage <= 1 ? 'disabled' : ''} onclick="goToPage(${currentPage - 1})">
+    html += `<button class="page-btn" data-page="${currentPage - 1}" ${currentPage <= 1 ? 'disabled' : ''}>
         <i class="fas fa-chevron-left"></i>
     </button>`;
 
@@ -484,12 +671,12 @@ function renderPagination() {
         if (p === '...') {
             html += `<span class="page-btn" style="cursor:default;border:none;">...</span>`;
         } else {
-            html += `<button class="page-btn ${p === currentPage ? 'active' : ''}" onclick="goToPage(${p})">${p}</button>`;
+            html += `<button class="page-btn ${p === currentPage ? 'active' : ''}" data-page="${p}">${p}</button>`;
         }
     });
 
     // Next button
-    html += `<button class="page-btn" ${currentPage >= totalPages ? 'disabled' : ''} onclick="goToPage(${currentPage + 1})">
+    html += `<button class="page-btn" data-page="${currentPage + 1}" ${currentPage >= totalPages ? 'disabled' : ''}>
         <i class="fas fa-chevron-right"></i>
     </button>`;
 
@@ -533,14 +720,15 @@ function goToPage(page) {
 
 function openModal(prompt) {
     const backdrop = document.getElementById('exploreModalBackdrop');
-    if (!backdrop) return;
+    const modalContent = document.getElementById('modalContent');
+    if (!backdrop || !modalContent) return;
 
     const avatarHtml = prompt.image_fullsize_url || prompt.image_url
-        ? `<img src="${escapeAttr(prompt.image_fullsize_url || prompt.image_url)}" alt="" class="modal-avatar" onerror="this.outerHTML=generateModalPlaceholder('${escapeAttr(prompt.name)}')">`
+        ? `<img src="${escapeAttr(prompt.image_fullsize_url || prompt.image_url)}" alt="" class="modal-avatar" data-placeholder-name="${escapeAttr(prompt.name || '')}">`
         : generateModalPlaceholder(prompt.name);
 
     const tagsHtml = (prompt.categories || [])
-        .map(c => `<span class="modal-tag"><i class="fas ${c.icon || 'fa-tag'}"></i> ${escapeHtml(c.name)}</span>`)
+        .map(c => `<span class="modal-tag"><i class="fas ${escapeAttr(c.icon || 'fa-tag')}"></i> ${escapeHtml(c.name)}</span>`)
         .join('');
 
     const description = prompt.description || 'No description available.';
@@ -551,7 +739,7 @@ function openModal(prompt) {
         : null;
 
     const landingBtn = landingUrl
-        ? `<a href="${landingUrl}" target="_blank" class="modal-secondary-btn"><i class="fas fa-external-link-alt"></i> Landing Page</a>`
+        ? `<a href="${escapeAttr(landingUrl)}" target="_blank" class="modal-secondary-btn"><i class="fas fa-external-link-alt"></i> Landing Page</a>`
         : '';
 
     const modalFavClass = prompt.is_favorite ? 'is-favorite' : '';
@@ -566,9 +754,13 @@ function openModal(prompt) {
         }
     }
 
-    document.getElementById('modalContent').innerHTML = `
-        <button class="modal-close-btn" onclick="closeModal()" title="Close"><i class="fas fa-times"></i></button>
-        <button class="modal-fav-btn ${modalFavClass}" onclick="toggleExploreFavorite(${prompt.id}, this)" title="${prompt.is_favorite ? 'Remove from favorites' : 'Add to favorites'}">
+    ExploreState.modalItem = prompt;
+    ExploreState.modalType = 'prompt';
+    ExploreState.modalLandingUrl = landingUrl || '';
+
+    modalContent.innerHTML = `
+        <button class="modal-close-btn" data-modal-action="close" title="Close"><i class="fas fa-times"></i></button>
+        <button class="modal-fav-btn ${modalFavClass}" data-modal-action="favorite" data-favorite-prompt-id="${escapeAttr(String(prompt.id))}" title="${prompt.is_favorite ? 'Remove from favorites' : 'Add to favorites'}">
             <i class="${modalFavIcon} fa-star"></i>
         </button>
         <div class="modal-header-section">
@@ -587,7 +779,7 @@ function openModal(prompt) {
         ${getPromptCTA(prompt)}
         <div class="modal-secondary-actions">
             ${landingBtn}
-            <button class="modal-secondary-btn" onclick="sharePrompt('${escapeAttr(prompt.name)}', '${landingUrl || ''}')">
+            <button class="modal-secondary-btn" data-modal-action="share">
                 <i class="fas fa-share-alt"></i> Share
             </button>
         </div>
@@ -599,16 +791,16 @@ function openModal(prompt) {
 
 function getPromptCTA(prompt) {
     if (prompt.user_has_access || prompt.is_mine) {
-        return `<button class="modal-cta" onclick="chatWithPrompt(${prompt.id}, '${escapeAttr(prompt.name)}')">
+        return `<button class="modal-cta" data-modal-action="chat">
             <i class="fas fa-comments"></i> Chat Now
         </button>`;
     }
     if (prompt.purchase_price > 0) {
-        return `<button class="modal-cta modal-cta-vip" onclick="purchasePrompt(${prompt.id})">
+        return `<button class="modal-cta modal-cta-vip" data-modal-action="purchase-prompt">
             <i class="fas fa-crown"></i> Unlock VIP Access
         </button>`;
     }
-    return `<button class="modal-cta" onclick="chatWithPrompt(${prompt.id}, '${escapeAttr(prompt.name)}')">
+    return `<button class="modal-cta" data-modal-action="chat">
         <i class="fas fa-comments"></i> Chat Now
     </button>`;
 }
@@ -644,10 +836,11 @@ async function purchasePrompt(promptId) {
 
 function openPackModal(pack) {
     const backdrop = document.getElementById('exploreModalBackdrop');
-    if (!backdrop) return;
+    const modalContent = document.getElementById('modalContent');
+    if (!backdrop || !modalContent) return;
 
     const coverHtml = pack.has_cover_image
-        ? `<img src="/api/packs/${pack.id}/cover/512" alt="" class="pack-modal-cover">`
+        ? `<img src="/api/packs/${encodeURIComponent(pack.id)}/cover/512" alt="" class="pack-modal-cover">`
         : `<div class="pack-modal-cover-placeholder"><span>${escapeHtml(pack.name ? pack.name.charAt(0).toUpperCase() : '?')}</span></div>`;
 
     const description = pack.description || '';
@@ -668,7 +861,7 @@ function openPackModal(pack) {
 
     const landingUrl = publicId && slug ? `/pack/${encodeURIComponent(publicId)}/${encodeURIComponent(slug)}/` : null;
     const landingBtn = landingUrl
-        ? `<a href="${landingUrl}" target="_blank" class="modal-secondary-btn"><i class="fas fa-external-link-alt"></i> View Landing</a>`
+        ? `<a href="${escapeAttr(landingUrl)}" target="_blank" class="modal-secondary-btn"><i class="fas fa-external-link-alt"></i> View Landing</a>`
         : '';
 
     let packVisibilityNotice = '';
@@ -680,8 +873,12 @@ function openPackModal(pack) {
         }
     }
 
-    document.getElementById('modalContent').innerHTML = `
-        <button class="modal-close-btn" onclick="closeModal()" title="Close"><i class="fas fa-times"></i></button>
+    ExploreState.modalItem = pack;
+    ExploreState.modalType = 'pack';
+    ExploreState.modalLandingUrl = landingUrl || '';
+
+    modalContent.innerHTML = `
+        <button class="modal-close-btn" data-modal-action="close" title="Close"><i class="fas fa-times"></i></button>
         <div class="pack-modal-header">
             ${coverHtml}
             <div class="modal-info">
@@ -697,19 +894,19 @@ function openPackModal(pack) {
             <div class="explore-loading" style="padding:1rem 0"><div class="spinner"></div></div>
         </div>
         ${!pack.is_paid && pack.id ? `
-        <button class="modal-cta" style="width:100%;cursor:pointer" onclick="claimFreePack(${pack.id}, '${landingUrl || ''}')">
+        <button class="modal-cta" style="width:100%;cursor:pointer" data-modal-action="claim-pack">
             <i class="fas fa-rocket"></i> Get This Pack - FREE
         </button>` : pack.is_paid && pack.id ? `
-        <button class="modal-cta" style="width:100%;cursor:pointer" id="packPurchaseBtn" onclick="purchasePack(${pack.id}, '${landingUrl || ''}')">
+        <button class="modal-cta" style="width:100%;cursor:pointer" id="packPurchaseBtn" data-modal-action="purchase-pack">
             <i class="fas fa-shopping-cart"></i> Get This Pack - ${priceLabel}
         </button>
         <div id="packPurchaseError" class="modal-error" style="display:none;color:#f04747;padding:0.5rem 0;text-align:center;font-size:0.9rem;"></div>` : landingUrl ? `
-        <a href="${landingUrl}" target="_blank" class="modal-cta" style="text-decoration:none;text-align:center;display:block">
+        <a href="${escapeAttr(landingUrl)}" target="_blank" class="modal-cta" style="text-decoration:none;text-align:center;display:block">
             <i class="fas fa-rocket"></i> Get This Pack
         </a>` : ''}
         <div class="modal-secondary-actions">
             ${landingBtn}
-            <button class="modal-secondary-btn" onclick="sharePrompt('${escapeAttr(pack.name)}', '${landingUrl || ''}')">
+            <button class="modal-secondary-btn" data-modal-action="share">
                 <i class="fas fa-share-alt"></i> Share
             </button>
         </div>
@@ -744,7 +941,7 @@ async function loadPackModalItems(packId) {
             const initial = item.prompt_name ? item.prompt_name.charAt(0).toUpperCase() : '?';
             const desc = item.prompt_description ? escapeHtml(item.prompt_description.substring(0, 60)) : '';
             html += `<div class="pack-modal-prompt-row">
-                <div class="pack-modal-prompt-avatar">${initial}</div>
+                <div class="pack-modal-prompt-avatar">${escapeHtml(initial)}</div>
                 <div class="pack-modal-prompt-info">
                     <div class="pack-modal-prompt-name">${escapeHtml(item.prompt_name)}</div>
                     ${desc ? `<div class="pack-modal-prompt-desc">${desc}</div>` : ''}
@@ -765,7 +962,30 @@ async function loadPackModalItems(packId) {
 
 function generateModalPlaceholder(name) {
     const initial = name ? name.charAt(0).toUpperCase() : '?';
-    return `<div class="modal-avatar-placeholder">${initial}</div>`;
+    return `<div class="modal-avatar-placeholder">${escapeHtml(initial)}</div>`;
+}
+
+function handleModalAction(event) {
+    const actionElement = event.target.closest('[data-modal-action]');
+    if (!actionElement) return;
+
+    const item = ExploreState.modalItem;
+    const action = actionElement.dataset.modalAction;
+    if (action === 'close') {
+        closeModal();
+    } else if (action === 'favorite' && item && ExploreState.modalType === 'prompt') {
+        toggleExploreFavorite(item.id, actionElement);
+    } else if (action === 'share' && item) {
+        sharePrompt(item.name, ExploreState.modalLandingUrl);
+    } else if (action === 'chat' && item) {
+        chatWithPrompt(item.id, item.name);
+    } else if (action === 'purchase-prompt' && item) {
+        purchasePrompt(item.id);
+    } else if (action === 'claim-pack' && item) {
+        claimFreePack(item.id, ExploreState.modalLandingUrl);
+    } else if (action === 'purchase-pack' && item) {
+        purchasePack(item.id, ExploreState.modalLandingUrl);
+    }
 }
 
 function closeModal() {
@@ -774,6 +994,9 @@ function closeModal() {
         backdrop.classList.remove('active');
         document.body.style.overflow = '';
     }
+    ExploreState.modalItem = null;
+    ExploreState.modalType = null;
+    ExploreState.modalLandingUrl = '';
 }
 
 async function chatWithPrompt(promptId, promptName) {
@@ -916,7 +1139,7 @@ async function sharePrompt(name, landingUrl) {
         } catch (e) {
             // Double fallback: show URL in a modal so user can select and copy
             const safeUrl = shareUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            NotificationModal.info('Share Link', `<input class="form-control" value="${safeUrl}" readonly onclick="this.select()">`, { allowHtml: true });
+            NotificationModal.info('Share Link', `<input class="form-control" value="${safeUrl}" readonly>`, { allowHtml: true });
         }
     }
 }
@@ -945,9 +1168,7 @@ async function toggleExploreFavorite(promptId, btnEl) {
 
         // Sync all buttons for this prompt (card + modal may both be visible)
         document.querySelectorAll(`.explore-fav-btn, .modal-fav-btn`).forEach(btn => {
-            // Find buttons that match this promptId by checking onclick
-            const onclickAttr = btn.getAttribute('onclick') || '';
-            if (onclickAttr.includes(`toggleExploreFavorite(${promptId},`)) {
+            if (btn.dataset.favoritePromptId === String(promptId)) {
                 const ico = btn.querySelector('i');
                 if (data.is_favorite) {
                     btn.classList.add('is-favorite');
@@ -1015,10 +1236,11 @@ function openLandingPreview(item, type) {
     ExploreState.iframeCurrentIndex = idx >= 0 ? idx : 0;
     ExploreState.iframeActive = true;
 
-    // Build URL — append ?preview=1 to skip custom domain redirects and analytics
+    // Public embed mode keeps owner-only preview semantics while allowing the
+    // isolated landing origin to be framed by the primary Explore page.
     const url = type === 'prompt'
-        ? `/p/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?preview=1`
-        : `/pack/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?preview=1`;
+        ? `/p/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?embed=1`
+        : `/pack/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?embed=1`;
 
     const iframe = document.getElementById('landingPreviewIframe');
     iframe.src = url;
@@ -1037,6 +1259,9 @@ function closeLandingPreview() {
     overlay.classList.remove('active');
     document.body.style.overflow = '';
     ExploreState.iframeActive = false;
+    ExploreState.previewItem = null;
+    ExploreState.previewType = null;
+    ExploreState.purchaseRequestPending = false;
 
     // Clear iframe to stop any running content
     const iframe = document.getElementById('landingPreviewIframe');
@@ -1057,8 +1282,8 @@ function navigatePreview(direction) {
     const type = item._type;
 
     const url = type === 'prompt'
-        ? `/p/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?preview=1`
-        : `/pack/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?preview=1`;
+        ? `/p/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?embed=1`
+        : `/pack/${encodeURIComponent(item.public_id)}/${encodeURIComponent(item.slug)}/?embed=1`;
 
     document.getElementById('landingPreviewIframe').src = url;
     updatePreviewBar(item, type);
@@ -1072,28 +1297,25 @@ function updatePreviewBar(item, type) {
 
     if (nameEl) nameEl.textContent = item.name || '';
     if (creatorEl) creatorEl.textContent = '@' + (item.creator_name || item.created_by_username || 'Unknown');
+    ExploreState.previewItem = item;
+    ExploreState.previewType = type;
 
     // CTA button
     if (ctaBtn) {
         if (type === 'prompt') {
             if (item.user_has_access || item.is_mine) {
                 ctaBtn.textContent = 'Chat Now';
-                ctaBtn.onclick = () => { closeLandingPreview(); chatWithPrompt(item.id, item.name); };
             } else if (item.purchase_price > 0) {
                 ctaBtn.textContent = 'Unlock VIP Access';
-                ctaBtn.onclick = () => { closeLandingPreview(); purchasePrompt(item.id); };
             } else {
                 ctaBtn.textContent = 'Chat Now';
-                ctaBtn.onclick = () => { closeLandingPreview(); chatWithPrompt(item.id, item.name); };
             }
         } else {
             // Pack
             if (item.is_paid) {
                 ctaBtn.textContent = 'Buy $' + Number(item.price).toFixed(2);
-                ctaBtn.onclick = () => { closeLandingPreview(); purchasePack(item.id, ''); };
             } else {
                 ctaBtn.textContent = 'Get Free';
-                ctaBtn.onclick = () => { closeLandingPreview(); claimFreePack(item.id, ''); };
             }
         }
     }
@@ -1116,7 +1338,22 @@ function updatePreviewNavigation() {
 }
 
 function previewCtaAction() {
-    // Fallback -- individual CTA buttons set their own onclick
+    const item = ExploreState.previewItem;
+    const type = ExploreState.previewType;
+    if (!item || !type) return;
+
+    closeLandingPreview();
+    if (type === 'prompt') {
+        if (item.user_has_access || item.is_mine || !(item.purchase_price > 0)) {
+            chatWithPrompt(item.id, item.name);
+        } else {
+            purchasePrompt(item.id);
+        }
+    } else if (item.is_paid) {
+        purchasePack(item.id, '');
+    } else {
+        claimFreePack(item.id, '');
+    }
 }
 
 // ============================================================

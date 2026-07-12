@@ -4,6 +4,7 @@
 # and the main async generator that feeds Aurvek's SSE transport.
 
 import asyncio
+import math
 import os
 import re
 import time
@@ -16,7 +17,17 @@ import orjson
 from database import get_db_connection
 from log_config import logger
 from integrations.delivery import deliver_to_platform, send_platform_error
-from common import get_balance, get_user_billing_info, get_effective_billing_info, consume_token
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    accumulate_ai_reservation_usage,
+    estimate_customer_charge_from_api_cost,
+    estimate_structured_billing_tokens,
+    get_user_billing_availability,
+    refund_fixed_usage,
+    reserve_ai_usage,
+    settle_ai_reservation_components,
+)
 from gransabio_config import (
     get_gransabio_config,
     validate_gransabio_url,
@@ -36,6 +47,14 @@ _HTTP_CLIENT_KWARGS = dict(
     trust_env=False,
     follow_redirects=False,
 )
+
+
+def _billing_safety_multiplier(value, default: int = 3) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, parsed)
 
 
 def get_http_client() -> httpx.AsyncClient:
@@ -598,18 +617,87 @@ def _verbose_sse(payload: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def get_cost_per_token(model_id: str, pricing: dict) -> float:
-    """Get average cost per token for a model from pricing dict.
-
-    Returns the average of input and output cost. Falls back to 0.0 if
-    model is not in pricing.
-    """
+def get_model_cost_rates(model_id: str, pricing: dict) -> tuple[float, float]:
+    """Return separate input/output per-token prices for a GranSabio model."""
     model_pricing = pricing.get(model_id)
     if not model_pricing:
-        return 0.0
-    input_cost = model_pricing.get("input_cost_per_token", 0.0)
-    output_cost = model_pricing.get("output_cost_per_token", 0.0)
-    return (input_cost + output_cost) / 2.0
+        return 0.0, 0.0
+    input_rate = float(model_pricing.get("input_cost_per_token", 0.0) or 0.0)
+    output_rate = float(model_pricing.get("output_cost_per_token", 0.0) or 0.0)
+    if min(input_rate, output_rate) < 0 or not all(
+        math.isfinite(value) for value in (input_rate, output_rate)
+    ):
+        raise ValueError(f"Invalid GranSabio pricing for model: {model_id}")
+    return input_rate, output_rate
+
+
+def _nonnegative_gransabio_tokens(value, field_name: str) -> int:
+    try:
+        numeric = float(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid GranSabio {field_name}") from exc
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        raise ValueError(f"Invalid GranSabio {field_name}")
+    return int(numeric)
+
+
+def estimate_gransabio_cost_upper_bound(
+    *,
+    content_request: dict,
+    pricing: dict,
+    generator_model: str,
+    qa_models: list,
+    qa_layers: list,
+    arbiter_model: str,
+    gran_sabio_model: str,
+    gran_sabio_fallback: bool,
+    max_iterations: int,
+    max_tokens: int,
+    safety_multiplier: int,
+) -> tuple[float, int]:
+    """Bound pipeline API cost, including repeated input/context per phase."""
+    max_iterations = max(1, int(max_iterations))
+    max_tokens = max(1, int(max_tokens))
+    layer_count = len(qa_layers or [])
+    call_plan: list[tuple[str, int, int]] = [
+        (generator_model, max_iterations, max_tokens),
+    ]
+    if layer_count and qa_models:
+        qa_output_cap = max(max_tokens, 8_000)
+        call_plan.extend(
+            (model, layer_count * max_iterations, qa_output_cap)
+            for model in qa_models
+        )
+    if arbiter_model and layer_count:
+        call_plan.append(
+            (arbiter_model, layer_count * max_iterations, max(max_tokens, 16_000))
+        )
+    if gran_sabio_model and (layer_count or gran_sabio_fallback):
+        call_plan.append((gran_sabio_model, max_iterations, max_tokens))
+
+    call_plan = [entry for entry in call_plan if entry[0] and entry[1] > 0]
+    maximum_output_tokens = sum(count * cap for _, count, cap in call_plan)
+    request_input_tokens = estimate_structured_billing_tokens(content_request)
+    # Any later phase can receive the original request plus prior candidate,
+    # QA, and arbitration output. Counting the full output budget for every
+    # call deliberately over-bounds pipelines whose prompts only include a
+    # subset of that history.
+    input_tokens_per_call = request_input_tokens + maximum_output_tokens
+
+    api_cost = 0.0
+    total_input_tokens = 0
+    for model_id, count, output_cap in call_plan:
+        input_rate, output_rate = get_model_cost_rates(model_id, pricing)
+        api_cost += count * (
+            input_tokens_per_call * input_rate + output_cap * output_rate
+        )
+        total_input_tokens += count * input_tokens_per_call
+
+    multiplier = max(1, int(safety_multiplier))
+    return (
+        api_cost * multiplier,
+        (total_input_tokens + maximum_output_tokens) * multiplier,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +706,262 @@ def get_cost_per_token(model_id: str, pricing: dict) -> float:
 
 # Regex to strip [[QUERY_COSTS...]] block appended by GranSabio
 _QUERY_COSTS_RE = re.compile(r'\n*\[\[QUERY_COSTS[\s\S]*?\]\]$')
+_GRANSABIO_TERMINAL_STATUSES = {
+    "approved",
+    "completed",
+    "rejected",
+    "preflight_rejected",
+    "auto_qa_rejected",
+    "failed",
+    "cancelled",
+}
+
+
+def _strip_gransabio_json_costs(content):
+    """Remove GranSabio's JSON cost envelope and restore root lists."""
+    if not isinstance(content, dict):
+        return content
+    had_query_costs = "query_costs" in content
+    clean_content = dict(content)
+    clean_content.pop("query_costs", None)
+    if (
+        had_query_costs
+        and set(clean_content) == {"items"}
+        and isinstance(clean_content["items"], list)
+    ):
+        return clean_content["items"]
+    return clean_content
+
+
+def _normalize_gransabio_content(content) -> str:
+    """Return terminal content as storable text without billing metadata."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        normalized_text = _QUERY_COSTS_RE.sub("", content).rstrip()
+        try:
+            structured_content = orjson.loads(normalized_text)
+        except orjson.JSONDecodeError:
+            return normalized_text
+        if isinstance(structured_content, (dict, list)):
+            structured_content = _strip_gransabio_json_costs(
+                structured_content
+            )
+            return orjson.dumps(structured_content).decode()
+        return normalized_text
+    if isinstance(content, (dict, list)):
+        return orjson.dumps(
+            _strip_gransabio_json_costs(content)
+        ).decode()
+    raise ValueError(
+        "GranSabio returned content with an unsupported type"
+    )
+
+
+def _gransabio_result_has_cost(result_data: dict) -> bool:
+    """Return whether /result explicitly exposes an incurred provider cost."""
+    if not isinstance(result_data, dict):
+        return False
+    costs = result_data.get("costs")
+    if not isinstance(costs, dict):
+        return False
+    grand_totals = costs.get("grand_totals")
+    return isinstance(grand_totals, dict) and grand_totals.get("cost") is not None
+
+
+def _extract_gransabio_result_usage(
+    result_data: dict,
+    *,
+    require_cost: bool,
+) -> Optional[dict]:
+    """Normalize real /result usage without charging reasoning twice."""
+    if not _gransabio_result_has_cost(result_data):
+        if require_cost:
+            raise ValueError(
+                "GranSabio returned no cost in grand_totals. "
+                "Model pricing may not be configured in GranSabio"
+            )
+        return None
+
+    grand_totals = result_data["costs"]["grand_totals"]
+    input_tokens = _nonnegative_gransabio_tokens(
+        grand_totals.get("input_tokens", 0),
+        "input_tokens",
+    )
+    output_tokens = _nonnegative_gransabio_tokens(
+        grand_totals.get("output_tokens", 0),
+        "output_tokens",
+    )
+    reasoning_tokens = _nonnegative_gransabio_tokens(
+        grand_totals.get("reasoning_tokens", 0),
+        "reasoning_tokens",
+    )
+    if reasoning_tokens > output_tokens:
+        raise ValueError(
+            "GranSabio reasoning_tokens cannot exceed output_tokens"
+        )
+
+    try:
+        api_cost = float(grand_totals["cost"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("GranSabio returned an invalid cost") from exc
+    if not math.isfinite(api_cost) or api_cost < 0:
+        raise ValueError("GranSabio returned an invalid cost")
+
+    return {
+        "input_tokens": input_tokens,
+        # GranSabio/provider output totals already include reasoning tokens.
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "api_cost": api_cost,
+    }
+
+
+def _gransabio_usage_component(
+    usage: dict,
+    *,
+    prompt_id: Optional[int],
+    byok: bool,
+    idempotency_key: Optional[str],
+) -> dict:
+    """Build the durable component used by normal and stale settlement."""
+    component = {
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "input_cost_per_million": 0.0,
+        "output_cost_per_million": 0.0,
+        "prompt_id": prompt_id,
+        "byok": bool(byok),
+        "override_api_cost": usage["api_cost"],
+    }
+    if idempotency_key:
+        component["idempotency_key"] = idempotency_key
+    return component
+
+
+async def _persist_gransabio_result_usage(
+    result_data: dict,
+    *,
+    reservation_id: Optional[str],
+    user_id: int,
+    prompt_id: Optional[int],
+    byok: bool,
+    require_cost: bool,
+    idempotency_key: Optional[str] = None,
+) -> Optional[dict]:
+    """Persist one real GranSabio aggregate before save, delivery, or return."""
+    usage = _extract_gransabio_result_usage(
+        result_data,
+        require_cost=require_cost,
+    )
+    if usage is None:
+        return None
+
+    component = _gransabio_usage_component(
+        usage,
+        prompt_id=prompt_id,
+        byok=byok,
+        idempotency_key=idempotency_key,
+    )
+    usage["component"] = component
+    if reservation_id:
+        await accumulate_ai_reservation_usage(
+            reservation_id=reservation_id,
+            user_id=int(user_id),
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            component=component,
+        )
+        usage["persisted"] = True
+    elif usage["api_cost"] > 0:
+        raise BillingReservationError(
+            "GranSabio incurred cost without an active billing reservation"
+        )
+    else:
+        usage["persisted"] = False
+    return usage
+
+
+async def _settle_gransabio_result_usage(
+    usage: Optional[dict],
+    *,
+    reservation_id: Optional[str],
+    user_id: int,
+    prompt_id: Optional[int],
+) -> None:
+    """Settle real usage when no assistant message will capture the hold."""
+    if usage is None or not reservation_id:
+        return
+    settled = await settle_ai_reservation_components(
+        reservation_id=reservation_id,
+        user_id=int(user_id),
+        prompt_id=prompt_id,
+        components=[usage["component"]],
+    )
+    if not settled:
+        raise BillingReservationError(
+            "GranSabio billing reservation is not active"
+        )
+
+
+def _gransabio_terminal_error(result_data: dict) -> str:
+    """Translate terminal result statuses without collapsing all rejections."""
+    status = str(result_data.get("status") or "").lower()
+    if status in {"preflight_rejected", "rejected_preflight"}:
+        feedback = result_data.get("preflight_feedback") or {}
+        if isinstance(feedback, dict):
+            detail = feedback.get("user_feedback") or feedback.get("message")
+        else:
+            detail = str(feedback)
+        return f"Preflight rejected: {detail or 'Request rejected by preflight checks.'}"
+    if status == "auto_qa_rejected":
+        feedback = result_data.get("auto_qa_feedback") or {}
+        if isinstance(feedback, dict):
+            detail = feedback.get("message") or feedback.get("user_feedback")
+        else:
+            detail = str(feedback)
+        return f"Auto-QA rejected: {detail or 'Request rejected during QA planning.'}"
+    if status == "cancelled":
+        return "GranSabio project was cancelled."
+    if status == "failed":
+        detail = result_data.get("failure_reason") or result_data.get("error")
+        return f"GranSabio pipeline failed: {detail or 'Unknown failure.'}"
+
+    iterations = result_data.get("iterations_used", "?")
+    return (
+        f"Quality check failed after {iterations} iterations. "
+        "Content did not meet the minimum score threshold."
+    )
+
+
+async def _fetch_terminal_gransabio_result_once(
+    client,
+    gs_url: str,
+    session_id: Optional[str],
+) -> Optional[dict]:
+    """Best-effort bounded recovery for cleanup after a started provider call."""
+    if not session_id:
+        return None
+    try:
+        response = await asyncio.wait_for(
+            client.get(
+                f"{gs_url}/result/{session_id}",
+                timeout=2.0,
+            ),
+            timeout=2.5,
+        )
+        if response.status_code != 200:
+            return None
+        result_data = response.json()
+        if not isinstance(result_data, dict):
+            return None
+        status = str(result_data.get("status") or "").lower()
+        if status not in _GRANSABIO_TERMINAL_STATUSES and "approved" not in result_data:
+            return None
+        return result_data
+    except (asyncio.TimeoutError, httpx.HTTPError, ValueError, TypeError):
+        return None
 
 
 async def generate_via_gransabio(
@@ -638,6 +982,7 @@ async def generate_via_gransabio(
     watchdog_hint_eval_id=None,
     max_tokens=4000,
     http_client: Optional[httpx.AsyncClient] = None,
+    strip_device_action_blocks: bool = False,
 ):
     """Async generator yielding Aurvek-format SSE chunks.
 
@@ -693,13 +1038,15 @@ async def generate_via_gransabio(
 
     # --- 4. Heuristic balance pre-check (phase-based estimate * safety_multiplier) ---
     user_id = current_user.id
-    billing = await get_effective_billing_info(user_id)
-    if billing["effective_balance"] <= 0:
+    billing = await get_user_billing_availability(user_id)
+    if billing["available"] <= 0:
         yield error_sse("Insufficient balance to start GranSabio pipeline.")
         return
 
     # Phase-based cost estimate using model pricing from GranSabio
-    safety_multiplier = int(admin_config.get("gransabio_cost_safety_multiplier", "3"))
+    safety_multiplier = _billing_safety_multiplier(
+        admin_config.get("gransabio_cost_safety_multiplier", "3")
+    )
     model_pricing = await get_gransabio_model_pricing(gs_url, extra_ips)
 
     generator_model = merged.get("generator_model", "")
@@ -736,35 +1083,41 @@ async def generate_via_gransabio(
         return
     gran_sabio_fallback = merged.get("gran_sabio_fallback", True)
     max_iters = int(merged.get("max_iterations", 3))
-
-    gen_cost_per_tok = get_cost_per_token(generator_model, model_pricing)
-    generation_cost = gen_cost_per_tok * max_tokens * max_iters
-
-    qa_cost = 0
-    if qa_layers and qa_models:
-        total_qa_cpt = sum(get_cost_per_token(m, model_pricing) for m in qa_models)
-        qa_cost = total_qa_cpt * max_tokens * len(qa_layers) * max_iters
-
-    arbiter_cost = 0
-    if arbiter_model:
-        arbiter_cost = get_cost_per_token(arbiter_model, model_pricing) * max_tokens * len(qa_layers) * max_iters
-
-    gs_escalation_cost = 0
-    if gran_sabio_model and gran_sabio_fallback:
-        gs_escalation_cost = get_cost_per_token(gran_sabio_model, model_pricing) * max_tokens * max_iters
-
-    total_estimate = generation_cost + qa_cost + arbiter_cost + gs_escalation_cost
-    total_estimate = max(total_estimate, gen_cost_per_tok * max_tokens)  # Floor: at least one gen call
-    worst_case = total_estimate * safety_multiplier
-
-    if worst_case > 0 and billing["effective_balance"] < worst_case:
-        yield error_sse(f"Insufficient balance (estimated max cost ${worst_case:.2f}).")
+    content_request = build_content_request(
+        user_message or message,
+        full_prompt,
+        context_messages,
+        merged,
+        max_tokens=max_tokens,
+    )
+    try:
+        worst_case, maximum_pipeline_tokens = estimate_gransabio_cost_upper_bound(
+            content_request=content_request,
+            pricing=model_pricing,
+            generator_model=generator_model,
+            qa_models=qa_models,
+            qa_layers=qa_layers,
+            arbiter_model=arbiter_model,
+            gran_sabio_model=gran_sabio_model,
+            gran_sabio_fallback=gran_sabio_fallback,
+            max_iterations=max_iters,
+            max_tokens=max_tokens,
+            safety_multiplier=safety_multiplier,
+        )
+    except (TypeError, ValueError) as exc:
+        yield error_sse(f"Cannot estimate GranSabio cost: {exc}")
         return
-    if (billing["monthly_remaining"] is not None
-            and billing["billing_limit_action"] == "block"
-            and worst_case > 0
-            and billing["monthly_remaining"] < worst_case):
-        yield error_sse(f"Monthly limit would be exceeded (estimated max cost ${worst_case:.2f}).")
+    customer_worst_case = await estimate_customer_charge_from_api_cost(
+        user_id=user_id,
+        prompt_id=prompt_id,
+        api_cost=worst_case,
+        maximum_tokens=maximum_pipeline_tokens,
+    )
+
+    if customer_worst_case > 0 and billing["available"] < customer_worst_case:
+        yield error_sse(
+            f"Insufficient balance (estimated max cost ${customer_worst_case:.2f})."
+        )
         return
 
     client = http_client or get_http_client()
@@ -773,6 +1126,9 @@ async def generate_via_gransabio(
     session_id = None
     lock_acquired = False
     lock_token = None
+    ai_reservation_id = None
+    billing_cost_observed = False
+    billing_usage_persisted = False
 
     try:
         # --- Acquire conversation lock ---
@@ -788,6 +1144,19 @@ async def generate_via_gransabio(
                 yield error_sse(
                     "GranSabio is still processing a previous message for this conversation."
                 )
+            return
+
+        try:
+            ai_reservation_id = await reserve_ai_usage(
+                user_id=user_id,
+                maximum_amount=customer_worst_case,
+            )
+        except InsufficientBalanceError:
+            yield error_sse("Insufficient balance to start GranSabio pipeline.")
+            return
+        except BillingReservationError:
+            logger.exception("Could not reserve GranSabio billing")
+            yield error_sse("GranSabio billing is temporarily unavailable.")
             return
 
         # Reset stop signal AFTER lock acquisition (prevents N+1 clearing N's stop)
@@ -818,14 +1187,6 @@ async def generate_via_gransabio(
         # --- 6. Open SSE stream ---
         phases_param = "all" if verbose else "status,generation"
         sse_url = f"{gs_url}/stream/project/{project_id}?phases={phases_param}"
-
-        content_request = build_content_request(
-            user_message or message,
-            full_prompt,
-            context_messages,
-            merged,
-            max_tokens=max_tokens,
-        )
 
         # We use a streaming context for the SSE connection
         async with client.stream("GET", sse_url, timeout=None) as sse_response:
@@ -909,12 +1270,31 @@ async def generate_via_gransabio(
 
                 gen_data = gen_task.result()
 
-                # Check for preflight rejection
+                # Check for rejections that finish before a durable session exists.
                 gen_status = gen_data.get("status", "")
-                if gen_status == "rejected":
+                if gen_status in {"rejected", "preflight_rejected"}:
                     feedback = gen_data.get("preflight_feedback", {})
-                    user_feedback = feedback.get("user_feedback", "Request rejected by preflight checks.")
+                    user_feedback = (
+                        feedback.get(
+                            "user_feedback",
+                            "Request rejected by preflight checks.",
+                        )
+                        if isinstance(feedback, dict)
+                        else str(feedback)
+                    )
                     yield error_sse(f"Preflight rejected: {user_feedback}")
+                    return
+                if gen_status == "auto_qa_rejected":
+                    feedback = gen_data.get("auto_qa_feedback", {})
+                    user_feedback = (
+                        feedback.get(
+                            "message",
+                            "Request rejected during QA planning.",
+                        )
+                        if isinstance(feedback, dict)
+                        else str(feedback)
+                    )
+                    yield error_sse(f"Auto-QA rejected: {user_feedback}")
                     return
 
                 session_id = gen_data.get("session_id")
@@ -982,8 +1362,8 @@ async def generate_via_gransabio(
             return
 
         content = None
-        grand_totals = None
         result_data = {}
+        result_usage = None
         result_deadline = time.monotonic() + 30.0
         last_err = None
 
@@ -995,23 +1375,85 @@ async def generate_via_gransabio(
                 )
                 if result_resp.status_code == 200:
                     result_data = result_resp.json()
+                    if not isinstance(result_data, dict):
+                        last_err = "invalid result payload"
+                        await asyncio.sleep(1.0)
+                        continue
 
-                    # Check approval status - do NOT save/deliver rejected content
-                    approved = result_data.get("approved", result_data.get("status") == "approved")
-                    if not approved:
-                        iters_used = result_data.get("iterations_used", "?")
-                        yield error_sse(
-                            f"Quality check failed after {iters_used} iterations. "
-                            "Content did not meet the minimum score threshold."
+                    result_status = str(result_data.get("status") or "").lower()
+                    approved = bool(
+                        result_data.get(
+                            "approved",
+                            result_status in {"approved", "completed"},
                         )
-                        # Yield summary even on rejection for UI feedback
-                        yield f'data: {orjson.dumps({"gransabio_complete": {"approved": False, "iterations_used": iters_used}}).decode()}\n\n'
+                    )
+                    billing_cost_observed = _gransabio_result_has_cost(
+                        result_data
+                    )
+                    try:
+                        result_usage = await _persist_gransabio_result_usage(
+                            result_data,
+                            reservation_id=ai_reservation_id,
+                            user_id=user_id,
+                            prompt_id=prompt_id,
+                            byok=byok,
+                            require_cost=approved,
+                            idempotency_key=(
+                                f"gransabio:{session_id}:terminal"
+                                if session_id
+                                else None
+                            ),
+                        )
+                        billing_usage_persisted = bool(
+                            result_usage and result_usage.get("persisted")
+                        )
+                    except (BillingReservationError, ValueError) as exc:
+                        logger.error(
+                            "Could not persist GranSabio result billing: %s",
+                            exc,
+                            exc_info=True,
+                        )
+                        yield error_sse(f"Billing error: {exc}.")
+                        return
+
+                    # Do not save or deliver rejected/failed/cancelled content,
+                    # but capture any real usage the terminal result reported.
+                    if not approved:
+                        try:
+                            await _settle_gransabio_result_usage(
+                                result_usage,
+                                reservation_id=ai_reservation_id,
+                                user_id=user_id,
+                                prompt_id=prompt_id,
+                            )
+                        except BillingReservationError as exc:
+                            logger.error(
+                                "Could not settle terminal GranSabio billing: %s",
+                                exc,
+                                exc_info=True,
+                            )
+                            yield error_sse(
+                                "GranSabio billing could not be finalized. "
+                                "The reserved amount remains protected for recovery."
+                            )
+                            return
+                        yield error_sse(_gransabio_terminal_error(result_data))
+                        iters_used = result_data.get(
+                            "iterations_used",
+                            result_data.get("final_iteration", "?"),
+                        )
+                        summary = {
+                            "gransabio_complete": {
+                                "approved": False,
+                                "status": result_status or "rejected",
+                                "iterations_used": iters_used,
+                            }
+                        }
+                        yield f'data: {orjson.dumps(summary).decode()}\n\n'
                         yield 'data: [DONE]\n\n'
                         return
 
                     content = result_data.get("content", "")
-                    costs = result_data.get("costs", {})
-                    grand_totals = costs.get("grand_totals", {})
                     break
                 elif result_resp.status_code == 202:
                     # Not ready yet
@@ -1030,34 +1472,49 @@ async def generate_via_gransabio(
             )
             return
 
-        # --- 11. Strip [[QUERY_COSTS...]] ---
-        content = _QUERY_COSTS_RE.sub("", content).rstrip()
+        # --- 11. Normalize text/JSON and strip embedded billing metadata ---
+        try:
+            content = _normalize_gransabio_content(content)
+        except (TypeError, ValueError) as exc:
+            yield error_sse(f"GranSabio returned invalid content: {exc}.")
+            return
 
         if not content:
+            try:
+                await _settle_gransabio_result_usage(
+                    result_usage,
+                    reservation_id=ai_reservation_id,
+                    user_id=user_id,
+                    prompt_id=prompt_id,
+                )
+            except BillingReservationError:
+                logger.exception(
+                    "Could not settle empty GranSabio result billing"
+                )
             yield error_sse("GranSabio returned empty content")
             return
 
-        # --- 12. Validate cost ---
-        if grand_totals is None:
-            grand_totals = {}
-
-        input_tokens = grand_totals.get("input_tokens", 0)
-        output_tokens = grand_totals.get("output_tokens", 0)
-        reasoning_tokens = grand_totals.get("reasoning_tokens", 0)
-        # Fold reasoning_tokens into output_tokens for billing (matches O1 pattern)
-        billing_output_tokens = output_tokens + reasoning_tokens
-        total_tokens = input_tokens + billing_output_tokens
-        api_cost = grand_totals.get("cost")
-
-        if api_cost is None:
-            yield error_sse(
-                "Billing error: GranSabio returned no cost in grand_totals. "
-                "Model pricing may not be configured in GranSabio."
-            )
-            return
+        # --- 12. Real usage was validated and durably attached above ---
+        input_tokens = result_usage["input_tokens"]
+        output_tokens = result_usage["output_tokens"]
+        reasoning_tokens = result_usage["reasoning_tokens"]
+        billing_output_tokens = output_tokens
+        total_tokens = result_usage["total_tokens"]
+        api_cost = result_usage["api_cost"]
 
         # --- Stop signal check point 3 ---
         if await check_stop_signal(conversation_id, redis_available):
+            try:
+                await _settle_gransabio_result_usage(
+                    result_usage,
+                    reservation_id=ai_reservation_id,
+                    user_id=user_id,
+                    prompt_id=prompt_id,
+                )
+            except BillingReservationError:
+                logger.exception(
+                    "Could not settle stopped GranSabio result billing"
+                )
             yield error_sse("Generation stopped by user (before save).")
             return
 
@@ -1082,20 +1539,48 @@ async def generate_via_gransabio(
                     llm_id=gs_llm_id,
                     byok=byok,
                     override_api_cost=api_cost,
+                    strip_device_action_blocks=strip_device_action_blocks,
+                    billing_reservation_id=ai_reservation_id,
+                    billing_only_accumulated_usage=bool(
+                        ai_reservation_id and result_usage.get("persisted")
+                    ),
                 )
 
                 # save_content_to_db returns (user_msg_id, bot_msg_id) or (None, None)
-                if save_result and isinstance(save_result, tuple):
-                    user_message_id, bot_message_id = save_result
-                    if user_message_id and bot_message_id:
-                        yield f'data: {orjson.dumps({"message_ids": {"user": user_message_id, "bot": bot_message_id}}).decode()}\n\n'
-                    else:
-                        yield error_sse("Failed to save GranSabio result to database.")
-                        return
+                if not (
+                    save_result
+                    and isinstance(save_result, tuple)
+                    and len(save_result) == 2
+                    and save_result[0]
+                    and save_result[1]
+                ):
+                    yield error_sse("Failed to save GranSabio result to database.")
+                    return
+                user_message_id, bot_message_id = save_result
+                yield f'data: {orjson.dumps({"message_ids": {"user": user_message_id, "bot": bot_message_id}}).decode()}\n\n'
 
             except Exception as exc:
                 logger.error("GranSabio save_content_to_db failed: %s", exc, exc_info=True)
                 yield error_sse(f"Failed to save result: {exc}")
+                return
+        else:
+            try:
+                await _settle_gransabio_result_usage(
+                    result_usage,
+                    reservation_id=ai_reservation_id,
+                    user_id=user_id,
+                    prompt_id=prompt_id,
+                )
+            except BillingReservationError as exc:
+                logger.error(
+                    "Could not settle unsaved GranSabio billing: %s",
+                    exc,
+                    exc_info=True,
+                )
+                yield error_sse(
+                    "GranSabio billing could not be finalized. "
+                    "The reserved amount remains protected for recovery."
+                )
                 return
 
         # --- 15. Yield final content chunks ---
@@ -1103,6 +1588,10 @@ async def generate_via_gransabio(
         yield f'data: {orjson.dumps({"content": content}).decode()}\n\n'
 
         # --- 16. Yield gransabio_complete summary ---
+        result_totals = (result_data.get("costs") or {}).get(
+            "grand_totals",
+            {},
+        )
         summary = {
             "gransabio_complete": {
                 "approved": True,
@@ -1114,8 +1603,14 @@ async def generate_via_gransabio(
                 "total_cost": api_cost,
                 "api_cost": api_cost,
                 # Read from result_data (top-level), fallback to grand_totals
-                "iterations_used": result_data.get("iterations_used", grand_totals.get("iterations")),
-                "final_score": result_data.get("final_score", grand_totals.get("final_score")),
+                "iterations_used": result_data.get(
+                    "iterations_used",
+                    result_totals.get("iterations"),
+                ),
+                "final_score": result_data.get(
+                    "final_score",
+                    result_totals.get("final_score"),
+                ),
             }
         }
         yield f'data: {orjson.dumps(summary).decode()}\n\n'
@@ -1133,11 +1628,63 @@ async def generate_via_gransabio(
         raise
 
     finally:
+        # A disconnect/stop can bypass the normal result loop after GranSabio
+        # has already incurred cost. Make one short terminal read; never poll or
+        # delay cleanup waiting for the remote pipeline.
+        if session_id and ai_reservation_id and not billing_usage_persisted:
+            try:
+                recovered_result = await _fetch_terminal_gransabio_result_once(
+                    client,
+                    gs_url,
+                    session_id,
+                )
+                if recovered_result and _gransabio_result_has_cost(
+                    recovered_result
+                ):
+                    billing_cost_observed = True
+                    recovered_usage = await _persist_gransabio_result_usage(
+                        recovered_result,
+                        reservation_id=ai_reservation_id,
+                        user_id=user_id,
+                        prompt_id=prompt_id,
+                        byok=byok,
+                        require_cost=False,
+                        idempotency_key=(
+                            f"gransabio:{session_id}:terminal"
+                            if session_id
+                            else None
+                        ),
+                    )
+                    billing_usage_persisted = bool(
+                        recovered_usage and recovered_usage.get("persisted")
+                    )
+                    await _settle_gransabio_result_usage(
+                        recovered_usage,
+                        reservation_id=ai_reservation_id,
+                        user_id=user_id,
+                        prompt_id=prompt_id,
+                    )
+            except Exception:
+                # Once /result disclosed cost, keep the active hold so stale
+                # reconciliation can settle its durable component.
+                logger.exception(
+                    "Could not recover terminal GranSabio billing for %s",
+                    session_id,
+                )
+
         # Clean up session and lock
         if session_id:
             await cleanup_session(conversation_id, redis_available)
         if lock_acquired:
             await release_gransabio_lock(conversation_id, lock_token, redis_available)
+        if ai_reservation_id and not billing_cost_observed:
+            try:
+                await refund_fixed_usage(ai_reservation_id)
+            except BillingReservationError:
+                logger.exception(
+                    "Could not release unfinished GranSabio reservation %s",
+                    ai_reservation_id,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1302,58 +1849,95 @@ async def process_gransabio_external(
             accumulated = []
             takeover_wd_config = prompt_ctx["takeover_watchdog_config"] or {}
             takeover_source = prompt_ctx.get("takeover_source", "post")
-
-            async for chunk in watchdog_takeover_response_requestfree(
-                directive=prompt_ctx["takeover_directive"] or "Redirect the conversation appropriately.",
-                watchdog_config=takeover_wd_config,
-                context_messages=ctx_with_current,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                prompt_id=prompt_id or 0,
-                original_prompt=prompt_ctx["original_prompt"],
-                user_level=prompt_ctx["user_level"],
-                source=takeover_source,
-            ):
-                if isinstance(chunk, str) and chunk.startswith("data: "):
-                    try:
-                        d = orjson.loads(chunk[6:].strip())
-                        c = d.get("content", "")
-                        if c:
-                            accumulated.append(c)
-                    except (orjson.JSONDecodeError, ValueError):
-                        pass
-
-            takeover_text = "".join(accumulated).strip()
-            if takeover_text:
-                # Resolve the actual watchdog LLM for proper DB attribution
-                from common import get_llm_info
-                wd_llm_id = takeover_wd_config.get("llm_id")
-                wd_llm = await get_llm_info(wd_llm_id) if wd_llm_id else None
-                wd_model = wd_llm["model"] if wd_llm else "watchdog-takeover"
-
-                # Persist and bill BEFORE delivering
-                db_result = await save_content_to_db(
-                    takeover_text, 0, 0, 0, conversation_id, user_id,
-                    wd_model, user_message=user_message,
-                    prompt_id=prompt_id, llm_id=wd_llm_id, byok=False,
-                )
-                if db_result and db_result[0]:
-                    await _deliver_to_platform(platform, platform_context, takeover_text)
-                else:
-                    await _send_platform_error(platform, platform_context,
-                        "Billing failed for watchdog response. Content not delivered.")
-                    return
-
-            # Finalize takeover (lock if needed, clean state, persist event)
+            takeover_billing = {}
             from tools.watchdog import _finalize_takeover
-            takeover_event_type = prompt_ctx.get("pending_hint_event_type", "security")
-            should_lock_gs = (prompt_ctx["action"] == "takeover_lock")
-            await _finalize_takeover(
-                conversation_id, prompt_id or 0, takeover_event_type,
-                prompt_ctx["takeover_directive"] or "",
-                channel="gransabio", should_lock=should_lock_gs,
-                locked_reason=f"WATCHDOG_{takeover_event_type.upper()}_TAKEOVER" if should_lock_gs else None,
+            takeover_event_type = prompt_ctx.get(
+                "pending_hint_event_type",
+                "security",
             )
+            should_lock_gs = prompt_ctx["action"] == "takeover_lock"
+            if should_lock_gs:
+                await _finalize_takeover(
+                    conversation_id,
+                    prompt_id or 0,
+                    takeover_event_type,
+                    prompt_ctx["takeover_directive"] or "",
+                    channel="gransabio",
+                    should_lock=True,
+                    locked_reason=(
+                        f"WATCHDOG_{takeover_event_type.upper()}_TAKEOVER"
+                    ),
+                )
+            try:
+                async for chunk in watchdog_takeover_response_requestfree(
+                    directive=prompt_ctx["takeover_directive"] or "Redirect the conversation appropriately.",
+                    watchdog_config=takeover_wd_config,
+                    context_messages=ctx_with_current,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    prompt_id=prompt_id or 0,
+                    original_prompt=prompt_ctx["original_prompt"],
+                    user_level=prompt_ctx["user_level"],
+                    source=takeover_source,
+                    billing_context=takeover_billing,
+                ):
+                    if isinstance(chunk, str) and chunk.startswith("data: "):
+                        try:
+                            d = orjson.loads(chunk[6:].strip())
+                            c = d.get("content", "")
+                            if c:
+                                accumulated.append(c)
+                        except (orjson.JSONDecodeError, ValueError):
+                            pass
+
+                takeover_text = "".join(accumulated).strip()
+                if takeover_text:
+                    # Resolve the actual watchdog LLM for proper DB attribution
+                    from common import get_llm_info
+                    wd_llm_id = takeover_wd_config.get("llm_id")
+                    wd_llm = await get_llm_info(wd_llm_id) if wd_llm_id else None
+                    wd_model = wd_llm["model"] if wd_llm else "watchdog-takeover"
+
+                    # Persist and bill BEFORE delivering
+                    db_result = await save_content_to_db(
+                        takeover_text,
+                        takeover_billing.get("input_tokens", 0),
+                        takeover_billing.get("output_tokens", 0),
+                        takeover_billing.get("input_tokens", 0)
+                        + takeover_billing.get("output_tokens", 0),
+                        conversation_id, user_id,
+                        wd_model, user_message=user_message,
+                        prompt_id=prompt_id, llm_id=wd_llm_id,
+                        byok=bool(takeover_billing.get("byok")),
+                        billing_reservation_id=takeover_billing.get("reservation_id"),
+                    )
+                    if db_result and db_result[0]:
+                        await _deliver_to_platform(platform, platform_context, takeover_text)
+                    else:
+                        await _send_platform_error(platform, platform_context,
+                            "Billing failed for watchdog response. Content not delivered.")
+                        return
+            finally:
+                takeover_reservation_id = takeover_billing.get("reservation_id")
+                if takeover_reservation_id:
+                    try:
+                        await refund_fixed_usage(takeover_reservation_id)
+                    except BillingReservationError:
+                        logger.exception(
+                            "Could not release unfinished external takeover reservation %s",
+                            takeover_reservation_id,
+                        )
+
+            if not should_lock_gs:
+                await _finalize_takeover(
+                    conversation_id,
+                    prompt_id or 0,
+                    takeover_event_type,
+                    prompt_ctx["takeover_directive"] or "",
+                    channel="gransabio",
+                    should_lock=False,
+                    locked_reason=None,
+                )
             return
 
         # Normal flow: extract assembled prompt fields

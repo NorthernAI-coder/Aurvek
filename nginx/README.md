@@ -92,7 +92,7 @@ Replace these placeholders with your actual values:
 
 | Placeholder | Description | Example |
 |------------|-------------|---------|
-| `{{AURVEK_ROOT}}` | AURVEK installation directory | `/var/www/aurvek` or `D:/AcertingAI/AURVEK` |
+| `{{AURVEK_ROOT}}` | AURVEK installation directory | `/var/www/aurvek` or `D:/apps/AURVEK` |
 | `{{FASTAPI_PORT}}` | FastAPI port | `7789` |
 | `{{SSL_CERT}}` | Path to SSL certificate | `/etc/letsencrypt/live/domain/fullchain.pem` |
 | `{{SSL_KEY}}` | Path to SSL private key | `/etc/letsencrypt/live/domain/privkey.pem` |
@@ -132,6 +132,14 @@ Set these in your `.env` file:
 # Primary application domain (skip DB lookup for this domain)
 PRIMARY_APP_DOMAIN=yourdomain.com
 
+# Production refuses to start with insecure authentication cookies
+ENVIRONMENT=production
+SECURE_COOKIES=true
+
+# Separate registrable domain for creator-authored HTML/JS (required for
+# prompt/pack landings, previews, and custom welcome pages)
+CREATOR_CONTENT_ORIGIN=https://pages.yourdomain-content.com
+
 # Custom domain pricing
 CUSTOM_DOMAIN_PRICE=25.00
 
@@ -144,6 +152,22 @@ CLOUDFLARE_FOR_IMAGES=true
 CLOUDFLARE_BASE_URL=https://cdn.yourdomain.com/
 CLOUDFLARE_SECRET=your-hmac-secret
 ```
+
+The creator-content hostname must resolve to the custom-domain catch-all
+server. It must not be a subdomain or sibling subdomain of the primary
+application site. See `docs/MARKETPLACE_CREATOR_ISOLATION.md` for the route
+allowlist and wizard sandbox requirements.
+
+The supplied server blocks redirect direct HTTP requests with status 308 and
+honour `X-Forwarded-Proto: https` only when the connection comes from loopback
+or a configured Cloudflare range. Keep `rate_limiting.conf` included at the
+`http` level so those maps and trusted-proxy checks are active.
+
+HSTS is enabled for the exact Aurvek-owned application, CDN, and
+creator-content hosts. `includeSubDomains` remains disabled until every
+subdomain has been audited for permanent HTTPS support.
+It is intentionally not emitted by the custom-domain catch-all, because a
+browser would retain that policy after a customer disconnects their domain.
 
 ## Auth Flow
 

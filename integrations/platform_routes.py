@@ -10,6 +10,10 @@ from integrations.conversations import (
     mutate_external_platforms,
     set_external_conversation,
 )
+from integrations.devices.service import (
+    conversation_has_external_device_bindings,
+    get_conversation_binding_summaries,
+)
 from integrations.platforms import validate_platform
 from models import User
 
@@ -39,6 +43,18 @@ async def update_external_platform(
     platform_conversation = None
 
     if action == "add":
+        if await conversation_has_external_device_bindings(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+        ):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "error": "external_devices_attached",
+                    "message": "Remove external device access before assigning this conversation to WhatsApp or Telegram.",
+                },
+            )
         result = await set_external_conversation(
             current_user.id,
             conversation_id,
@@ -123,6 +139,11 @@ async def update_external_platform(
             )
             platform_conversation = await cursor.fetchone()
 
+    binding_summaries = await get_conversation_binding_summaries(
+        current_user.id,
+        [conv[0] for conv in visible_conversations if not conv[4]],
+    )
+
     updated_conversations = [
         {
             "id": conv[0],
@@ -131,6 +152,7 @@ async def update_external_platform(
             "chat_name": conv[3],
             "external_platform": conv[4],
             "last_activity": conv[5],
+            "external_bindings": None if conv[4] else binding_summaries.get(int(conv[0])),
         }
         for conv in visible_conversations
     ]
@@ -146,6 +168,7 @@ async def update_external_platform(
                 "chat_name": platform_conversation[3],
                 "external_platform": platform_conversation[4],
                 "last_activity": platform_conversation[5],
+                "external_bindings": None,
             }
         )
 

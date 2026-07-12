@@ -1,3 +1,4 @@
+import json
 import os
 from html import escape
 
@@ -5,6 +6,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 
 from common import slugify
 from database import get_db_connection
+from marketplace.landing.isolation import primary_app_url
 
 
 LANDING_RELATED_LINKS_ENABLED = os.getenv("LANDING_RELATED_LINKS_ENABLED", "1") == "1"
@@ -155,6 +157,9 @@ def inject_prompt_landing_analytics(html_content: str, prompt_id: int, *, is_pre
     if is_preview or "_aurvek_analytics_loaded" in html_content:
         return html_content
 
+    prompt_id = int(prompt_id)
+    purchase_url = primary_app_url(f"/purchase/prompt/{prompt_id}") or ""
+    purchase_url_json = json.dumps(purchase_url)
     tracking_script = f'''
 <!-- Aurvek Analytics Tracking -->
 <script>
@@ -163,7 +168,8 @@ def inject_prompt_landing_analytics(html_content: str, prompt_id: int, *, is_pre
     window._aurvek_analytics_loaded = true;
     fetch('/api/analytics/track-visit', {{
         method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
+        mode: 'no-cors',
+        headers: {{'Content-Type': 'text/plain;charset=UTF-8'}},
         body: JSON.stringify({{
             prompt_id: {prompt_id},
             page_path: window.location.pathname,
@@ -174,17 +180,19 @@ def inject_prompt_landing_analytics(html_content: str, prompt_id: int, *, is_pre
 }})();
 window.AurvekPurchase = function(promptId) {{
     if (!promptId) promptId = {prompt_id};
-    fetch('/api/prompts/' + promptId + '/purchase', {{
-        method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
-        credentials: 'include'
-    }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
-        if (data.checkout_url) window.location = data.checkout_url;
-        else if (data.free_purchase) window.location = '/chat';
-        else if (data.redirect) window.location = data.redirect;
-        else if (data.message) alert(data.message);
-        else if (data.detail) alert(data.detail);
-    }}).catch(function(e) {{ console.error('Purchase error:', e); }});
+    var purchaseUrl = {purchase_url_json};
+    if (!purchaseUrl || Number(promptId) !== {prompt_id}) {{
+        console.error('Purchase is unavailable for this landing page.');
+        return;
+    }}
+    if (window.parent && window.parent !== window) {{
+        window.parent.postMessage({{
+            type: 'aurvek-purchase-request',
+            promptId: {prompt_id}
+        }}, '*');
+        return;
+    }}
+    window.location.assign(purchaseUrl);
 }};
 </script>
 '''
@@ -201,6 +209,9 @@ def inject_custom_domain_analytics(html_content: str, prompt_id: int) -> str:
     if "_aurvek_analytics_loaded" in html_content:
         return html_content
 
+    prompt_id = int(prompt_id)
+    purchase_url = primary_app_url(f"/purchase/prompt/{prompt_id}") or ""
+    purchase_url_json = json.dumps(purchase_url)
     tracking_script = f'''
 <!-- Aurvek Analytics Tracking -->
 <script>
@@ -209,7 +220,8 @@ def inject_custom_domain_analytics(html_content: str, prompt_id: int) -> str:
     window._aurvek_analytics_loaded = true;
     fetch('/api/analytics/track-visit', {{
         method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
+        mode: 'no-cors',
+        headers: {{'Content-Type': 'text/plain;charset=UTF-8'}},
         body: JSON.stringify({{
             prompt_id: {prompt_id},
             page_path: window.location.pathname,
@@ -218,6 +230,22 @@ def inject_custom_domain_analytics(html_content: str, prompt_id: int) -> str:
         credentials: 'include'
     }}).catch(function(e) {{ console.log('Analytics:', e); }});
 }})();
+window.AurvekPurchase = function(promptId) {{
+    if (!promptId) promptId = {prompt_id};
+    var purchaseUrl = {purchase_url_json};
+    if (!purchaseUrl || Number(promptId) !== {prompt_id}) {{
+        console.error('Purchase is unavailable for this landing page.');
+        return;
+    }}
+    if (window.parent && window.parent !== window) {{
+        window.parent.postMessage({{
+            type: 'aurvek-purchase-request',
+            promptId: {prompt_id}
+        }}, '*');
+        return;
+    }}
+    window.location.assign(purchaseUrl);
+}};
 </script>
 '''
     if "</body>" in html_content.lower():

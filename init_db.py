@@ -95,6 +95,16 @@ def init_db():
             conn.execute("INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES ('geo_global_cf_rule_id', '')")
             conn.execute("INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value) VALUES ('geo_landing_cf_rule_ids', '[]')")
 
+            # Seed SYSTEM_CONFIG with storage-quota default (30 GB binary; 0 = unlimited)
+            conn.execute(
+                "INSERT OR IGNORE INTO SYSTEM_CONFIG (key, value, description) VALUES (?, ?, ?)",
+                (
+                    'storage_quota_default_bytes',
+                    '32212254720',
+                    'Default per-user storage quota in bytes (0 = unlimited)',
+                ),
+            )
+
             # Seed SYSTEM_CONFIG with GranSabio defaults
             gransabio_defaults = [
                 ("gransabio_enabled", "false"),

@@ -6,7 +6,9 @@ async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, 
                               pdf_error_metadata=None,
                               prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                               llm_id=None, save_to_db: bool = True, web_search_mode=None, byok: bool = False, api_model=None,
-                              pending_attachment_refs: Optional[list[str]] = None):
+                              pending_attachment_refs: Optional[list[str]] = None,
+                              strip_device_action_blocks: bool = False,
+                              billing_reservation_id: str | None = None):
     """
     Call OpenRouter unified API - 100% OpenAI compatible.
 
@@ -68,5 +70,7 @@ async def call_openrouter_api(messages, model, temperature, max_tokens, prompt, 
         byok=byok,
         api_model=api_model,
         pending_attachment_refs=pending_attachment_refs,
+        strip_device_action_blocks=strip_device_action_blocks,
+        billing_reservation_id=billing_reservation_id,
     ):
         yield chunk

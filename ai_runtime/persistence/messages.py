@@ -1,15 +1,43 @@
+import re
+
 from ai_runtime.dependencies import *
 from ai_runtime.memory.recording import _record_memory_turn_best_effort
-from ai_runtime.config import model_token_cost_cache
 from ai_runtime.multi_ai.errors import MultiAiBillingError
+from billing.usage_reservations import (
+    BillingReservationError,
+    complete_ai_reservation_settlement,
+    prepare_ai_reservation_settlement,
+    settle_fixed_usage_in_transaction,
+)
 
 _get_post_watchdog_config = extract_post_watchdog_config
+
+AURVEK_ACTION_BLOCK_RE = re.compile(
+    r"(?:\[AURVEK_ACTIONS\].*?\[/AURVEK_ACTIONS\]|```aurvek-actions\s*.*?```)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def strip_aurvek_action_blocks(content: str | None) -> str:
+    clean = AURVEK_ACTION_BLOCK_RE.sub("", str(content or "")).strip()
+    return clean or "[Structured device action returned]"
+
+
+def assistant_content_for_storage(content, *, strip_device_action_blocks: bool = False):
+    if strip_device_action_blocks:
+        return strip_aurvek_action_blocks(content)
+    return content
+
 
 async def save_content_to_db(content, input_tokens, output_tokens, total_tokens, conversation_id, user_id, model, user_message=None,
                              input_token_fallback=None,
                              prompt_id=None, watchdog_config=None, watchdog_hint_active=False, watchdog_hint_eval_id=None,
                              llm_id=None, citations_json=None, byok=False, override_api_cost=None,
-                             pending_attachment_refs: Optional[list[str]] = None):
+                             pending_attachment_refs: Optional[list[str]] = None,
+                             strip_device_action_blocks: bool = False,
+                             billing_reservation_id: str | None = None,
+                             billing_only_accumulated_usage: bool = False,
+                             fixed_billing_reservation_id: str | None = None):
     # logger.info(f"Complete AI message:\n {content}")  # Commented to avoid encoding issues with emojis
     logger.info(f"Tokens usados:\ninput_tokens: {input_tokens}\noutput_tokens: {output_tokens}\ntotal_tokens: {total_tokens}")
 
@@ -52,16 +80,28 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     )
                     # Providers generally report prompt tokens including the user message.
                     # Use reported tokens when available; only fallback when missing/zero.
-                    billable_input_tokens = (
+                    billable_input_tokens = 0 if billing_only_accumulated_usage else (
                         reported_input_tokens
                         if reported_input_tokens > 0
                         else fallback_input_tokens
                     )
                     reported_output_tokens = int(output_tokens or 0)
-                    billable_output_tokens = (
+                    billable_output_tokens = 0 if billing_only_accumulated_usage else (
                         reported_output_tokens
                         if reported_output_tokens > 0
                         else estimate_message_tokens(content)
+                    )
+                    ai_credit = await prepare_ai_reservation_settlement(
+                        conn,
+                        reservation_id=billing_reservation_id,
+                        user_id=user_id,
+                    )
+                    if ai_credit is not None:
+                        billable_input_tokens += ai_credit.accumulated_input_tokens
+                        billable_output_tokens += ai_credit.accumulated_output_tokens
+                    stored_assistant_content = assistant_content_for_storage(
+                        content,
+                        strip_device_action_blocks=strip_device_action_blocks,
                     )
 
                     user_message_id = None
@@ -94,7 +134,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                     '''
                     cursor = await conn.execute(
                         bot_insert_query,
-                        (conversation_id, user_id, content, 'bot', billable_input_tokens, billable_output_tokens, current_time, llm_id, citations_json)
+                        (conversation_id, user_id, stored_assistant_content, 'bot', billable_input_tokens, billable_output_tokens, current_time, llm_id, citations_json)
                     )
                     row = await cursor.fetchone()
                     message_id = row[0] if row else None
@@ -103,22 +143,17 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         normalized_llm_id = int(llm_id) if llm_id is not None and int(llm_id) > 0 else None
                     except (TypeError, ValueError):
                         normalized_llm_id = None
-                    cache_key = ("llm_id", normalized_llm_id) if normalized_llm_id is not None else ("legacy_model", model)
-                    if cache_key in model_token_cost_cache:
-                        input_token_cost_per_million, output_token_cost_per_million = model_token_cost_cache[cache_key]
+                    if normalized_llm_id is not None:
+                        cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE id = ?'
+                        cursor = await conn.execute(cost_query, (normalized_llm_id,))
                     else:
-                        if normalized_llm_id is not None:
-                            cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE id = ?'
-                            cursor = await conn.execute(cost_query, (normalized_llm_id,))
-                        else:
-                            cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?'
-                            cursor = await conn.execute(cost_query, (model,))
-                        token_cost_row = await cursor.fetchone()
-                        if token_cost_row:
-                            input_token_cost_per_million, output_token_cost_per_million = token_cost_row
-                            model_token_cost_cache[cache_key] = (input_token_cost_per_million, output_token_cost_per_million)
-                        else:
-                            input_token_cost_per_million, output_token_cost_per_million = 0, 0
+                        cost_query = 'SELECT input_token_cost, output_token_cost FROM LLM WHERE model = ?'
+                        cursor = await conn.execute(cost_query, (model,))
+                    token_cost_row = await cursor.fetchone()
+                    if token_cost_row:
+                        input_token_cost_per_million, output_token_cost_per_million = token_cost_row
+                    else:
+                        input_token_cost_per_million, output_token_cost_per_million = 0, 0
 
                     # Get prompt_id from conversation (role_id in CONVERSATIONS is the prompt_id)
                     if prompt_id is None:
@@ -138,11 +173,25 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                         prompt_id=prompt_id,
                         byok=byok,
                         override_api_cost=override_api_cost,
+                        billing_account_id_override=(
+                            ai_credit.billing_account_id if ai_credit else None
+                        ),
                     )
                     if not billing_ok:
                         await conn.rollback()
                         await discard_pending_attachments(pending_attachment_refs, "billing_failed")
                         return (None, None)
+                    await complete_ai_reservation_settlement(conn, ai_credit)
+                    if fixed_billing_reservation_id:
+                        fixed_settled = await settle_fixed_usage_in_transaction(
+                            conn,
+                            fixed_billing_reservation_id,
+                            expected_user_id=user_id,
+                        )
+                        if not fixed_settled:
+                            raise BillingReservationError(
+                                "Fixed media billing reservation is not active"
+                            )
 
                     # Update conversation last_activity for sort ordering
                     await conn.execute("UPDATE CONVERSATIONS SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))
@@ -182,7 +231,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                             user_id=user_id,
                             conversation_id=conversation_id,
                             user_content=user_message,
-                            assistant_content=content,
+                            assistant_content=stored_assistant_content,
                             prompt_id=prompt_id,
                             user_message_id=user_message_id,
                             assistant_message_id=message_id,
@@ -195,7 +244,7 @@ async def save_content_to_db(content, input_tokens, output_tokens, total_tokens,
                             user_id=user_id,
                             conversation_id=conversation_id,
                             user_message=user_message,
-                            assistant_message=content,
+                            assistant_message=stored_assistant_content,
                         )
                     except Exception:
                         logger.warning(
@@ -266,6 +315,7 @@ async def save_multi_ai_to_db(
     watchdog_hint_eval_id: Optional[int] = None,
     byok_models: set = None,
     incognito: bool = False,
+    billing_reservation_id: str | None = None,
 ) -> tuple:
     """Save Multi-AI response as a single bot message. Bill each model separately.
 
@@ -309,12 +359,18 @@ async def save_multi_ai_to_db(
                     bot_row = await cursor.fetchone()
                     bot_msg_id = bot_row[0] if bot_row else None
 
+                    ai_credit = await prepare_ai_reservation_settlement(
+                        conn,
+                        reservation_id=billing_reservation_id,
+                        user_id=user_id,
+                    )
+
                     # Bill each model separately
                     _byok_set = byok_models or set()
                     for llm_id in model_ids:
                         r = results[llm_id]
-                        if r.get("error"):
-                            continue  # Skip billing for errored models
+                        if r.get("error") and not r.get("billable_usage"):
+                            continue
 
                         model_name = r["model"]
                         input_cost, output_cost = await get_llm_token_costs(conn=conn, llm_id=llm_id)
@@ -342,11 +398,16 @@ async def save_multi_ai_to_db(
                             cursor,
                             prompt_id=prompt_id,
                             byok=llm_id in _byok_set,
+                            billing_account_id_override=(
+                                ai_credit.billing_account_id if ai_credit else None
+                            ),
                         )
                         if not bill_result:
                             raise MultiAiBillingError(
                                 f"Billing failed for user={user_id} model={model_name}"
                             )
+
+                    await complete_ai_reservation_settlement(conn, ai_credit)
 
                     # Update conversation last_activity for sort ordering
                     await conn.execute("UPDATE CONVERSATIONS SET last_activity = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))

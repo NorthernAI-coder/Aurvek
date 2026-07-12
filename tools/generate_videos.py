@@ -7,7 +7,9 @@ import aiohttp
 import dramatiq
 import time
 import re
+import secrets
 import base64
+from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from fastapi.responses import JSONResponse
@@ -20,10 +22,27 @@ from common import estimate_message_tokens, Cost
 from models import User, ConnectionManager
 from integrations.conversations import is_whatsapp_conversation
 from tools import register_tool, register_dramatiq_task, register_function_handler
+from tools.delivery_ack import publish_result_with_ack
+from database import get_db_connection
+from storage_quota import (
+    StorageQuotaExceededError,
+    delete_generated_file_rows,
+    ensure_generation_headroom,
+    record_generated_file,
+)
 from save_images import save_image_locally, generate_img_token, resize_image
 from auth import hash_password, verify_password, get_user_by_username, get_current_user, create_access_token, get_user_by_id, get_user_from_phone_number
 from auth import get_current_user_from_websocket, get_user_id_from_conversation, get_user_by_token, create_user_info, create_login_response, generate_magic_link
 from common import Cost, generate_user_hash, has_sufficient_balance, cost_tts, cache_directory, users_directory, elevenlabs_key, openai_key, tts_engine, get_balance, deduct_balance, record_daily_usage, load_service_costs, ALGORITHM, estimate_message_tokens, CLOUDFLARE_BASE_URL, MEDIA_TOKEN_EXPIRE_HOURS
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    claim_fixed_usage_provider,
+    mark_fixed_usage_provider_succeeded,
+    refund_fixed_usage,
+    reserve_fixed_usage,
+    settle_fixed_usage,
+)
 
 load_dotenv()
 
@@ -35,8 +54,33 @@ VIDEO_GENERATION_TIMEOUT = int(os.getenv('VIDEO_GENERATION_TIMEOUT', 600))  # Ti
 # Available models (Gemini API):
 #   - veo-3.1-fast-generate-preview (fast, good for most use cases)
 #   - veo-3.1-generate-preview (best quality, slower)
-#   - veo-2.0-generate-001 (stable, older)
+#   - veo-3.1-lite-generate-preview (lowest-cost VEO 3.1 variant)
 VEO_MODEL = os.getenv('VEO_MODEL', 'veo-3.1-fast-generate-preview')
+VEO_DURATION_SECONDS = 8
+VEO_RESOLUTION = '720p'
+
+
+def _video_billing_service_name() -> str:
+    """Resolve a SERVICES name for the concrete VEO model and output plan."""
+    if VIDEO_GENERATION_ENGINE != 'veo-3':
+        return f'VIDEO-{VIDEO_GENERATION_ENGINE.upper()}'
+    normalized_model = VEO_MODEL.lower()
+    if 'veo-3.1' in normalized_model and 'lite' in normalized_model:
+        return 'VIDEO-VEO-3.1-LITE-8S-720P'
+    if 'veo-3.1' in normalized_model and 'fast' in normalized_model:
+        return 'VIDEO-VEO-3.1-FAST-8S-720P'
+    if 'veo-3.1' in normalized_model:
+        return 'VIDEO-VEO-3.1-STANDARD-8S-720P'
+    model_component = re.sub(r'[^A-Z0-9]+', '-', VEO_MODEL.upper()).strip('-')
+    return f'VIDEO-{model_component}-8S-720P'
+
+
+async def _publish_video_event(channel_name: str, payload) -> None:
+    """Treat progress/error delivery as best effort, never as provider state."""
+    try:
+        await redis_client.publish(channel_name, payload)
+    except Exception as exc:
+        print(f"WARNING: Could not publish video event: {exc}")
 
 async def generate_video_veo3(prompt: str, aspect_ratio: str = "16:9", negative_prompt: str = None) -> tuple:
     """Generate video using Google's VEO-3 model with official google-genai library"""
@@ -55,6 +99,9 @@ async def generate_video_veo3(prompt: str, aspect_ratio: str = "16:9", negative_
         config_params = {}
         if negative_prompt:
             config_params["negative_prompt"] = negative_prompt
+        config_params["aspect_ratio"] = aspect_ratio
+        config_params["duration_seconds"] = VEO_DURATION_SECONDS
+        config_params["resolution"] = VEO_RESOLUTION
             
         config = types.GenerateVideosConfig(**config_params)
         
@@ -135,6 +182,7 @@ async def generate_video(prompt: str) -> tuple:
 
 async def save_video_locally(video_data, filename, user, conversation_id, source="bot", format="mp4"):
     """Save video file locally using the same structure as images"""
+    file_path = None
     try:
         # Use the same directory structure as images
         from common import users_directory
@@ -151,18 +199,24 @@ async def save_video_locally(video_data, filename, user, conversation_id, source
         file_location = os.path.join(users_directory, hash_prefix1, hash_prefix2, user_hash, "files", conversation_id_prefix1, conversation_id_prefix2, "video", source)
         
         # Create the directory if it doesn't exist
-        if not os.path.exists(file_location):
-            os.makedirs(file_location)
+        os.makedirs(file_location, exist_ok=True)
         
-        # Generate filename with timestamp
-        timestamp = int(time.time())
-        base_filename = f"{filename}_{timestamp}"
+        base_filename = filename
         
         # Save the video file
         file_path = os.path.join(file_location, f"{base_filename}.{format}")
         with open(file_path, 'wb') as f:
             f.write(video_data)
-        
+
+        # Ledger the generated video so it counts against the owner's storage
+        # quota (one row per file on disk). Fail fast: the file is written first,
+        # then ledgered immediately after -- if the ledger insert fails, the
+        # except block below removes the file and re-raises, so an unaccounted
+        # artifact never exists.
+        async with get_db_connection() as conn:
+            await record_generated_file(conn, conversation_id, 'video', file_path, len(video_data))
+            await conn.commit()
+
         # Generate video path (same structure as images)
         video_path = f"users/{hash_prefix1}/{hash_prefix2}/{user_hash}/files/{conversation_id_prefix1}/{conversation_id_prefix2}/video/{source}/{base_filename}.{format}"
         
@@ -173,18 +227,45 @@ async def save_video_locally(video_data, filename, user, conversation_id, source
         print(f"Video saved: {file_path}")
         print(f"Video URL: {token_url}")
         
-        return base_url, token_url
+        return base_url, token_url, file_path
         
     except Exception as e:
+        if file_path:
+            try:
+                os.remove(file_path)
+            except FileNotFoundError:
+                pass
         print(f"Error saving video: {e}")
         raise e
 
-async def generate_video_task(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str):
+
+async def _delete_generated_video(file_path: str) -> None:
+    media_root = Path(users_directory).resolve()
+    resolved_path = Path(file_path).resolve()
+    if not resolved_path.is_relative_to(media_root):
+        raise ValueError("Refusing to delete video outside the user media root")
+    await asyncio.to_thread(resolved_path.unlink, missing_ok=True)
+    # Drop the ledger row together with the file so a refunded video stops
+    # counting against the owner's storage quota.
+    async with get_db_connection() as conn:
+        await delete_generated_file_rows(conn, [str(resolved_path)])
+        await conn.commit()
+
+
+async def generate_video_task(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str, reservation_id: str):
+    saved_video_path = None
+    provider_succeeded = False
     try:
         print("Entering generate_video_task")
+        if not await claim_fixed_usage_provider(
+            reservation_id,
+            purpose="video",
+            user_id=user_id,
+        ):
+            return
         
         # Send initial status update
-        await redis_client.publish(channel_name, orjson.dumps({
+        await _publish_video_event(channel_name, orjson.dumps({
             'progress_update': 'Starting video generation...'
         }).decode())
         
@@ -196,7 +277,10 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
             client = genai.Client(api_key=GEMINI_API_KEY)
             generation_prompt = f"Create a high-quality 8-second video: {prompt}"
             
-            config = types.GenerateVideosConfig()
+            config = types.GenerateVideosConfig(
+                duration_seconds=VEO_DURATION_SECONDS,
+                resolution=VEO_RESOLUTION,
+            )
             
             print(f"Starting VEO-3 video generation with prompt: {generation_prompt}")
             
@@ -207,7 +291,7 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
                 config=config
             )
             
-            await redis_client.publish(channel_name, orjson.dumps({
+            await _publish_video_event(channel_name, orjson.dumps({
                 'progress_update': 'Video generation started'
             }).decode())
             
@@ -225,7 +309,7 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
                 
                 # Send progress update to chat
                 progress_msg = f"Generating video... {elapsed_time}s elapsed (up to 6min)"
-                await redis_client.publish(channel_name, orjson.dumps({
+                await _publish_video_event(channel_name, orjson.dumps({
                     'progress_update': progress_msg
                 }).decode())
                 
@@ -237,6 +321,19 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
             # Get the generated video
             if hasattr(operation, 'result') and hasattr(operation.result, 'generated_videos'):
                 generated_video = operation.result.generated_videos[0]
+                provider_succeeded = True
+                if not await mark_fixed_usage_provider_succeeded(
+                    reservation_id,
+                    purpose="video",
+                    user_id=user_id,
+                ):
+                    raise BillingReservationError(
+                        "Video billing reservation is no longer active"
+                    )
+                if not await settle_fixed_usage(reservation_id):
+                    raise BillingReservationError(
+                        "Video billing reservation is no longer active"
+                    )
                 video_file = generated_video.video
                 video_data = client.files.download(file=video_file)
                 mime_type = "video/mp4"
@@ -248,17 +345,17 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
         except Exception as e:
             raise Exception(f"VEO-3 generation failed: {str(e)}")
         
-        filename = f"generated_video_{conversation_id}_{int(time.time())}"
+        filename = f"generated_video_{secrets.token_hex(24)}"
         source = "bot"
         format = "mp4"
 
         user = await get_user_by_id(user_id)
 
-        await redis_client.publish(channel_name, orjson.dumps({
+        await _publish_video_event(channel_name, orjson.dumps({
             'progress_update': 'Saving video...'
         }).decode())
 
-        video_link_base, video_link_token = await save_video_locally(
+        video_link_base, video_link_token, saved_video_path = await save_video_locally(
             video_data=video_data,
             filename=filename,
             user=user,
@@ -297,44 +394,101 @@ async def generate_video_task(channel_name: str, prompt: str, conversation_id: i
             }
         ]).decode()
 
-        await redis_client.publish(channel_name, orjson.dumps({
-            'content_to_show': content_to_show,
-            'content_to_save': content_to_save
-        }).decode())
-        
-        await redis_client.publish(channel_name, 'END')
-        
+        await publish_result_with_ack(
+            redis_client,
+            channel_name=channel_name,
+            payload={
+                'content_to_show': content_to_show,
+                'content_to_save': content_to_save,
+            },
+            reservation_id=reservation_id,
+        )
+
     except Exception as e:
         print(f"Error in generate_video_task: {e}")
-        await redis_client.publish(channel_name, orjson.dumps({'error': str(e)}).decode())
-        await redis_client.publish(channel_name, 'END')
+        refunded = False
+        if not provider_succeeded:
+            try:
+                refunded = await refund_fixed_usage(reservation_id)
+            except BillingReservationError:
+                print(f"WARNING: Failed to refund video reservation {reservation_id}")
+        if refunded and saved_video_path and not provider_succeeded:
+            try:
+                await _delete_generated_video(saved_video_path)
+            except Exception as cleanup_error:
+                print(
+                    "WARNING: Failed to remove refunded video "
+                    f"{saved_video_path}: {cleanup_error}"
+                )
+        await _publish_video_event(
+            channel_name,
+            orjson.dumps({'error': str(e)}).decode(),
+        )
+        await _publish_video_event(channel_name, 'END')
 
-@dramatiq.actor
-def generate_video_task_actor(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str):
-    asyncio.run(generate_video_task(channel_name, prompt, conversation_id, user_id, is_whatsapp, request_url))
+@dramatiq.actor(max_retries=0, max_age=None, time_limit=600_000)
+def generate_video_task_actor(channel_name: str, prompt: str, conversation_id: int, user_id: int, is_whatsapp: bool, request_url: str, reservation_id: str):
+    asyncio.run(generate_video_task(channel_name, prompt, conversation_id, user_id, is_whatsapp, request_url, reservation_id))
 
 async def handle_generate_video(function_arguments, messages, model, temperature, max_tokens, content, conversation_id, current_user, request, input_tokens, output_tokens, total_tokens, message_id, user_id, client, prompt, user_message=None):
+    reservation_id = None
+    reservation_handed_off = False
     try:
         print("Entering handle_generate_video")
+        if (
+            current_user is None
+            or int(getattr(current_user, "id", -1)) != int(user_id)
+            or not bool(getattr(current_user, "can_generate_images", False))
+        ):
+            yield f"data: {orjson.dumps({'content': 'Video generation is not enabled for this account.', 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
+            return
         video_prompt = function_arguments['prompt']
-        channel_name = f"generate_video_response_{conversation_id}_{user_id}_{int(time.time())}"
+        channel_name = (
+            f"generate_video_response_{conversation_id}_{user_id}_"
+            f"{secrets.token_urlsafe(12)}"
+        )
         
         is_whatsapp = await is_whatsapp_conversation(conversation_id)
         request_url = str(request.url)
-        
-        # Video generation costs more than images
-        video_cost = Cost.IMAGE_GENERATION_COST * 10  # Adjust cost as needed
-        
-        if not await has_sufficient_balance(user_id, video_cost):
-            yield f"data: {orjson.dumps({'content': 'Insufficient balance to generate video.', 'save_to_db': True, 'yield': True}).decode()}\n\n"
+
+        # Storage-quota soft pre-check: a generation may START only while the
+        # owner is strictly under quota. Runs BEFORE any billing reservation so
+        # we never charge for an operation the quota check then kills. The
+        # requester is verified to be the conversation owner (user_id) above.
+        try:
+            async with get_db_connection(readonly=True) as quota_conn:
+                await ensure_generation_headroom(quota_conn, user_id)
+        except StorageQuotaExceededError as quota_exc:
+            yield f"data: {orjson.dumps({'content': quota_exc.message, 'save_to_db': True, 'yield': True, 'is_error': True}).decode()}\n\n"
             return
 
-        generate_video_task_actor.send(channel_name, video_prompt, conversation_id, user_id, is_whatsapp, request_url)
-        
-        yield f"data: {orjson.dumps({'content': 'Generating video... This may take up to 6 minutes.', 'save_to_db': False, 'yield': True}).decode()}\n\n"
-        
+        video_service_name = _video_billing_service_name()
+        video_cost, video_service_id = Cost.get_media_generation_service(
+            video_service_name
+        )
+        reservation_id = await reserve_fixed_usage(
+            user_id=user_id,
+            purpose="video",
+            amount=video_cost,
+            service_id=video_service_id,
+            usage_quantity=1,
+        )
+
         async with redis_client.pubsub() as pubsub:
             await pubsub.subscribe(channel_name)
+            generate_video_task_actor.send(
+                channel_name,
+                video_prompt,
+                conversation_id,
+                user_id,
+                is_whatsapp,
+                request_url,
+                reservation_id,
+            )
+            reservation_handed_off = True
+
+            yield f"data: {orjson.dumps({'content': 'Generating video... This may take up to 6 minutes.', 'save_to_db': False, 'yield': True}).decode()}\n\n"
+
             start_time = time.time()
             while True:
                 if time.time() - start_time > VIDEO_GENERATION_TIMEOUT:
@@ -356,24 +510,24 @@ async def handle_generate_video(function_arguments, messages, model, temperature
                         yield f"data: {orjson.dumps({'content': json_data['progress_update'], 'save_to_db': False, 'yield': True, 'replace_last': True}).decode()}\n\n"
                     elif 'content_to_show' in json_data and 'content_to_save' in json_data:
                         # Send video as separate type for proper rendering
-                        yield f"data: {orjson.dumps({'video_content': json_data['content_to_show'], 'save_to_db': False, 'yield': True}).decode()}\n\n"
-                        yield f"data: {orjson.dumps({'content': json_data['content_to_save'], 'save_to_db': True, 'yield': False}).decode()}\n\n"
+                        yield f"data: {orjson.dumps({'video_content': json_data['content_to_show'], 'save_to_db': False, 'yield': True, '_delivery_ack': json_data.get('_delivery_ack')}).decode()}\n\n"
+                        yield f"data: {orjson.dumps({'content': json_data['content_to_save'], 'save_to_db': True, 'yield': False, '_delivery_ack': json_data.get('_delivery_ack')}).decode()}\n\n"
                 else:
                     await asyncio.sleep(0.1)
         
-        deducted = await deduct_balance(user_id, video_cost)
-        if not deducted:
-            print(f"WARNING: Failed to deduct video generation cost for user {user_id} - insufficient balance")
-        await record_daily_usage(
-            user_id=user_id,
-            usage_type='video',
-            cost=video_cost,
-            units=1
-        )
-
+    except InsufficientBalanceError:
+        yield f"data: {orjson.dumps({'content': 'Insufficient balance to generate video.', 'save_to_db': True, 'yield': True}).decode()}\n\n"
+    except BillingReservationError:
+        yield f"data: {orjson.dumps({'content': 'Video billing is temporarily unavailable.', 'save_to_db': True, 'yield': True}).decode()}\n\n"
     except Exception as e:
         print(f"Error in handle_generate_video: {e}")
         yield f"data: {orjson.dumps({'content': f'Error generating video: {str(e)}', 'save_to_db': True, 'yield': True}).decode()}\n\n"
+    finally:
+        if reservation_id and not reservation_handed_off:
+            try:
+                await refund_fixed_usage(reservation_id)
+            except BillingReservationError:
+                print(f"WARNING: Failed to refund video reservation {reservation_id}")
 
 # Register the tool for semantic router
 register_tool({

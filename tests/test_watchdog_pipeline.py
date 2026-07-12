@@ -24,6 +24,7 @@ from tests.conftest import (
     seed_prompt,
 )
 from tools.llm_caller import LLMCallResult
+from billing.usage_reservations import InsufficientBalanceError
 from tools.watchdog import (
     _clear_stale_hint,
     _count_user_turns,
@@ -155,6 +156,79 @@ class TestReadRecentMessages:
 
 @pytest.mark.asyncio
 class TestRunWatchdogEvaluation:
+
+    @_mock_redis_publish
+    async def test_billing_is_reserved_before_provider_and_settled_before_event(
+        self, mock_redis, db_path, mock_db, monkeypatch
+    ):
+        seed_llm(db_path)
+        seed_prompt(db_path, watchdog_config=_make_watchdog_config(frequency=1))
+        seed_conversation(db_path)
+        ids = seed_messages(db_path, count=2)
+        order = []
+
+        async def reserve(**kwargs):
+            order.append("reserve")
+            return "watchdog-reservation"
+
+        async def provider(**kwargs):
+            order.append("provider")
+            return _llm_response_json("none", "info", "All good", "")
+
+        async def settle(**kwargs):
+            order.append("settle")
+
+        monkeypatch.setattr("tools.watchdog._reserve_watchdog_tokens", reserve)
+        monkeypatch.setattr("tools.watchdog.call_llm_non_streaming_with_usage", provider)
+        monkeypatch.setattr("tools.watchdog._settle_watchdog_tokens", settle)
+        monkeypatch.setattr(
+            "tools.watchdog._refund_watchdog_reservation",
+            AsyncMock(),
+        )
+
+        await run_watchdog_evaluation(
+            conversation_id=1,
+            user_message_id=ids[0][0],
+            bot_message_id=ids[1][0],
+            prompt_id=1,
+        )
+
+        assert order == ["reserve", "provider", "settle"]
+        events = get_watchdog_events(db_path, conv_id=1)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "none"
+
+    @_mock_redis_publish
+    async def test_insufficient_balance_prevents_watchdog_provider_call(
+        self, mock_redis, db_path, mock_db, monkeypatch
+    ):
+        seed_llm(db_path)
+        seed_prompt(db_path, watchdog_config=_make_watchdog_config(frequency=1))
+        seed_conversation(db_path)
+        ids = seed_messages(db_path, count=2)
+        provider = AsyncMock()
+
+        monkeypatch.setattr(
+            "tools.watchdog._reserve_watchdog_tokens",
+            AsyncMock(side_effect=InsufficientBalanceError("insufficient")),
+        )
+        monkeypatch.setattr(
+            "tools.watchdog.call_llm_non_streaming_with_usage",
+            provider,
+        )
+
+        await run_watchdog_evaluation(
+            conversation_id=1,
+            user_message_id=ids[0][0],
+            bot_message_id=ids[1][0],
+            prompt_id=1,
+        )
+
+        provider.assert_not_awaited()
+        events = get_watchdog_events(db_path, conv_id=1)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "error"
+        assert "Insufficient balance" in events[0]["analysis"]
 
     async def test_disabled_config_no_evaluation(self, db_path, mock_db):
         """Prompt with watchdog disabled should produce no events."""

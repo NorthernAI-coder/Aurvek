@@ -1,10 +1,18 @@
+import math
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from auth import get_current_user
-from billing.discounts import DiscountError, validate_discount_code
+from billing.discounts import (
+    DISCOUNT_SCOPE_MARKETPLACE,
+    DISCOUNT_SCOPE_WALLET,
+    DISCOUNT_SCOPES,
+    DiscountError,
+    validate_wallet_credit_code,
+    validate_wallet_grant_amount,
+)
 from captcha_service import get_captcha_config
 from common import GOOGLE_CLIENT_ID, get_template_context, templates
 from database import get_db_connection
@@ -12,6 +20,34 @@ from models import User
 
 
 router = APIRouter()
+
+
+def _discount_values_for_scope(
+    scope: str,
+    discount_value: float | str | None,
+    wallet_grant_amount: float | str | None,
+) -> tuple[str, float, float | None]:
+    normalized_scope = (scope or DISCOUNT_SCOPE_MARKETPLACE).strip().lower()
+    if normalized_scope not in DISCOUNT_SCOPES:
+        raise HTTPException(status_code=400, detail="Invalid discount scope")
+
+    if normalized_scope == DISCOUNT_SCOPE_WALLET:
+        try:
+            grant_amount = validate_wallet_grant_amount(wallet_grant_amount)
+        except DiscountError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        return normalized_scope, 0.0, grant_amount
+
+    try:
+        percentage = float(discount_value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Marketplace discount percentage is required") from exc
+    if not math.isfinite(percentage) or percentage <= 0 or percentage > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Marketplace discount percentage must be greater than 0 and at most 100",
+        )
+    return normalized_scope, percentage, None
 
 
 async def _require_admin(current_user: User | None):
@@ -49,7 +85,9 @@ async def create_discount(request: Request, current_user: User = Depends(get_cur
 @router.post("/process-discount")
 async def process_discount(
     code: str = Form(...),
-    discount: str = Form(...),
+    discount: Optional[str] = Form(None),
+    scope: str = Form(DISCOUNT_SCOPE_MARKETPLACE),
+    wallet_grant_amount: Optional[str] = Form(None),
     validity_date: str = Form(None),
     usage_limit: str = Form(None),
     unlimited_usage: bool = Form(False),
@@ -58,6 +96,15 @@ async def process_discount(
 ):
     if current_user is None or not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    code = code.strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Discount code is required")
+    scope, discount_value, wallet_grant = _discount_values_for_scope(
+        scope,
+        discount,
+        wallet_grant_amount,
+    )
 
     active = True
     unlimited_uses = unlimited_usage
@@ -73,10 +120,23 @@ async def process_discount(
             await conn.execute(
                 """
                 INSERT INTO discounts
-                (code, discount_value, active, validity_date, usage_count, unlimited_usage, unlimited_validity)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (code, discount_value, active, validity_date, usage_count,
+                 unlimited_usage, unlimited_validity, created_by_user_id,
+                 scope, wallet_grant_amount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (code, discount, active, validity_date, usage_limit, unlimited_uses, unlimited_date),
+                (
+                    code,
+                    discount_value,
+                    active,
+                    validity_date,
+                    usage_limit,
+                    unlimited_uses,
+                    unlimited_date,
+                    current_user.id,
+                    scope,
+                    wallet_grant,
+                ),
             )
             await conn.commit()
         except Exception as exc:
@@ -88,18 +148,29 @@ async def process_discount(
 @router.post("/apply-discount")
 async def apply_discount(
     discount_code: str = Form(...),
-    amount: float = Form(...),
+    amount: Optional[float] = Form(None),
+    current_user: User = Depends(get_current_user),
 ):
+    del amount  # Wallet grants are fixed server-side and never derived from this value.
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
-        discount = await validate_discount_code(discount_code, amount)
+        wallet_credit = await validate_wallet_credit_code(
+            discount_code,
+            current_user.id,
+        )
     except DiscountError as exc:
-        return JSONResponse({"success": False, "message": exc.message}, status_code=400)
+        return JSONResponse(
+            {"success": False, "message": exc.message},
+            status_code=exc.status_code,
+        )
 
     return JSONResponse(
         {
             "success": True,
-            "newPrice": discount.final_amount,
-            "originalAmount": amount,
+            "scope": wallet_credit.scope,
+            "walletGrantAmount": wallet_credit.grant_amount,
+            "newPrice": 0,
         }
     )
 
@@ -147,7 +218,9 @@ async def get_discount(code: str, current_user: User = Depends(get_current_user)
 @router.post("/admin/update-discount")
 async def update_discount(
     code: str = Form(...),
-    discount_value: float = Form(...),
+    discount_value: Optional[float] = Form(None),
+    scope: str = Form(DISCOUNT_SCOPE_MARKETPLACE),
+    wallet_grant_amount: Optional[float] = Form(None),
     active: bool = Form(...),
     validity_date: Optional[str] = Form(None),
     usage_count: Optional[int] = Form(None),
@@ -157,6 +230,12 @@ async def update_discount(
 ):
     if current_user is None or not await current_user.is_admin:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    scope, discount_value, wallet_grant = _discount_values_for_scope(
+        scope,
+        discount_value,
+        wallet_grant_amount,
+    )
 
     async with get_db_connection() as conn:
         cursor = await conn.cursor()
@@ -170,7 +249,8 @@ async def update_discount(
                 """
                 UPDATE discounts
                 SET discount_value = ?, active = ?, validity_date = ?,
-                    usage_count = ?, unlimited_validity = ?, unlimited_usage = ?
+                    usage_count = ?, unlimited_validity = ?, unlimited_usage = ?,
+                    scope = ?, wallet_grant_amount = ?
                 WHERE code = ?
                 """,
                 (
@@ -180,6 +260,8 @@ async def update_discount(
                     usage_count,
                     unlimited_validity,
                     unlimited_usage,
+                    scope,
+                    wallet_grant,
                     code,
                 ),
             )

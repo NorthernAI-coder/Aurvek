@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from auth import get_user_from_phone_number
+from billing.usage_reservations import serialize_user_billing_response
 from clients import async_twilio, twilio_validator
 from common import (
     PRIMARY_APP_DOMAIN,
@@ -30,7 +31,7 @@ from prompts import can_user_access_prompt
 from save_images import get_or_generate_img_token
 from tools.tts import handle_tts_request, insert_tts_break
 
-from ai_runtime.messages import process_save_message
+from ai_runtime.messages import process_save_message, storage_quota_notice_from_response
 
 
 router = APIRouter()
@@ -745,16 +746,21 @@ async def whatsapp_webhook(request: Request):
 
         # --- Normal (non-GranSabio) path continues below ---
         # Use process_save_message directly to avoid Form() object issues
-        response = await process_save_message(
-            request=request,
-            conversation_id=conversation_id,
-            current_user=current_user,
-            text_plain=user_message,
-            files=files,
-            full_response=False,
-            is_whatsapp=True,
-            thinking_budget_tokens=None  # Explicitly set to None
+        response = await serialize_user_billing_response(
+            current_user.id,
+            process_save_message(
+                request=request,
+                conversation_id=conversation_id,
+                current_user=current_user,
+                text_plain=user_message,
+                files=files,
+                full_response=False,
+                is_whatsapp=True,
+                thinking_budget_tokens=None,
+            ),
         )
+
+        quota_notice = storage_quota_notice_from_response(response)
 
         if isinstance(response, StreamingResponse):
             accumulated_text = ""
@@ -800,20 +806,34 @@ async def whatsapp_webhook(request: Request):
 
             await flush_accumulated_text()
 
+            if quota_notice:
+                await async_twilio.send_message(
+                    body=quota_notice,
+                    from_=to_number,
+                    to=from_number
+                )
         else:
             # Handle non-streaming responses (rate limit, insufficient balance, etc.)
-            status_code = response.status_code if hasattr(response, 'status_code') else 500
-            error_messages = {
-                429: "You've sent too many messages. Please wait a moment.",
-                402: "Insufficient balance. Please top up your account.",
-                403: "This conversation is not available.",
-            }
-            user_msg = error_messages.get(status_code, "Sorry, your message could not be processed. Please try again.")
-            await async_twilio.send_message(
-                body=user_msg,
-                from_=to_number,
-                to=from_number
-            )
+            if quota_notice:
+                # Media-only message rejected for lack of storage: tell the user.
+                await async_twilio.send_message(
+                    body=quota_notice,
+                    from_=to_number,
+                    to=from_number
+                )
+            else:
+                status_code = response.status_code if hasattr(response, 'status_code') else 500
+                error_messages = {
+                    429: "You've sent too many messages. Please wait a moment.",
+                    402: "Insufficient balance. Please top up your account.",
+                    403: "This conversation is not available.",
+                }
+                user_msg = error_messages.get(status_code, "Sorry, your message could not be processed. Please try again.")
+                await async_twilio.send_message(
+                    body=user_msg,
+                    from_=to_number,
+                    to=from_number
+                )
 
         # Log outgoing WhatsApp response
         async with get_db_connection() as log_conn:

@@ -110,8 +110,17 @@ async def test_password_login_rejects_disabled_account(monkeypatch):
             self.context = context
 
     monkeypatch.setattr(auth_flows, "check_rate_limits", lambda *args, **kwargs: None)
-    monkeypatch.setattr(auth_flows, "check_failure_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        auth_flows,
+        "check_login_failure_limits",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(auth_flows, "record_failure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        auth_flows,
+        "record_login_failure",
+        lambda *args, **kwargs: 1,
+    )
     monkeypatch.setattr(auth_flows.asyncio, "sleep", AsyncMock())
     monkeypatch.setattr(auth_flows, "verify_captcha", AsyncMock(return_value=(True, None)))
     monkeypatch.setattr(auth_flows, "get_user_by_username", AsyncMock(return_value=disabled_user))

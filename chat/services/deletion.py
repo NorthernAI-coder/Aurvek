@@ -113,11 +113,11 @@ async def purge_linked_memory_providers_best_effort(
     return purged
 
 
-async def delete_conversation_files_for_user(
-    current_user: User,
-    conversation_id: int,
-) -> bool:
-    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(current_user.username)
+def _remove_conversation_media_dir(username: str, conversation_id: int) -> bool:
+    """Remove a conversation's real media dir under its owner's tree:
+    data/users/{h1}/{h2}/{user_hash}/files/{conv:07d[:3]}/{conv[3:]}/.
+    Returns True when the dir is gone (removed or never existed)."""
+    hash_prefix1, hash_prefix2, user_hash = generate_user_hash(username)
     conversation_id_str = f"{conversation_id:07d}"
     conversation_folder = os.path.join(
         users_directory,
@@ -136,6 +136,13 @@ async def delete_conversation_files_for_user(
     except OSError as exc:
         logger.error("Error deleting conversation folder %s: %s", conversation_id, str(exc))
         return False
+
+
+async def delete_conversation_files_for_user(
+    current_user: User,
+    conversation_id: int,
+) -> bool:
+    return _remove_conversation_media_dir(current_user.username, conversation_id)
 
 
 async def purge_stale_incognito_conversations_for_user(current_user: User) -> None:
@@ -277,11 +284,20 @@ async def delete_conversation_recursively(conversation_id):
         result = await cursor.fetchone()
         if result:
             user_id = result[0]
+            role_id = result[1]
+            is_incognito = bool(result[2])
+            # Resolve the owner's username so the real per-conversation media dir
+            # can be removed below. The admin caller only removes the legacy
+            # static dir; without this the real dir (data/users/.../files/...)
+            # would leak on every admin delete.
+            await cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+            owner_row = await cursor.fetchone()
+            owner_username = owner_row[0] if owner_row else None
             purged_memory_providers = await purge_linked_memory_providers_best_effort(
                 user_id=user_id,
                 conversation_id=conversation_id,
-                prompt_id=result[1],
-                incognito=bool(result[2]),
+                prompt_id=role_id,
+                incognito=is_incognito,
             )
             await delete_conversation_rows(
                 conn,
@@ -290,6 +306,8 @@ async def delete_conversation_recursively(conversation_id):
             )
             await conn.commit()
             await prune_unreferenced_blobs()
+            if owner_username:
+                _remove_conversation_media_dir(owner_username, conversation_id)
             return user_id
     return None
 

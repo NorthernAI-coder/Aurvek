@@ -24,6 +24,10 @@ from database import get_db_connection
 from common import deduct_balance, get_balance, record_daily_usage
 from marketplace.middleware.custom_domains import invalidate_domain_cache
 from marketplace.config import require_creator_tools_enabled, require_public_landings_enabled
+from marketplace.landing.isolation import (
+    get_creator_content_config,
+    is_host_isolated_from_primary,
+)
 
 # Configuration from environment
 CNAME_TARGET = os.getenv("CLOUDFLARE_CNAME_TARGET", "")
@@ -179,7 +183,13 @@ class DomainConfigRequest(BaseModel):
         pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'
         if not re.match(pattern, v):
             raise ValueError('Invalid domain format')
-        return v.lower().strip()
+        domain = v.lower().strip().rstrip(".")
+        if not is_host_isolated_from_primary(domain):
+            raise ValueError('Custom domain must be on a separate site from Aurvek')
+        creator_config = get_creator_content_config()
+        if creator_config and domain == creator_config.host:
+            raise ValueError('Domain is reserved for isolated creator content')
+        return domain
 
 
 # =============================================================================

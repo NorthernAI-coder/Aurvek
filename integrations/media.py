@@ -1,6 +1,5 @@
 import asyncio
 import io
-import sqlite3
 
 import aiohttp
 import httpx
@@ -8,14 +7,179 @@ import requests
 from fastapi import HTTPException
 from pydub import AudioSegment
 
+from billing.usage_reservations import (
+    BillingReservationError,
+    InsufficientBalanceError,
+    mark_fixed_usage_provider_succeeded,
+    refund_fixed_usage,
+    reserve_fixed_usage,
+    settle_fixed_usage,
+)
 from clients import deepgram, stt_engine, stt_fallback_enabled
-from common import Cost, deduct_balance, has_sufficient_balance, record_daily_usage
-from database import DB_MAX_RETRIES, DB_RETRY_DELAY_BASE, get_db_connection, is_lock_error
+from common import Cost, load_service_costs
 from log_config import logger
 from tools.tts_load_balancer import get_elevenlabs_key
 
 
 DEFAULT_STT_LANGUAGE = "es"
+_STT_PROVIDER_DEFAULT_COSTS = {
+    "deepgram": 0.0059,
+    "elevenlabs": 0.005,
+}
+_STT_PROVIDER_COST_KEYS = {
+    "deepgram": "STT_COST_PER_MINUTE_DEEPGRAM",
+    "elevenlabs": "STT_COST_PER_MINUTE_ELEVENLABS",
+}
+_STT_PROVIDER_SERVICE_KEYS = {
+    "deepgram": "STT_SERVICE_ID_DEEPGRAM",
+    "elevenlabs": "STT_SERVICE_ID_ELEVENLABS",
+}
+
+
+class BillableSTTProviderError(RuntimeError):
+    """The provider completed billable work but no transcript was usable."""
+
+
+async def get_stt_billing_config(
+    engine: str,
+    *,
+    configured_engine: str,
+) -> tuple[float, int | None]:
+    """Return the rate and service that belong to one STT provider attempt."""
+    normalized_engine = str(engine or "").strip().lower()
+    normalized_configured_engine = str(configured_engine or "").strip().lower()
+    if normalized_engine not in _STT_PROVIDER_DEFAULT_COSTS:
+        raise BillingReservationError(
+            f"Unsupported speech-to-text engine: {engine}"
+        )
+
+    if normalized_engine == normalized_configured_engine:
+        rate = Cost.STT_COST_PER_MINUTE
+        service_id = Cost.STT_SERVICE_ID
+    else:
+        costs = await load_service_costs()
+        rate = costs.get(
+            _STT_PROVIDER_COST_KEYS[normalized_engine],
+            _STT_PROVIDER_DEFAULT_COSTS[normalized_engine],
+        )
+        service_id = costs.get(_STT_PROVIDER_SERVICE_KEYS[normalized_engine])
+
+    try:
+        normalized_rate = float(rate)
+        normalized_service_id = (
+            int(service_id) if service_id is not None else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise BillingReservationError(
+            f"Billing is not configured for STT provider {normalized_engine}"
+        ) from exc
+    if normalized_rate <= 0:
+        raise BillingReservationError(
+            f"Billing is not configured for STT provider {normalized_engine}"
+        )
+    return normalized_rate, normalized_service_id
+
+
+async def refund_stt_attempt(
+    reservation_id: str,
+    *,
+    context: str,
+    suppress_billing_error: bool = False,
+) -> None:
+    """Release a reservation when an STT provider produced no billable work."""
+    try:
+        refunded = await refund_fixed_usage(reservation_id)
+        if not refunded:
+            raise BillingReservationError(
+                "Speech-to-text reservation could not be refunded"
+            )
+    except BillingReservationError as exc:
+        logger.exception("Could not refund %s STT reservation", context)
+        if not suppress_billing_error:
+            raise HTTPException(
+                status_code=503,
+                detail="Speech-to-text billing is temporarily unavailable",
+            ) from exc
+
+
+async def settle_stt_attempt(
+    reservation_id: str,
+    *,
+    context: str,
+) -> None:
+    """Settle provider work without refunding a possibly billable result."""
+    try:
+        marked = await mark_fixed_usage_provider_succeeded(
+            reservation_id,
+            purpose="stt",
+        )
+        if not marked:
+            raise BillingReservationError(
+                "Speech-to-text reservation is no longer active"
+            )
+        settled = await settle_fixed_usage(reservation_id)
+    except Exception as exc:
+        logger.exception("Could not settle %s STT reservation", context)
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text billing is temporarily unavailable",
+        ) from exc
+    if not settled:
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text billing is temporarily unavailable",
+        )
+
+
+async def finalize_failed_stt_attempt(
+    reservation_id: str,
+    error: BaseException,
+    *,
+    context: str,
+) -> None:
+    """Settle a billable provider response, otherwise release its reservation."""
+    if isinstance(error, BillableSTTProviderError):
+        await settle_stt_attempt(
+            reservation_id,
+            context=context,
+        )
+        return
+    await refund_stt_attempt(
+        reservation_id,
+        context=context,
+        suppress_billing_error=not isinstance(error, Exception),
+    )
+
+
+async def reserve_stt_attempt(
+    *,
+    user_id: int,
+    engine: str,
+    configured_engine: str,
+    duration_min: float,
+    context: str,
+) -> str:
+    """Reserve the configured cost for one concrete STT provider attempt."""
+    try:
+        rate, service_id = await get_stt_billing_config(
+            engine,
+            configured_engine=configured_engine,
+        )
+        return await reserve_fixed_usage(
+            user_id=user_id,
+            purpose="stt",
+            amount=rate * duration_min,
+            service_id=service_id,
+            usage_quantity=duration_min,
+        )
+    except InsufficientBalanceError:
+        raise HTTPException(status_code=402, detail="Insufficient balance")
+    except BillingReservationError as exc:
+        logger.error("Could not reserve %s STT usage: %s", context, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text billing is temporarily unavailable",
+        ) from exc
 
 
 async def transcribe_with_elevenlabs(audio_content: bytes = None, media_url: str = None):
@@ -45,8 +209,13 @@ async def transcribe_with_elevenlabs(audio_content: bytes = None, media_url: str
                 if response.status != 200:
                     error_text = await response.text()
                     raise Exception(f"ElevenLabs API error: {response.status} - {error_text}")
-                result = await response.json()
-                return result.get("text", "")
+                try:
+                    result = await response.json()
+                    return result.get("text", "")
+                except Exception as exc:
+                    raise BillableSTTProviderError(
+                        "ElevenLabs returned an unusable STT response"
+                    ) from exc
     except Exception as e:
         logger.error(f"Error transcribing with ElevenLabs: {str(e)}")
         raise
@@ -78,89 +247,20 @@ async def transcribe_with_deepgram(
         else:
             raise Exception("No audio content or media URL provided")
 
-        result = response.to_dict()
-        if not result:
-            raise Exception("No response from Deepgram")
-        return result["results"]["channels"][0]["alternatives"][0]["transcript"]
+        try:
+            result = response.to_dict()
+            if not result:
+                raise ValueError("No response from Deepgram")
+            return result["results"]["channels"][0]["alternatives"][0][
+                "transcript"
+            ]
+        except Exception as exc:
+            raise BillableSTTProviderError(
+                "Deepgram returned an unusable STT response"
+            ) from exc
     except Exception as e:
         logger.error(f"Error transcribing with Deepgram: {str(e)}")
         raise
-
-
-async def cost_stt(user_id: int, duration_in_minutes: float):
-    total_stt_cost = Cost.STT_COST_PER_MINUTE * duration_in_minutes
-    if not await deduct_balance(user_id, total_stt_cost):
-        return
-
-    last_lock_error = None
-    for attempt in range(DB_MAX_RETRIES):
-        retry_needed = False
-        wait_time = 0.0
-        async with get_db_connection() as conn:
-            transaction_started = False
-            try:
-                await conn.execute("BEGIN IMMEDIATE")
-                transaction_started = True
-
-                await conn.execute(
-                    """
-                    INSERT INTO SERVICE_USAGE (user_id, service_id, usage_quantity, cost)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (user_id, Cost.STT_SERVICE_ID, duration_in_minutes, total_stt_cost),
-                )
-
-                await conn.execute(
-                    """
-                    UPDATE USER_DETAILS
-                    SET total_cost = total_cost + ?, total_stt_cost = total_stt_cost + ?
-                    WHERE user_id = ?
-                    """,
-                    (total_stt_cost, total_stt_cost, user_id),
-                )
-
-                await record_daily_usage(
-                    user_id=user_id,
-                    usage_type="stt",
-                    cost=total_stt_cost,
-                    units=duration_in_minutes,
-                    conn=conn,
-                )
-
-                await conn.commit()
-                return
-            except sqlite3.OperationalError as exc:
-                if transaction_started:
-                    try:
-                        await conn.rollback()
-                    except Exception:
-                        pass
-                if is_lock_error(exc) and attempt < DB_MAX_RETRIES - 1:
-                    wait_time = DB_RETRY_DELAY_BASE * (attempt + 1)
-                    last_lock_error = exc
-                    retry_needed = True
-                else:
-                    logger.error(f"Error executing STT cost query: {exc}")
-                    return
-            except Exception as e:
-                if transaction_started:
-                    try:
-                        await conn.rollback()
-                    except Exception:
-                        pass
-                logger.error(f"Error executing STT cost query: {e}")
-                return
-
-        if retry_needed:
-            await asyncio.sleep(wait_time)
-
-    if last_lock_error:
-        logger.error(
-            "Could not register STT cost for user_id=%s after %s retries: %s",
-            user_id,
-            DB_MAX_RETRIES,
-            last_lock_error,
-        )
 
 
 async def transcribe_external_audio(
@@ -185,36 +285,73 @@ async def transcribe_external_audio(
         raise HTTPException(status_code=400, detail="No audio")
 
     duration_min = audio_duration / 60
-    total_stt_cost = Cost.STT_COST_PER_MINUTE * duration_min
-    if not await has_sufficient_balance(user_id, total_stt_cost):
-        raise HTTPException(status_code=402, detail="Insufficient balance")
+    primary_engine = (
+        "elevenlabs" if str(stt_engine).lower() == "elevenlabs" else "deepgram"
+    )
 
-    prompt = None
+    async def transcribe_with_engine(engine: str):
+        if engine == "elevenlabs":
+            return await transcribe_with_elevenlabs(audio_content=audio_content)
+        return await transcribe_with_deepgram(
+            audio_content=audio_content,
+            user_agent=user_agent,
+        )
+
+    primary_reservation_id = await reserve_stt_attempt(
+        user_id=user_id,
+        engine=primary_engine,
+        configured_engine=primary_engine,
+        duration_min=duration_min,
+        context=f"external {primary_engine}",
+    )
     try:
-        if stt_engine == "elevenlabs":
-            prompt = await transcribe_with_elevenlabs(audio_content=audio_content)
-        else:
-            prompt = await transcribe_with_deepgram(
-                audio_content=audio_content,
-                user_agent=user_agent,
-            )
-    except Exception as primary_error:
-        if not stt_fallback_enabled:
-            raise primary_error
+        prompt = await transcribe_with_engine(primary_engine)
+    except BaseException as primary_error:
+        await finalize_failed_stt_attempt(
+            primary_reservation_id,
+            primary_error,
+            context=f"failed external {primary_engine}",
+        )
+        if not isinstance(primary_error, Exception) or not stt_fallback_enabled:
+            raise
 
-        fallback_engine = "deepgram" if stt_engine == "elevenlabs" else "elevenlabs"
+        fallback_engine = (
+            "deepgram" if primary_engine == "elevenlabs" else "elevenlabs"
+        )
+        fallback_reservation_id = await reserve_stt_attempt(
+            user_id=user_id,
+            engine=fallback_engine,
+            configured_engine=primary_engine,
+            duration_min=duration_min,
+            context=f"external fallback {fallback_engine}",
+        )
         try:
-            if fallback_engine == "elevenlabs":
-                prompt = await transcribe_with_elevenlabs(audio_content=audio_content)
-            else:
-                prompt = await transcribe_with_deepgram(
-                    audio_content=audio_content,
-                    user_agent=user_agent,
-                )
-        except Exception:
-            raise primary_error
+            prompt = await transcribe_with_engine(fallback_engine)
+        except BaseException as fallback_error:
+            await finalize_failed_stt_attempt(
+                fallback_reservation_id,
+                fallback_error,
+                context=f"failed external fallback {fallback_engine}",
+            )
+            if not isinstance(fallback_error, Exception):
+                raise
+            logger.error(
+                "Both external STT engines failed. Primary: %s, Fallback: %s",
+                primary_error,
+                fallback_error,
+            )
+            raise primary_error from fallback_error
 
-    await cost_stt(user_id, duration_min)
+        await settle_stt_attempt(
+            fallback_reservation_id,
+            context=f"external fallback {fallback_engine}",
+        )
+        return prompt
+
+    await settle_stt_attempt(
+        primary_reservation_id,
+        context=f"external {primary_engine}",
+    )
     return prompt
 
 

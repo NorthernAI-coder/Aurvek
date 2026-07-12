@@ -1,10 +1,12 @@
 import os
+import re
 import time
 import sys
 from datetime import timedelta
 
 # Fixed cache path
-CACHE_DIR = "data/cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+TIME_ARGUMENT_PATTERN = re.compile(r"^(?:0h|[1-9]\d{0,5}[hdwm])$")
 
 def delete_old_files(age_limit):
     # Get the current time
@@ -24,6 +26,11 @@ def delete_old_files(age_limit):
                 print(f"Deleted: {file_path}")
 
 def parse_time_argument(arg):
+    if not isinstance(arg, str) or not TIME_ARGUMENT_PATTERN.fullmatch(arg):
+        raise ValueError(
+            "Time must be a non-negative number followed by h, d, w or m"
+        )
+
     value = int(arg[:-1])
     unit = arg[-1]
     
